@@ -1,0 +1,49 @@
+[
+  {
+    "id": 1,
+    "name": "APEX RECORDS",
+    "phone": "+38 (383) 838-38-38",
+    "size": "41",
+    "status": "new",
+    "createdAt": "2026-04-22T12:33:02.987Z"
+  },
+  {
+    "id": 2,
+    "name": "APEX RECORDS",
+    "phone": "+38 (095) 923-44-63",
+    "size": "40",
+    "contactViaTelegram": true,
+    "status": "confirmed",
+    "createdAt": "2026-04-22T13:02:04.351Z",
+    "updatedAt": "2026-04-22T13:02:41.683Z"
+  },
+  {
+    "id": 3,
+    "name": "Alex",
+    "phone": "+38 (095) 923-44-63",
+    "size": "40",
+    "contactViaTelegram": true,
+    "status": "new",
+    "createdAt": "2026-04-22T13:02:16.741Z"
+  },
+  {
+    "id": 4,
+    "name": "Alex",
+    "phone": "+38 (095) 923-44-63",
+    "size": "40",
+    "contactViaTelegram": false,
+    "status": "confirmed",
+    "createdAt": "2026-04-22T14:04:09.440Z",
+    "updatedAt": "2026-04-22T14:04:22.395Z"
+  },
+  {
+    "id": 5,
+    "name": "Alex",
+    "phone": "+38 (095) 923-44-63",
+    "size": "40",
+    "contactViaTelegram": true,
+    "status": "confirmed",
+    "createdAt": "2026-04-22T14:04:29.615Z",
+    "updatedAt": "2026-04-22T14:04:37.486Z"
+  }
+]

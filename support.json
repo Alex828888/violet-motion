@@ -1,0 +1,63 @@
+[
+  {
+    "id": 1,
+    "message": "zdraste",
+    "timestamp": "2026-04-22T12:30:56.383Z",
+    "answered": true
+  },
+  {
+    "id": 2,
+    "message": "cho delat ?",
+    "sessionId": "sess_1776862683675_zvlt0qd",
+    "timestamp": "2026-04-22T13:42:31.242Z",
+    "answered": true,
+    "updatedAt": "2026-04-22T13:42:31.245Z",
+    "accepted": true,
+    "managerId": 7996143460,
+    "acceptedAt": "2026-04-22T13:43:03.033Z",
+    "endedAt": "2026-04-22T13:43:06.536Z"
+  },
+  {
+    "id": 3,
+    "message": "fdfdf",
+    "sessionId": "sess_1776862683675_zvlt0qd",
+    "timestamp": "2026-04-22T12:59:39.281Z",
+    "answered": true,
+    "endedAt": "2026-04-22T13:43:06.539Z"
+  },
+  {
+    "id": 4,
+    "message": "fggf",
+    "sessionId": "sess_1776862683675_zvlt0qd",
+    "timestamp": "2026-04-22T12:59:58.543Z",
+    "answered": true,
+    "accepted": true,
+    "managerId": 7996143460,
+    "acceptedAt": "2026-04-22T13:43:50.038Z",
+    "endedAt": "2026-04-22T13:43:53.585Z"
+  },
+  {
+    "id": 5,
+    "message": "i cho delat",
+    "sessionId": "sess_1776865386544_qxf43ga",
+    "timestamp": "2026-04-22T13:44:31.179Z",
+    "answered": true,
+    "accepted": true,
+    "managerId": 7996143460,
+    "acceptedAt": "2026-04-22T13:44:21.913Z",
+    "updatedAt": "2026-04-22T13:44:31.182Z",
+    "endedAt": "2026-04-22T13:44:39.755Z"
+  },
+  {
+    "id": 6,
+    "message": "fggrgf",
+    "sessionId": "sess_1776865479761_wjm5b8e",
+    "timestamp": "2026-04-22T14:03:50.804Z",
+    "answered": true,
+    "accepted": true,
+    "managerId": 7996143460,
+    "acceptedAt": "2026-04-22T14:03:30.546Z",
+    "updatedAt": "2026-04-22T14:03:50.808Z",
+    "endedAt": "2026-04-22T14:03:55.296Z"
+  }
+]
