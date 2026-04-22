@@ -2,26 +2,24 @@
  * VIOLET MOTION — TELEGRAM ADMIN BOT
  * node bot.js
  *
- * .env:  BOT_TOKEN, ADMIN_IDS, SERVER_URL, API_KEY
+ * .env: BOT_TOKEN, ADMIN_IDS, SERVER_URL, API_KEY
  */
 
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
-const fs   = require('fs');
-const path = require('path');
 
 const TOKEN =
   process.env.BOT_TOKEN ||
   process.env.TG_TOKEN ||
   '';
 
-const ADMIN_IDS  = (process.env.ADMIN_IDS || '')
+const ADMIN_IDS = (process.env.ADMIN_IDS || '')
   .split(',')
   .map(s => Number(s.trim()))
   .filter(Boolean);
 
 const SERVER_URL = process.env.SERVER_URL || 'http://localhost:3000';
-const API_KEY    = process.env.API_KEY    || 'violet-secret';
+const API_KEY = process.env.API_KEY || 'violet-secret';
 
 if (!TOKEN) {
   console.error('❌ BOT_TOKEN not set');
@@ -30,26 +28,6 @@ if (!TOKEN) {
 
 const bot = new TelegramBot(TOKEN, { polling: true });
 console.log('🤖 Admin bot started…');
-
-/* ── Data helpers ────────────────────────────────────────────── */
-const DATA = path.join(__dirname, 'data');
-const F = {
-  orders:  path.join(DATA, 'orders.json'),
-  reviews: path.join(DATA, 'reviews.json'),
-  support: path.join(DATA, 'support.json'),
-};
-
-function read(f) {
-  try {
-    return JSON.parse(fs.readFileSync(f, 'utf8'));
-  } catch {
-    return [];
-  }
-}
-
-function write(f, d) {
-  fs.writeFileSync(f, JSON.stringify(d, null, 2), 'utf8');
-}
 
 /* ── Auth ────────────────────────────────────────────────────── */
 function isAdmin(id) {
@@ -60,7 +38,22 @@ function isAdmin(id) {
 const managerDialogs = {};
 const pendingSearch = {};
 
-/* ── Server relay ────────────────────────────────────────────── */
+/* ── HTTP helpers ────────────────────────────────────────────── */
+async function serverGet(pathname) {
+  try {
+    const r = await fetch(`${SERVER_URL}${pathname}`, {
+      method: 'GET',
+      headers: {
+        'x-api-key': API_KEY,
+      },
+    });
+    return await r.json();
+  } catch (e) {
+    console.error('[relay GET]', e.message);
+    return null;
+  }
+}
+
 async function serverPost(pathname, body) {
   try {
     const r = await fetch(`${SERVER_URL}${pathname}`, {
@@ -74,6 +67,38 @@ async function serverPost(pathname, body) {
     return await r.json();
   } catch (e) {
     console.error('[relay POST]', e.message);
+    return { success: false };
+  }
+}
+
+async function serverPatch(pathname, body) {
+  try {
+    const r = await fetch(`${SERVER_URL}${pathname}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': API_KEY,
+      },
+      body: JSON.stringify(body),
+    });
+    return await r.json();
+  } catch (e) {
+    console.error('[relay PATCH]', e.message);
+    return { success: false };
+  }
+}
+
+async function serverDelete(pathname) {
+  try {
+    const r = await fetch(`${SERVER_URL}${pathname}`, {
+      method: 'DELETE',
+      headers: {
+        'x-api-key': API_KEY,
+      },
+    });
+    return await r.json();
+  } catch (e) {
+    console.error('[relay DELETE]', e.message);
     return { success: false };
   }
 }
@@ -122,23 +147,12 @@ const PAGE = 5;
 
 function paginate(arr, p) {
   const total = Math.ceil(arr.length / PAGE) || 1;
-  const page  = Math.max(1, Math.min(p, total));
+  const page = Math.max(1, Math.min(p, total));
   return {
     items: arr.slice((page - 1) * PAGE, page * PAGE),
     page,
     total,
   };
-}
-
-function isMainMenuText(text) {
-  return [
-    '📦 Замовлення',
-    '💬 Відгуки',
-    '🎧 Підтримка',
-    '📊 Статистика',
-    '🔍 Пошук',
-    '❓ Допомога',
-  ].includes(text);
 }
 
 /* ── Send/edit helper ────────────────────────────────────────── */
@@ -183,8 +197,13 @@ function ordersKeyboard(items, page, total, filter) {
   return { inline_keyboard: rows };
 }
 
-function showOrders(chatId, page = 1, filter = null, msgId = null) {
-  let orders = read(F.orders).reverse();
+async function showOrders(chatId, page = 1, filter = null, msgId = null) {
+  let orders = await serverGet('/api/admin/orders');
+  if (!Array.isArray(orders)) {
+    return reply(chatId, '❌ Не вдалося завантажити замовлення.', MAIN_KB, msgId);
+  }
+
+  orders = orders.reverse();
 
   if (filter) {
     orders = orders.filter(o =>
@@ -219,9 +238,9 @@ function showOrders(chatId, page = 1, filter = null, msgId = null) {
   reply(chatId, text, ordersKeyboard(items, p, total, filter), msgId);
 }
 
-function showOrderDetail(chatId, id, msgId = null) {
-  const o = read(F.orders).find(x => x.id === id);
-  if (!o) {
+async function showOrderDetail(chatId, id, msgId = null) {
+  const o = await serverGet(`/api/admin/orders/${id}`);
+  if (!o || o.error) {
     return bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB });
   }
 
@@ -253,15 +272,21 @@ function showOrderDetail(chatId, id, msgId = null) {
 /* ══════════════════════════════════════════════════════════════
    REVIEWS
 ══════════════════════════════════════════════════════════════ */
-function showReviews(chatId, page = 1, msgId = null) {
-  const reviews = read(F.reviews).reverse();
-  if (!reviews.length) return reply(chatId, '💬 Відгуків ще немає.', MAIN_KB);
+async function showReviews(chatId, page = 1, msgId = null) {
+  let reviews = await serverGet('/api/admin/reviews');
+  if (!Array.isArray(reviews)) {
+    return reply(chatId, '❌ Не вдалося завантажити відгуки.', MAIN_KB, msgId);
+  }
+
+  reviews = reviews.reverse();
+
+  if (!reviews.length) return reply(chatId, '💬 Відгуків ще немає.', MAIN_KB, msgId);
 
   const { items, page: p, total } = paginate(reviews, page);
 
   let text = `💬 <b>Відгуки</b> (${reviews.length}):\n\n`;
   items.forEach(r => {
-    text += `${stars(r.rating)} <b>${r.name}</b>\n<i>${r.text.slice(0, 100)}${r.text.length > 100 ? '…' : ''}</i>\n${r.date}\n\n`;
+    text += `${stars(r.rating)} <b>${r.name}</b>\n<i>${(r.text || '').slice(0, 100)}${(r.text || '').length > 100 ? '…' : ''}</i>\n${r.date || '—'}\n\n`;
   });
 
   const delRows = items.map(r => [
@@ -282,16 +307,22 @@ function showReviews(chatId, page = 1, msgId = null) {
 /* ══════════════════════════════════════════════════════════════
    SUPPORT
 ══════════════════════════════════════════════════════════════ */
-function showSupport(chatId, page = 1, msgId = null) {
-  const msgs = read(F.support).reverse();
-  if (!msgs.length) return reply(chatId, '🎧 Запитів підтримки немає.', MAIN_KB);
+async function showSupport(chatId, page = 1, msgId = null) {
+  let msgs = await serverGet('/api/admin/support');
+  if (!Array.isArray(msgs)) {
+    return reply(chatId, '❌ Не вдалося завантажити підтримку.', MAIN_KB, msgId);
+  }
+
+  msgs = msgs.reverse();
+
+  if (!msgs.length) return reply(chatId, '🎧 Запитів підтримки немає.', MAIN_KB, msgId);
 
   const unans = msgs.filter(m => !m.answered).length;
   const { items, page: p, total } = paginate(msgs, page);
 
   let text = `🎧 <b>Підтримка</b> (${msgs.length} всього, ⚠️ ${unans} без відповіді):\n\n`;
   items.forEach(m => {
-    text += `${m.answered ? '✅' : '⚠️'} <b>#${m.id}</b>  ${m.message.slice(0, 80)}\n${fmtDate(m.timestamp)}\n\n`;
+    text += `${m.answered ? '✅' : '⚠️'} <b>#${m.id}</b>  ${(m.message || '').slice(0, 80)}\n${fmtDate(m.timestamp)}\n\n`;
   });
 
   const actRows = items
@@ -314,13 +345,17 @@ function showSupport(chatId, page = 1, msgId = null) {
 /* ══════════════════════════════════════════════════════════════
    STATS
 ══════════════════════════════════════════════════════════════ */
-function showStats(chatId, msgId = null) {
-  const orders  = read(F.orders);
-  const reviews = read(F.reviews);
-  const support = read(F.support);
+async function showStats(chatId, msgId = null) {
+  const orders = await serverGet('/api/admin/orders');
+  const reviews = await serverGet('/api/admin/reviews');
+  const support = await serverGet('/api/admin/support');
+
+  if (!Array.isArray(orders) || !Array.isArray(reviews) || !Array.isArray(support)) {
+    return reply(chatId, '❌ Не вдалося завантажити статистику.', MAIN_KB, msgId);
+  }
 
   const avg = reviews.length
-    ? (reviews.reduce((s, r) => s + r.rating, 0) / reviews.length).toFixed(1)
+    ? (reviews.reduce((s, r) => s + Number(r.rating || 0), 0) / reviews.length).toFixed(1)
     : '—';
 
   const sc = {};
@@ -356,10 +391,10 @@ bot.onText(/\/search (.+)/, (msg, match) => {
   if (!isAdmin(msg.from.id)) return;
   showOrders(msg.chat.id, 1, match[1].trim().toLowerCase());
 });
-bot.onText(/\/orders/,  msg => { if (!isAdmin(msg.from.id)) return; showOrders(msg.chat.id); });
+bot.onText(/\/orders/, msg => { if (!isAdmin(msg.from.id)) return; showOrders(msg.chat.id); });
 bot.onText(/\/reviews/, msg => { if (!isAdmin(msg.from.id)) return; showReviews(msg.chat.id); });
 bot.onText(/\/support/, msg => { if (!isAdmin(msg.from.id)) return; showSupport(msg.chat.id); });
-bot.onText(/\/stats/,   msg => { if (!isAdmin(msg.from.id)) return; showStats(msg.chat.id); });
+bot.onText(/\/stats/, msg => { if (!isAdmin(msg.from.id)) return; showStats(msg.chat.id); });
 
 /* ══════════════════════════════════════════════════════════════
    TEXT MESSAGES → navigation + dialog relay
@@ -369,9 +404,8 @@ bot.on('message', async msg => {
   if (!isAdmin(msg.from.id)) return;
 
   const chatId = msg.chat.id;
-  const text   = msg.text.trim();
+  const text = msg.text.trim();
 
-  /* ── Menu buttons must work before relay ── */
   if (text === '📦 Замовлення') {
     if (managerDialogs[chatId]) {
       await bot.sendMessage(chatId, 'ℹ️ Спочатку завершіть активний діалог кнопкою 🔚 Завершити діалог.', { reply_markup: DIALOG_KB });
@@ -435,21 +469,12 @@ bot.on('message', async msg => {
     return;
   }
 
-  /* ── If manager is in active dialog → relay to client ── */
   if (managerDialogs[chatId]) {
     if (text === '🔚 Завершити діалог') {
       const sessionId = managerDialogs[chatId];
       delete managerDialogs[chatId];
 
       await serverPost('/api/support/end', { sessionId });
-
-      const msgs = read(F.support);
-      const idx  = msgs.findIndex(m => m.sessionId === sessionId && !m.answered);
-      if (idx >= 0) {
-        msgs[idx].answered = true;
-        msgs[idx].endedAt = new Date().toISOString();
-        write(F.support, msgs);
-      }
 
       await bot.sendMessage(
         chatId,
@@ -467,7 +492,6 @@ bot.on('message', async msg => {
     return;
   }
 
-  /* ── Awaiting search input ── */
   if (pendingSearch[chatId]) {
     delete pendingSearch[chatId];
     showOrders(chatId, 1, text.toLowerCase());
@@ -480,8 +504,8 @@ bot.on('message', async msg => {
 ══════════════════════════════════════════════════════════════ */
 bot.on('callback_query', async q => {
   const chatId = q.message.chat.id;
-  const msgId  = q.message.message_id;
-  const data   = q.data;
+  const msgId = q.message.message_id;
+  const data = q.data;
 
   if (!isAdmin(q.from.id)) {
     try {
@@ -496,80 +520,87 @@ bot.on('callback_query', async q => {
 
   if (data === 'noop') return;
 
-  /* orders list */
   if (data === 'orders') {
     showOrders(chatId, 1, null, msgId);
     return;
   }
 
-  /* orders pagination: op_2 or op_2_f_олена */
   if (data.startsWith('op_')) {
-    const parts  = data.split('_f_');
-    const page   = Number(parts[0].replace('op_', ''));
+    const parts = data.split('_f_');
+    const page = Number(parts[0].replace('op_', ''));
     const filter = parts[1] || null;
     showOrders(chatId, page, filter, msgId);
     return;
   }
 
-  /* order detail */
   if (data.startsWith('od_')) {
     showOrderDetail(chatId, Number(data.slice(3)), msgId);
     return;
   }
 
-  /* confirm / cancel order */
   if (data.startsWith('confirm_') || data.startsWith('cancel_')) {
     const isConf = data.startsWith('confirm_');
     const id = Number(data.replace(isConf ? 'confirm_' : 'cancel_', ''));
 
-    const orders = read(F.orders);
-    const idx = orders.findIndex(o => o.id === id);
-    if (idx < 0) {
+    const order = await serverGet(`/api/admin/orders/${id}`);
+    if (!order || order.error) {
       await bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB });
       return;
     }
 
-    orders[idx].status = isConf ? 'confirmed' : 'cancelled';
-    orders[idx].updatedAt = new Date().toISOString();
-    write(F.orders, orders);
+    const updated = await serverPatch(`/api/admin/orders/${id}`, {
+      status: isConf ? 'confirmed' : 'cancelled',
+    });
+
+    if (!updated || updated.error) {
+      await bot.sendMessage(chatId, '❌ Не вдалося змінити статус замовлення.', { reply_markup: MAIN_KB });
+      return;
+    }
 
     await bot.sendMessage(
       chatId,
-      `${isConf ? '✅' : '❌'} Замовлення #${id} (${orders[idx].name}) — <b>${isConf ? 'підтверджено' : 'скасовано'}</b>`,
+      `${isConf ? '✅' : '❌'} Замовлення #${id} (${updated.name}) — <b>${isConf ? 'підтверджено' : 'скасовано'}</b>`,
       { parse_mode: 'HTML', reply_markup: MAIN_KB }
     );
     return;
   }
 
-  /* delete order */
   if (data.startsWith('del_order_')) {
     const id = Number(data.slice(10));
-    write(F.orders, read(F.orders).filter(o => o.id !== id));
+
+    const deleted = await serverDelete(`/api/admin/orders/${id}`);
+    if (!deleted || deleted.error) {
+      await bot.sendMessage(chatId, `❌ Не вдалося видалити замовлення #${id}.`, { reply_markup: MAIN_KB });
+      return;
+    }
+
     await bot.sendMessage(chatId, `🗑 Замовлення #${id} видалено.`, { reply_markup: MAIN_KB });
     return;
   }
 
-  /* reviews pagination */
   if (data.startsWith('rv_')) {
     showReviews(chatId, Number(data.slice(3)), msgId);
     return;
   }
 
-  /* delete review */
   if (data.startsWith('del_review_')) {
     const id = Number(data.slice(11));
-    write(F.reviews, read(F.reviews).filter(r => r.id !== id));
+
+    const deleted = await serverDelete(`/api/admin/reviews/${id}`);
+    if (!deleted || deleted.error) {
+      await bot.sendMessage(chatId, `❌ Не вдалося видалити відгук #${id}.`, { reply_markup: MAIN_KB });
+      return;
+    }
+
     await bot.sendMessage(chatId, `🗑 Відгук #${id} видалено.`, { reply_markup: MAIN_KB });
     return;
   }
 
-  /* support pagination */
   if (data.startsWith('sp_')) {
     showSupport(chatId, Number(data.slice(3)), msgId);
     return;
   }
 
-  /* accept support dialog */
   if (data.startsWith('accept_')) {
     const sessionId = data.slice(7);
 
@@ -588,15 +619,18 @@ bot.on('callback_query', async q => {
     return;
   }
 
-  /* mark support answered */
   if (data.startsWith('answered_')) {
     const id = Number(data.slice(9));
-    const msgs = read(F.support);
-    const idx  = msgs.findIndex(m => m.id === id);
-    if (idx >= 0) {
-      msgs[idx].answered = true;
-      write(F.support, msgs);
+
+    const updated = await serverPatch(`/api/admin/support/${id}`, {
+      answered: true,
+    });
+
+    if (!updated || updated.error) {
+      await bot.sendMessage(chatId, `❌ Не вдалося змінити статус запиту #${id}.`, { reply_markup: MAIN_KB });
+      return;
     }
+
     await bot.sendMessage(chatId, `✅ Запит #${id} — відповіли.`, { reply_markup: MAIN_KB });
     return;
   }
@@ -605,14 +639,15 @@ bot.on('callback_query', async q => {
 bot.on('polling_error', e => console.error('[poll]', e.message));
 bot.on('error', e => console.error('[bot]', e.message));
 
-const express = require("express");
-const app = express();
+/* ── Tiny web server for Render ────────────────────────────── */
+const express = require('express');
+const webApp = express();
 
-app.get("/", (req, res) => {
-    res.send("Bot is running");
+webApp.get('/', (_req, res) => {
+  res.send('Bot is running');
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log("Server running on port", PORT);
+webApp.listen(PORT, () => {
+  console.log('Server running on port', PORT);
 });

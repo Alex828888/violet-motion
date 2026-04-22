@@ -111,7 +111,6 @@ app.get('/bot.js', (_req, res) => {
   res.sendFile(path.join(ROOT, 'bot.js'));
 });
 
-/* Optional common static files */
 app.get('/favicon.ico', (_req, res) => {
   res.status(204).end();
 });
@@ -135,13 +134,97 @@ app.use(express.static(ROOT, {
   },
 }));
 
-/* ── Bot auth ──────────────────────────────────────────────── */
+/* ── Auth ──────────────────────────────────────────────────── */
 function authBot(req, res, next) {
   if (req.headers['x-api-key'] !== API_KEY) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   next();
 }
+
+/* ═══════════════════════════════════════════════════════════
+   ADMIN API FOR BOT
+═══════════════════════════════════════════════════════════ */
+
+/* ── Orders admin ──────────────────────────────────────────── */
+app.get('/api/admin/orders', authBot, (_req, res) => {
+  res.json(read(F.orders));
+});
+
+app.get('/api/admin/orders/:id', authBot, (req, res) => {
+  const id = Number(req.params.id);
+  const order = read(F.orders).find(x => x.id === id);
+  if (!order) return res.status(404).json({ error: 'Not found' });
+  res.json(order);
+});
+
+app.patch('/api/admin/orders/:id', authBot, (req, res) => {
+  const id = Number(req.params.id);
+  const arr = read(F.orders);
+  const idx = arr.findIndex(x => x.id === id);
+
+  if (idx < 0) return res.status(404).json({ error: 'Not found' });
+
+  arr[idx] = {
+    ...arr[idx],
+    ...req.body,
+    id: arr[idx].id,
+    updatedAt: new Date().toISOString(),
+  };
+
+  write(F.orders, arr);
+  res.json(arr[idx]);
+});
+
+app.delete('/api/admin/orders/:id', authBot, (req, res) => {
+  const id = Number(req.params.id);
+  const arr = read(F.orders);
+  const exists = arr.some(x => x.id === id);
+
+  if (!exists) return res.status(404).json({ error: 'Not found' });
+
+  write(F.orders, arr.filter(x => x.id !== id));
+  res.json({ success: true });
+});
+
+/* ── Reviews admin ─────────────────────────────────────────── */
+app.get('/api/admin/reviews', authBot, (_req, res) => {
+  res.json(read(F.reviews));
+});
+
+app.delete('/api/admin/reviews/:id', authBot, (req, res) => {
+  const id = Number(req.params.id);
+  const arr = read(F.reviews);
+  const exists = arr.some(x => x.id === id);
+
+  if (!exists) return res.status(404).json({ error: 'Not found' });
+
+  write(F.reviews, arr.filter(x => x.id !== id));
+  res.json({ success: true });
+});
+
+/* ── Support admin ─────────────────────────────────────────── */
+app.get('/api/admin/support', authBot, (_req, res) => {
+  res.json(read(F.support));
+});
+
+app.patch('/api/admin/support/:id', authBot, (req, res) => {
+  const id = Number(req.params.id);
+  const arr = read(F.support);
+  const idx = arr.findIndex(x => x.id === id);
+
+  if (idx < 0) return res.status(404).json({ error: 'Not found' });
+
+  arr[idx] = {
+    ...arr[idx],
+    ...req.body,
+    id: arr[idx].id,
+    updatedAt: new Date().toISOString(),
+  };
+
+  write(F.support, arr);
+  res.json(arr[idx]);
+});
 
 /* ── SSE endpoint ──────────────────────────────────────────── */
 app.get('/api/support/stream', (req, res) => {
@@ -301,13 +384,25 @@ app.patch('/api/orders/:id', (req, res) => {
 
   if (idx < 0) return res.status(404).json({ error: 'Not found' });
 
-  Object.assign(arr[idx], req.body, { id: arr[idx].id });
+  arr[idx] = {
+    ...arr[idx],
+    ...req.body,
+    id: arr[idx].id,
+    updatedAt: new Date().toISOString(),
+  };
+
   write(F.orders, arr);
   res.json(arr[idx]);
 });
 
 app.delete('/api/orders/:id', (req, res) => {
-  write(F.orders, read(F.orders).filter(x => x.id !== +req.params.id));
+  const id = Number(req.params.id);
+  const arr = read(F.orders);
+  const exists = arr.some(x => x.id === id);
+
+  if (!exists) return res.status(404).json({ error: 'Not found' });
+
+  write(F.orders, arr.filter(x => x.id !== id));
   res.json({ success: true });
 });
 
@@ -352,7 +447,13 @@ app.post('/api/review', async (req, res) => {
 app.get('/api/reviews', (_req, res) => res.json(read(F.reviews)));
 
 app.delete('/api/reviews/:id', (req, res) => {
-  write(F.reviews, read(F.reviews).filter(x => x.id !== +req.params.id));
+  const id = Number(req.params.id);
+  const arr = read(F.reviews);
+  const exists = arr.some(x => x.id === id);
+
+  if (!exists) return res.status(404).json({ error: 'Not found' });
+
+  write(F.reviews, arr.filter(x => x.id !== id));
   res.json({ success: true });
 });
 
@@ -433,7 +534,13 @@ app.patch('/api/support/:id', (req, res) => {
 
   if (idx < 0) return res.status(404).json({ error: 'Not found' });
 
-  Object.assign(arr[idx], req.body, { id: arr[idx].id });
+  arr[idx] = {
+    ...arr[idx],
+    ...req.body,
+    id: arr[idx].id,
+    updatedAt: new Date().toISOString(),
+  };
+
   write(F.support, arr);
   res.json(arr[idx]);
 });
