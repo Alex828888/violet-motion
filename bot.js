@@ -604,3 +604,15 @@ bot.on('callback_query', async q => {
 
 bot.on('polling_error', e => console.error('[poll]', e.message));
 bot.on('error', e => console.error('[bot]', e.message));
+
+const express = require("express");
+const app = express();
+
+app.get("/", (req, res) => {
+    res.send("Bot is running");
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log("Server running on port", PORT);
+});
