@@ -464,7 +464,7 @@ button, input, textarea, select { font: inherit; }
 .float-order-btn {
   position: fixed;
   bottom: 92px; /* вище support FAB */
-  right: 20px;
+  left: 20px;
   z-index: 198;
   display: inline-flex;
   align-items: center;
@@ -513,19 +513,12 @@ button, input, textarea, select { font: inherit; }
   transform: translateX(3px);
 }
 
-/* на мобільному — тільки іконка щоб не заважала */
 @media (max-width: 480px) {
   .float-order-btn {
-    padding: 14px;
-    border-radius: 50%;
     bottom: 88px;
-    right: 16px;
-  }
-  .float-order-btn__text {
-    display: none;
-  }
-  .float-order-btn__icon {
-    width: 18px;
-    height: 18px;
+    left: 12px;
+    padding: 11px 16px;
+    font-size: 11px;
+    gap: 6px;
   }
 }
