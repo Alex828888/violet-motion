@@ -606,3 +606,22 @@ supportInput.addEventListener('keydown', e => {
     sendSupportMsg();
   }
 });
+
+/* ── Floating Order Button ───────────────────────────────────── */
+(function () {
+  const floatBtn  = document.getElementById('floatOrderBtn');
+  const heroBtn   = document.getElementById('heroOrderBtn');
+  if (!floatBtn || !heroBtn) return;
+
+  const observer = new IntersectionObserver(
+    entries => {
+      entries.forEach(entry => {
+        /* кнопка видима —ховаємо float; зникла — показуємо */
+        floatBtn.classList.toggle('visible', !entry.isIntersecting);
+      });
+    },
+    { threshold: 0, rootMargin: '0px 0px -20px 0px' }
+  );
+
+  observer.observe(heroBtn);
+})();

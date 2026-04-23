@@ -70,7 +70,7 @@
         <div class="price-note">Лише сьогодні • оплата після примірки</div>
       </div>
       <div class="hero-actions">
-        <a href="#order" class="main-btn">ЗАБРАТИ ЗА 895 ГРН</a>
+        <a href="#order" class="main-btn" id="heroOrderBtn">ЗАБРАТИ ЗА 895 ГРН</a>
         <a href="#features" class="ghost-btn">ПОДИВИТИСЬ ДЕТАЛІ</a>
       </div>
       <div class="hero-mini-stats">
@@ -83,11 +83,32 @@
 
   <main>
 
-    <!-- 01 FEATURES -->
-    <section class="section features" id="features">
+    <!-- 01 GALLERY (перша секція) -->
+    <section class="section gallery-section" id="gallery">
       <div class="container">
         <div class="section-head">
           <span class="section-code">01</span>
+          <h2><span class="h-soft">Галерея</span></h2>
+        </div>
+        <div class="gallery-box">
+          <div class="gallery-main">
+            <img id="mainGalleryImage" src="main.jpg">
+          </div>
+          <div class="gallery-thumbs">
+            <img class="thumb active" src="main.jpg" data-image="main.jpg">
+            <img class="thumb" src="side.jpg" data-image="side.jpg">
+            <img class="thumb" src="back.jpg" data-image="back.jpg">
+            <img class="thumb" src="top.jpg" data-image="top.jpg">
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 02 FEATURES -->
+    <section class="section features" id="features">
+      <div class="container">
+        <div class="section-head">
+          <span class="section-code">02</span>
           <h2>Чому вони реально <span class="h-accent">чіпляють</span></h2>
         </div>
         <div class="feature-grid">
@@ -115,12 +136,12 @@
       </div>
     </section>
 
-    <!-- 02 VISUAL -->
+    <!-- 03 VISUAL -->
     <section class="section visual-block">
       <div class="container">
         <div class="visual-box">
           <div class="visual-text">
-            <span class="section-code">02</span>
+            <span class="section-code">03</span>
             <h2>М'який <span class="h-soft">вайб</span>. Чистий <span class="h-accent">стиль</span>. Максимум <span class="h-glow">жіночності</span>.</h2>
             <p>Це не просто кросівки "під усе". Це пара, яка одразу робить образ акуратнішим, свіжішим і дорожчим на вигляд.</p>
             <ul class="visual-list">
@@ -135,27 +156,6 @@
             <img src="photo_2026-04-22_13-18-54.jpg" alt="Кросівки Violet Motion" class="visual-image" onerror="this.style.display='none'" />
             <div class="glow-orb glow-1"></div>
             <div class="glow-orb glow-2"></div>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- 03 GALLERY -->
-    <section class="section gallery-section" id="gallery">
-      <div class="container">
-        <div class="section-head">
-          <span class="section-code">03</span>
-          <h2><span class="h-soft">Галерея</span></h2>
-        </div>
-        <div class="gallery-box">
-          <div class="gallery-main">
-            <img id="mainGalleryImage" src="main.jpg">
-          </div>
-          <div class="gallery-thumbs">
-            <img class="thumb active" src="main.jpg" data-image="main.jpg">
-            <img class="thumb" src="side.jpg" data-image="side.jpg">
-            <img class="thumb" src="back.jpg" data-image="back.jpg">
-            <img class="thumb" src="top.jpg" data-image="top.jpg">
           </div>
         </div>
       </div>
@@ -259,7 +259,6 @@
               <input type="hidden" id="selectedSize" name="size" />
             </div>
 
-            <!-- Telegram contact option -->
             <label class="tg-option-label" id="tgOptionLabel">
               <input type="checkbox" id="contactViaTelegram" class="tg-checkbox-input" />
               <span class="tg-checkbox-box">
@@ -336,6 +335,14 @@
     </section>
 
   </main>
+
+  <!-- FLOATING ORDER BUTTON -->
+  <a href="#order" class="float-order-btn" id="floatOrderBtn" aria-label="Замовити">
+    <span class="float-order-btn__text">ЗАМОВИТИ</span>
+    <svg class="float-order-btn__icon" width="16" height="16" viewBox="0 0 24 24" fill="none">
+      <path d="M5 12H19M19 12L12 5M19 12L12 19" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+  </a>
 
   <!-- ORDER SUCCESS OVERLAY -->
   <div class="order-overlay" id="orderOverlay">

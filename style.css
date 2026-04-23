@@ -459,3 +459,73 @@ button, input, textarea, select { font: inherit; }
 @media (max-width: 380px) {
   .support-panel { right: 8px; width: calc(100vw - 16px); bottom: 82px; }
 }
+
+/* ── Floating Order Button ───────────────────────────────────── */
+.float-order-btn {
+  position: fixed;
+  bottom: 92px; /* вище support FAB */
+  right: 20px;
+  z-index: 198;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 20px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #d799ff, #b86cff 45%, #7a2aff);
+  color: #fff;
+  font-family: "Inter", sans-serif;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-decoration: none;
+  box-shadow: 0 8px 28px rgba(138,60,255,0.45), 0 2px 8px rgba(0,0,0,0.2);
+  border: 1px solid rgba(255,255,255,0.15);
+
+  /* початковий стан — прихована */
+  opacity: 0;
+  transform: translateY(12px) scale(0.95);
+  pointer-events: none;
+  transition: opacity 0.35s ease, transform 0.35s ease, box-shadow 0.2s ease;
+}
+
+.float-order-btn.visible {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  pointer-events: all;
+}
+
+.float-order-btn:hover {
+  box-shadow: 0 12px 36px rgba(138,60,255,0.55), 0 2px 8px rgba(0,0,0,0.25);
+  transform: translateY(-2px) scale(1.02);
+}
+
+.float-order-btn:active {
+  transform: translateY(0) scale(0.98);
+}
+
+.float-order-btn__icon {
+  flex-shrink: 0;
+  transition: transform 0.2s ease;
+}
+
+.float-order-btn:hover .float-order-btn__icon {
+  transform: translateX(3px);
+}
+
+/* на мобільному — тільки іконка щоб не заважала */
+@media (max-width: 480px) {
+  .float-order-btn {
+    padding: 14px;
+    border-radius: 50%;
+    bottom: 88px;
+    right: 16px;
+  }
+  .float-order-btn__text {
+    display: none;
+  }
+  .float-order-btn__icon {
+    width: 18px;
+    height: 18px;
+  }
+}
