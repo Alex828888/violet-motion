@@ -25,7 +25,7 @@
 </head>
 <body>
 
-  <!-- TICKER — лічильник синхронізований зі скриптом (17) -->
+  <!-- TICKER -->
   <div class="top-ticker">
     <div class="ticker-track">
       <span>✨ Легка вага</span>
@@ -56,13 +56,16 @@
         <div class="brand">VIOLET MOTION</div>
       </div>
 
-      <div class="hero-video-card">
-        <video class="hero-video" autoplay muted loop playsinline poster="photo_2026-04-22_13-18-54.jpg">
+      <!-- VIDEO with skeleton placeholder -->
+      <div class="hero-video-card" id="heroVideoCard">
+        <div class="sk-placeholder" id="videoSkeleton"></div>
+        <video class="hero-video" autoplay muted loop playsinline poster="photo_2026-04-22_13-18-54.jpg"
+               id="heroVideo">
           <source src="media/shoes-video.mp4" type="video/mp4" />
         </video>
-        <img src="photo_2026-04-22_13-18-54.jpg" alt="Кросівки Violet Motion" class="hero-video-fallback" onerror="this.style.display='none'" />
+        <img src="photo_2026-04-22_13-18-54.jpg" alt="Кросівки Violet Motion"
+             class="hero-video-fallback" id="heroFallback" onerror="this.style.display='none'" />
         <div class="hero-video-shine"></div>
-        <!-- LIVE VIEWERS — соціальний тиск на відео -->
         <div class="hero-live-badge">
           <span class="live-dot"></span>
           <span id="heroViewers">24</span>&nbsp;переглядають зараз
@@ -76,7 +79,6 @@
       </h1>
       <p class="hero-text">Ефектні жіночі кросівки у світло-фіолетовому стилі. Ідеально для прогулянок, міста, подорожей і щоденного вайбу без втоми в ногах.</p>
 
-      <!-- СОЦІАЛЬНИЙ ДОКАЗ: аватари + лічильник -->
       <div class="hero-social-proof">
         <div class="hero-avatars">
           <div class="hero-av" style="background:linear-gradient(135deg,#f9a8d4,#c084fc)">О</div>
@@ -102,8 +104,9 @@
       </div>
 
       <div class="hero-actions">
-        <a href="#order" class="main-btn pulse-cta" id="heroOrderBtn">💜 ЗАБРАТИ ЗА 895 ГРН</a>
-        <a href="#features" class="ghost-btn">ПОДИВИТИСЬ ДЕТАЛІ</a>
+        <a href="#order" class="main-btn pulse-cta" id="heroOrderBtn"
+           data-track="hero_cta">💜 ЗАБРАТИ ЗА 895 ГРН</a>
+        <a href="#features" class="ghost-btn" data-track="hero_details">ПОДИВИТИСЬ ДЕТАЛІ</a>
       </div>
 
       <div class="hero-mini-stats">
@@ -112,7 +115,6 @@
         <div class="mini-card"><strong>14 днів</strong><span>обмін</span></div>
       </div>
 
-      <!-- ГАРАНТІЙНА СТРІЧКА -->
       <div class="trust-ribbon">
         <div class="trust-item">🔒 Оплата після примірки</div>
         <div class="trust-item">🚚 Нова Пошта</div>
@@ -123,8 +125,8 @@
 
   <main>
 
-    <!-- ПОПАП СОЦІАЛЬНОГО ДОКАЗУ -->
-    <div class="soc-popup" id="socPopup">
+    <!-- SOCIAL POPUP (smaller, mobile-friendly) -->
+    <div class="soc-popup" id="socPopup" role="status" aria-live="polite">
       <div class="soc-popup-icon">👟</div>
       <div class="soc-popup-body">
         <strong id="socPopupName">Олена, Київ</strong>
@@ -136,19 +138,25 @@
     <!-- 01 GALLERY -->
     <section class="section gallery-section" id="gallery">
       <div class="container">
-        <div class="section-head">
+        <div class="section-head fade-in-up">
           <span class="section-code">01</span>
           <h2><span class="h-soft">Галерея</span></h2>
         </div>
-        <div class="gallery-box">
-          <div class="gallery-main">
+        <div class="gallery-box fade-in-up">
+          <!-- Main image with skeleton -->
+          <div class="gallery-main sk-wrap sk-square-ratio">
+            <div class="sk-placeholder"></div>
             <img id="mainGalleryImage" src="main.jpg" alt="Кросівки Violet Motion" />
           </div>
           <div class="gallery-thumbs">
-            <img class="thumb active" src="main.jpg" data-image="main.jpg" alt="Вид спереду" />
-            <img class="thumb" src="side.jpg" data-image="side.jpg" alt="Вид збоку" />
-            <img class="thumb" src="back.jpg" data-image="back.jpg" alt="Вид ззаду" />
-            <img class="thumb" src="top.jpg" data-image="top.jpg" alt="Вид зверху" />
+            <img class="thumb active" src="main.jpg" data-image="main.jpg" alt="Вид спереду"
+                 data-track="gallery_thumb" />
+            <img class="thumb" src="side.jpg" data-image="side.jpg" alt="Вид збоку"
+                 data-track="gallery_thumb" />
+            <img class="thumb" src="back.jpg" data-image="back.jpg" alt="Вид ззаду"
+                 data-track="gallery_thumb" />
+            <img class="thumb" src="top.jpg" data-image="top.jpg" alt="Вид зверху"
+                 data-track="gallery_thumb" />
           </div>
         </div>
       </div>
@@ -157,27 +165,27 @@
     <!-- 02 FEATURES -->
     <section class="section features" id="features">
       <div class="container">
-        <div class="section-head">
+        <div class="section-head fade-in-up">
           <span class="section-code">02</span>
           <h2>Чому вони реально <span class="h-accent">чіпляють</span></h2>
         </div>
         <div class="feature-grid">
-          <article class="feature-card">
+          <article class="feature-card fade-in-up">
             <div class="feature-icon">☁️</div>
             <h3>М'яка посадка</h3>
             <p>Амортизуюча підошва знижує навантаження під час ходьби протягом дня.</p>
           </article>
-          <article class="feature-card">
+          <article class="feature-card fade-in-up">
             <div class="feature-icon">💜</div>
             <h3>Стильний відтінок</h3>
             <p>Світлий фіолетовий акцент виглядає ніжно, дорого і не банально.</p>
           </article>
-          <article class="feature-card">
+          <article class="feature-card fade-in-up">
             <div class="feature-icon">🫧</div>
             <h3>Дихаючий верх</h3>
             <p>Сітчасті вставки допомагають нозі почуватися комфортно навіть у теплу погоду.</p>
           </article>
-          <article class="feature-card">
+          <article class="feature-card fade-in-up">
             <div class="feature-icon">✨</div>
             <h3>На кожен день</h3>
             <p>Підійдуть і під спортивний образ, і під легкий міський casual.</p>
@@ -189,7 +197,7 @@
     <!-- 03 VISUAL -->
     <section class="section visual-block">
       <div class="container">
-        <div class="visual-box">
+        <div class="visual-box fade-in-up">
           <div class="visual-text">
             <span class="section-code">03</span>
             <h2>М'який <span class="h-soft">вайб</span>. Чистий <span class="h-accent">стиль</span>. Максимум <span class="h-glow">жіночності</span>.</h2>
@@ -200,10 +208,11 @@
               <li>зручні на щодень</li>
               <li>гарно виглядають у русі</li>
             </ul>
-            <a href="#order" class="main-btn small-btn">ЗАМОВИТИ ЗАРАЗ</a>
+            <a href="#order" class="main-btn small-btn" data-track="visual_cta">ЗАМОВИТИ ЗАРАЗ</a>
           </div>
           <div class="visual-image-wrap">
-            <img src="photo_2026-04-22_13-18-54.jpg" alt="Кросівки Violet Motion" class="visual-image" onerror="this.style.display='none'" />
+            <img src="photo_2026-04-22_13-18-54.jpg" alt="Кросівки Violet Motion"
+                 class="visual-image" onerror="this.style.display='none'" />
             <div class="glow-orb glow-1"></div>
             <div class="glow-orb glow-2"></div>
           </div>
@@ -214,11 +223,11 @@
     <!-- 04 SPECS -->
     <section class="section specs-section">
       <div class="container">
-        <div class="section-head">
+        <div class="section-head fade-in-up">
           <span class="section-code">04</span>
           <h2><span class="h-accent">Характеристики</span></h2>
         </div>
-        <div class="specs-card">
+        <div class="specs-card fade-in-up">
           <div class="spec-row"><span>Тип</span><strong>Жіночі кросівки</strong></div>
           <div class="spec-row"><span>Колір</span><strong>Білий / світло-фіолетовий</strong></div>
           <div class="spec-row"><span>Верх</span><strong>Еко-шкіра + дихаюча сітка</strong></div>
@@ -232,24 +241,24 @@
     <!-- 05 STEPS -->
     <section class="section steps-section">
       <div class="container">
-        <div class="section-head">
+        <div class="section-head fade-in-up">
           <span class="section-code">05</span>
           <h2>Як це <span class="h-glow">працює</span></h2>
         </div>
         <div class="steps-list">
-          <div class="step-item">
+          <div class="step-item fade-in-up">
             <div class="step-num">01</div>
             <div class="step-body"><h3>Ви залишаєте заявку</h3><p>Ваше ім'я, телефон і розмір — швидко та зручно.</p></div>
           </div>
-          <div class="step-item">
+          <div class="step-item fade-in-up">
             <div class="step-num">02</div>
             <div class="step-body"><h3>Ми уточнюємо деталі</h3><p>Менеджер зв'яжеться з Вами для підтвердження замовлення.</p></div>
           </div>
-          <div class="step-item">
+          <div class="step-item fade-in-up">
             <div class="step-num">03</div>
             <div class="step-body"><h3>Відправляємо Новою Поштою</h3><p>Швидка доставка по Україні у зручне для Вас відділення.</p></div>
           </div>
-          <div class="step-item">
+          <div class="step-item fade-in-up">
             <div class="step-num">04</div>
             <div class="step-body"><h3>Ви отримуєте й приміряєте</h3><p>Спочатку огляд і примірка, а вже потім оплата при отриманні.</p></div>
           </div>
@@ -260,7 +269,7 @@
     <!-- 06 SALE -->
     <section class="section sale-section">
       <div class="container">
-        <div class="sale-box">
+        <div class="sale-box fade-in-up">
           <div class="sale-top">
             <span class="section-code">06</span>
             <h2>Акція ще <span class="h-accent">триває</span></h2>
@@ -276,21 +285,20 @@
             <div class="time-box"><span id="seconds">59</span><small>сек</small></div>
           </div>
           <div class="stock-box">🔥 Залишилось <span id="stockCount">17</span> пар за акційною ціною</div>
-          <a href="#order" class="main-btn sale-cta">ЗАБРАТИ ЗА 895 ГРН</a>
+          <a href="#order" class="main-btn sale-cta" data-track="sale_cta">ЗАБРАТИ ЗА 895 ГРН</a>
         </div>
       </div>
     </section>
 
-    <!-- 07 ORDER — форма з соціальним доказом -->
+    <!-- 07 ORDER -->
     <section class="section order-section" id="order">
       <div class="container">
-        <div class="section-head">
+        <div class="section-head fade-in-up">
           <span class="section-code">07</span>
           <h2>Оформити <span class="h-glow">замовлення</span></h2>
         </div>
 
-        <!-- СОЦІАЛЬНИЙ ДОКАЗ НАД ФОРМОЮ -->
-        <div class="order-social-proof">
+        <div class="order-social-proof fade-in-up">
           <div class="osp-avatars">
             <div class="osp-av" style="background:linear-gradient(135deg,#f9a8d4,#c084fc)">М</div>
             <div class="osp-av" style="background:linear-gradient(135deg,#a5f3fc,#818cf8)">О</div>
@@ -299,7 +307,7 @@
           <span>Сьогодні вже <strong id="todayOrders">7</strong> замовлень · Останнє — <strong id="lastOrderTime">14 хв тому</strong></span>
         </div>
 
-        <div class="order-card">
+        <div class="order-card fade-in-up">
           <form id="orderForm" class="order-form">
             <label class="input-group">
               <span>Ваше ім'я</span>
@@ -312,11 +320,11 @@
             <div class="input-group">
               <span>Оберіть розмір</span>
               <div class="size-grid" id="sizeGrid">
-                <button type="button" class="size-btn" data-size="36">36</button>
-                <button type="button" class="size-btn" data-size="37">37</button>
-                <button type="button" class="size-btn" data-size="38">38</button>
-                <button type="button" class="size-btn" data-size="39">39</button>
-                <button type="button" class="size-btn" data-size="40">40</button>
+                <button type="button" class="size-btn" data-size="36" data-track="size_select">36</button>
+                <button type="button" class="size-btn" data-size="37" data-track="size_select">37</button>
+                <button type="button" class="size-btn" data-size="38" data-track="size_select">38</button>
+                <button type="button" class="size-btn" data-size="39" data-track="size_select">39</button>
+                <button type="button" class="size-btn" data-size="40" data-track="size_select">40</button>
               </div>
               <input type="hidden" id="selectedSize" name="size" />
             </div>
@@ -336,14 +344,15 @@
               </span>
             </label>
 
-            <!-- МІКРО-ГАРАНТІЇ ПРЯМО НАД КНОПКОЮ -->
             <div class="pre-btn-trust">
               <span>🔒 Ніякої передоплати</span>
               <span>📦 Примірка на пошті</span>
               <span>↩️ Обмін 14 днів</span>
             </div>
 
-            <button type="submit" class="main-btn form-btn pulse-cta">💜 ЗАБРАТИ ЗА 895 ГРН</button>
+            <button type="submit" class="main-btn form-btn pulse-cta" data-track="order_submit">
+              💜 ЗАБРАТИ ЗА 895 ГРН
+            </button>
             <p class="secure-note">Оплата лише після примірки. Безпечне замовлення без передоплати.</p>
             <p class="form-agree">Натискаючи кнопку, Ви погоджуєтесь на обробку персональних даних.</p>
             <div class="form-message" id="formMessage"></div>
@@ -352,16 +361,15 @@
       </div>
     </section>
 
-    <!-- 08 REVIEWS — 15 відгуків, без фото -->
+    <!-- 08 REVIEWS -->
     <section class="section reviews-section" id="reviews">
       <div class="container">
-        <div class="section-head">
+        <div class="section-head fade-in-up">
           <span class="section-code">08</span>
           <h2><span class="h-soft">Відгуки</span></h2>
         </div>
 
-        <!-- ЗАГАЛЬНИЙ РЕЙТИНГ -->
-        <div class="rating-summary">
+        <div class="rating-summary fade-in-up">
           <div class="rating-big">4.9</div>
           <div class="rating-summary-right">
             <div class="rating-stars-big">★★★★★</div>
@@ -388,7 +396,7 @@
             <div class="reviews-list" id="reviewsList"></div>
             <div class="reviews-pagination" id="reviewsPagination"></div>
           </div>
-          <div class="review-form-card">
+          <div class="review-form-card fade-in-up">
             <div class="review-form-title">Залишити <span class="h-accent">відгук</span></div>
             <form id="reviewForm" class="review-form">
               <label class="input-group">
@@ -410,7 +418,7 @@
                 <span>Ваш відгук</span>
                 <textarea id="reviewText" class="review-textarea" placeholder="Напишіть кілька слів про враження..."></textarea>
               </label>
-              <button type="submit" class="main-btn form-btn">ДОДАТИ ВІДГУК</button>
+              <button type="submit" class="main-btn form-btn" data-track="review_submit">ДОДАТИ ВІДГУК</button>
               <div class="form-message" id="reviewMessage"></div>
             </form>
           </div>
@@ -421,7 +429,8 @@
   </main>
 
   <!-- FLOATING ORDER BUTTON -->
-  <a href="#order" class="float-order-btn" id="floatOrderBtn" aria-label="Замовити">
+  <a href="#order" class="float-order-btn" id="floatOrderBtn" aria-label="Замовити"
+     data-track="float_cta">
     <span class="float-order-btn__text">ЗАМОВИТИ</span>
     <svg class="float-order-btn__icon" width="16" height="16" viewBox="0 0 24 24" fill="none">
       <path d="M5 12H19M19 12L12 5M19 12L12 19" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
@@ -465,7 +474,7 @@
   </div>
 
   <!-- SUPPORT FAB -->
-  <button class="support-fab" id="supportFab" aria-label="Підтримка">
+  <button class="support-fab" id="supportFab" aria-label="Підтримка" data-track="support_open">
     <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
       <path d="M20 2H4C2.9 2 2 2.9 2 4V22L6 18H20C21.1 18 22 17.1 22 16V4C22 2.9 21.1 2 20 2Z" fill="currentColor"/>
     </svg>
