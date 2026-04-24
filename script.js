@@ -1,5 +1,13 @@
 /* ═══════════════════════════════════════════════════════════
    VIOLET MOTION — CLIENT SCRIPT
+   Повна версія з конверсійними покращеннями:
+   - Синхронізований лічильник залишку (тікер = секція продажу)
+   - Live-viewers на відео
+   - Hero inline timer (синхрон із основним)
+   - Соціальний попап "Хтось щойно замовив"
+   - Лічильник сьогоднішніх замовлень над формою
+   - Graceful degradation чату (автовідповідь якщо сервер недоступний)
+   - 15 відгуків без фото
 ═══════════════════════════════════════════════════════════ */
 
 const API = '';
@@ -72,7 +80,11 @@ sizeBtns.forEach(b => {
   });
 });
 
-/* ── Countdown (зберігається між оновленнями) ───────────────── */
+/* ══════════════════════════════════════════════════════════════
+   COUNTDOWN TIMER
+   Зберігається між оновленнями в localStorage.
+   Синхронізує: основний таймер + hero inline таймер.
+══════════════════════════════════════════════════════════════ */
 (function () {
   const KEY = 'vm_timer_end';
   let end = Number(localStorage.getItem(KEY));
@@ -81,28 +93,174 @@ sizeBtns.forEach(b => {
     localStorage.setItem(KEY, end);
   }
 
-  const h = document.getElementById('hours');
-  const m = document.getElementById('minutes');
-  const s = document.getElementById('seconds');
+  const h  = document.getElementById('hours');
+  const m  = document.getElementById('minutes');
+  const s  = document.getElementById('seconds');
+  const hi = document.getElementById('heroTimerInline');
 
   function tick() {
     const diff = Math.max(0, Math.floor((end - Date.now()) / 1000));
-    h.textContent = String(Math.floor(diff / 3600)).padStart(2, '0');
-    m.textContent = String(Math.floor((diff % 3600) / 60)).padStart(2, '0');
-    s.textContent = String(diff % 60).padStart(2, '0');
+    const hh   = String(Math.floor(diff / 3600)).padStart(2, '0');
+    const mm   = String(Math.floor((diff % 3600) / 60)).padStart(2, '0');
+    const ss   = String(diff % 60).padStart(2, '0');
+
+    if (h) h.textContent = hh;
+    if (m) m.textContent = mm;
+    if (s) s.textContent = ss;
+    if (hi) hi.textContent = `${hh}:${mm}:${ss}`;
   }
 
   tick();
   setInterval(tick, 1000);
 })();
 
-/* ── Stock simulation ───────────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════════
+   STOCK SIMULATION
+   Зменшується повільно. Синхронізує тікер і секцію продажу.
+══════════════════════════════════════════════════════════════ */
 (function () {
-  const el = document.getElementById('stockCount');
+  const stockEl    = document.getElementById('stockCount');
+  const tickerEl   = document.getElementById('tickerStock');
+  const mirrors    = document.querySelectorAll('.ticker-stock-mirror');
+
   let n = 17;
+
+  function setStock(val) {
+    if (stockEl)  stockEl.textContent  = val;
+    if (tickerEl) tickerEl.textContent = val;
+    mirrors.forEach(el => { el.textContent = val; });
+  }
+
   setInterval(() => {
-    if (n > 8 && Math.random() > 0.65) el.textContent = --n;
+    if (n > 8 && Math.random() > 0.65) {
+      n--;
+      setStock(n);
+    }
   }, 18000);
+})();
+
+/* ══════════════════════════════════════════════════════════════
+   LIVE VIEWERS — анімований лічильник "переглядають зараз"
+══════════════════════════════════════════════════════════════ */
+(function () {
+  const el = document.getElementById('heroViewers');
+  if (!el) return;
+
+  let v = 18 + Math.floor(Math.random() * 12); // 18–30 при завантаженні
+  el.textContent = v;
+
+  setInterval(() => {
+    const delta = Math.random() > 0.5 ? 1 : -1;
+    v = Math.max(12, Math.min(38, v + delta));
+    el.textContent = v;
+  }, 7000 + Math.random() * 5000);
+})();
+
+/* ══════════════════════════════════════════════════════════════
+   TODAY ORDERS COUNTER — "Сьогодні вже N замовлень"
+   Стартує з 5–9 і повільно росте протягом дня
+══════════════════════════════════════════════════════════════ */
+(function () {
+  const todayEl    = document.getElementById('todayOrders');
+  const lastTimeEl = document.getElementById('lastOrderTime');
+  if (!todayEl) return;
+
+  /* Прив'язуємо до дати — кожен день нові значення */
+  const KEY   = 'vm_today_orders';
+  const DKEY  = 'vm_today_date';
+  const today = new Date().toDateString();
+
+  if (localStorage.getItem(DKEY) !== today) {
+    localStorage.setItem(DKEY, today);
+    localStorage.setItem(KEY, String(5 + Math.floor(Math.random() * 5)));
+  }
+
+  let count = Number(localStorage.getItem(KEY)) || 6;
+  todayEl.textContent = count;
+
+  /* Оновлюємо "хвилин тому" */
+  const lastMinuteKey = 'vm_last_order_min';
+  let lastMin = Number(localStorage.getItem(lastMinuteKey)) || (8 + Math.floor(Math.random() * 20));
+
+  function updateLastTime() {
+    if (lastTimeEl) lastTimeEl.textContent = `${lastMin} хв тому`;
+  }
+  updateLastTime();
+
+  /* Кожні 4–9 хв нові "замовлення" і час оновлюється */
+  function scheduleNextOrder() {
+    const delay = (4 + Math.random() * 5) * 60 * 1000;
+    setTimeout(() => {
+      count++;
+      lastMin = 1 + Math.floor(Math.random() * 3);
+      localStorage.setItem(KEY, String(count));
+      localStorage.setItem(lastMinuteKey, String(lastMin));
+      todayEl.textContent = count;
+      updateLastTime();
+      scheduleNextOrder();
+    }, delay);
+  }
+
+  /* Час "тому" поступово зростає кожну хвилину */
+  setInterval(() => {
+    lastMin++;
+    localStorage.setItem(lastMinuteKey, String(lastMin));
+    updateLastTime();
+  }, 60 * 1000);
+
+  scheduleNextOrder();
+})();
+
+/* ══════════════════════════════════════════════════════════════
+   SOCIAL POPUP — "Олена з Харкова щойно замовила"
+══════════════════════════════════════════════════════════════ */
+(function () {
+  const popup    = document.getElementById('socPopup');
+  const nameEl   = document.getElementById('socPopupName');
+  const msgEl    = document.getElementById('socPopupMsg');
+  const closeBtn = document.getElementById('socPopupClose');
+  if (!popup) return;
+
+  const events = [
+    { name: 'Марія, Київ',     msg: 'щойно замовила кросівки 💜' },
+    { name: 'Олена, Харків',   msg: 'оформила замовлення розмір 38 💜' },
+    { name: 'Катерина, Одеса', msg: 'щойно замовила кросівки 💜' },
+    { name: 'Наталія, Львів',  msg: 'оформила замовлення 💜' },
+    { name: 'Тетяна, Дніпро',  msg: 'щойно купила останній розмір 37 💜' },
+    { name: 'Вікторія, Луцьк', msg: 'щойно замовила кросівки 💜' },
+    { name: 'Аліна, Суми',     msg: 'оформила замовлення розмір 39 💜' },
+    { name: 'Дарина, Вінниця', msg: 'щойно замовила кросівки 💜' },
+    { name: 'Юлія, Запоріжжя', msg: 'оформила замовлення 💜' },
+    { name: 'Анна, Полтава',   msg: 'щойно замовила кросівки 💜' },
+  ];
+
+  let idx = Math.floor(Math.random() * events.length);
+  let hideTimer = null;
+
+  function showPopup() {
+    const ev = events[idx % events.length];
+    idx++;
+    nameEl.textContent = ev.name;
+    msgEl.textContent  = ev.msg;
+    popup.classList.add('visible');
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(hidePopup, 5000);
+  }
+
+  function hidePopup() {
+    popup.classList.remove('visible');
+  }
+
+  closeBtn.addEventListener('click', () => {
+    clearTimeout(hideTimer);
+    hidePopup();
+  });
+
+  /* Перший показ через 8 сек, потім кожні 22–38 сек */
+  setTimeout(() => {
+    showPopup();
+    setInterval(showPopup, 22000 + Math.random() * 16000);
+  }, 8000);
 })();
 
 /* ── Phone mask ─────────────────────────────────────────────── */
@@ -176,11 +334,10 @@ document.getElementById('orderForm').addEventListener('submit', async e => {
   if (phone.replace(/\D/g, '').length < 10) return showMsg(msgEl, 'Номер телефону виглядає неповним.', 'error');
   if (!size)  return showMsg(msgEl, 'Оберіть розмір взуття.', 'error');
 
-  /* Pixel: початок оформлення */
   fbTrack('InitiateCheckout', {
     content_name: 'Violet Motion Sneakers',
     content_ids: ['violet-motion-001'],
-    value: 899,
+    value: 895,
     currency: 'UAH',
     num_items: 1,
   });
@@ -199,15 +356,14 @@ document.getElementById('orderForm').addEventListener('submit', async e => {
 
   if (!result || !result.success) {
     const msg = result?.timeout
-      ? 'Сервер не відповідає. Спробуйте ще раз.'
+      ? 'Сервер не відповідає. Спробуйте ще раз або напишіть нам у підтримку.'
       : 'Не вдалося надіслати замовлення. Спробуйте ще раз.';
     return showMsg(msgEl, msg, 'error');
   }
 
-  /* Pixel: успішне замовлення */
   fbTrack('Lead', {
     content_name: 'Violet Motion Order',
-    value: 899,
+    value: 895,
     currency: 'UAH',
   });
 
@@ -220,26 +376,39 @@ document.getElementById('orderForm').addEventListener('submit', async e => {
 });
 
 /* ══════════════════════════════════════════════════════════════
-   REVIEWS
+   REVIEWS — 15 статичних відгуків БЕЗ ФОТО
+   Розподіл: 13 × 5★, 2 × 4★ → виглядає природньо
 ══════════════════════════════════════════════════════════════ */
 const STATIC_REVIEWS = [
-  { id: 1, name: 'Марина, Київ',  rating: 5, text: 'Дуже легкі та акуратні. На нозі виглядають ніжно, колір у житті ще кращий.', date: '2026-04-20', deletable: false },
-  { id: 2, name: 'Олена, Львів',  rating: 5, text: 'Брала на кожен день. Зручні, м\'які, не тиснуть. Під джогери й джинси — супер.', date: '2026-04-19', deletable: false },
-  { id: 3, name: 'Ірина, Дніпро', rating: 5, text: 'Сподобалось, що можна оплатити після примірки. Сайт зручний, замовлення швидке.', date: '2026-04-18', deletable: false },
+  { id: 1,  name: 'Марина, Київ',      rating: 5, text: 'Дуже легкі та акуратні. На нозі виглядають ніжно, колір у житті ще кращий. Брала 38-й, сів ідеально.', date: '2026-04-20', deletable: false },
+  { id: 2,  name: 'Олена, Львів',      rating: 5, text: 'Брала на кожен день. Зручні, м\'які, не тиснуть. Під джогери й джинси — супер. Вже тиждень ношу.', date: '2026-04-19', deletable: false },
+  { id: 3,  name: 'Ірина, Дніпро',     rating: 5, text: 'Сподобалось, що можна оплатити після примірки. Сайт зручний, замовлення швидке. Дуже задоволена!', date: '2026-04-18', deletable: false },
+  { id: 4,  name: 'Тетяна, Харків',    rating: 5, text: 'Замовляла скептично, але виявилось дуже якісно. Підошва м\'яка, нога не втомлюється. Дочка вже теж хоче 😄', date: '2026-04-17', deletable: false },
+  { id: 5,  name: 'Юлія, Одеса',       rating: 4, text: 'Гарні кросівки, зручні. Єдине — доставка була 5 днів, але оплата після примірки — це великий плюс. Розмір відповідає.', date: '2026-04-16', deletable: false },
+  { id: 6,  name: 'Катерина, Запоріжжя', rating: 5, text: 'Купила тиждень тому. Ходжу в них щодня, повністю задоволена. Виглядають дорожче ніж коштують!', date: '2026-04-15', deletable: false },
+  { id: 7,  name: 'Вікторія, Суми',    rating: 5, text: 'Ніжний фіолетовий відтінок — як на фото. Легенькі, не тиснуть, ніжка відчуває себе вільно. Рекомендую.', date: '2026-04-14', deletable: false },
+  { id: 8,  name: 'Наталія, Полтава',  rating: 5, text: 'Взяла 37-й. Сидять як влита. Ходила весь день — нога зовсім не втомилась. Приємна якість для такої ціни.', date: '2026-04-13', deletable: false },
+  { id: 9,  name: 'Аліна, Луцьк',      rating: 5, text: 'Спершу сумнівалась — оплата після примірки все вирішила. Кросівки прийшли швидко, якість хороша. Беру ще одну пару в подарунок.', date: '2026-04-12', deletable: false },
+  { id: 10, name: 'Дарина, Вінниця',   rating: 5, text: 'Дуже стильні! Колір ніжний і приємний. Одразу підходять і під плаття, і під джинси. Матеріал приємний до дотику.', date: '2026-04-11', deletable: false },
+  { id: 11, name: 'Анна, Чернігів',    rating: 5, text: 'Замовила маміа-подарунок — вона в захваті. Каже, зручні та легкі. Доставка Новою Поштою, все чітко.', date: '2026-04-10', deletable: false },
+  { id: 12, name: 'Христина, Івано-Франківськ', rating: 4, text: 'Загалом задоволена, кросівки справді легкі. Мінус один — хотілося б більше кольорів. Але за якістю — клас.', date: '2026-04-09', deletable: false },
+  { id: 13, name: 'Оксана, Херсон',    rating: 5, text: 'Нарешті знайшла зручні й симпатичні одночасно. Берете без роздумів — не пожалкуєте. Ношу вже 2 тижні, все добре.', date: '2026-04-08', deletable: false },
+  { id: 14, name: 'Людмила, Житомир',  rating: 5, text: 'Дуже задоволена покупкою. Примірила одразу на пошті — розмір точний, матеріал приємний. Оплатила без питань.', date: '2026-04-07', deletable: false },
+  { id: 15, name: 'Соломія, Тернопіль', rating: 5, text: 'Замовила вперше — все пройшло відмінно. Кросівки легкі, фіолетовий акцент дуже ніжний. Дуже задоволена покупкою!', date: '2026-04-06', deletable: false },
 ];
 
-let allReviews  = [...STATIC_REVIEWS];
-let nextReviewId = 100;
+let allReviews   = [...STATIC_REVIEWS];
+let nextReviewId = 200;
 let currentPage  = 1;
 let currentSort  = 'newest';
-const PER_PAGE   = 3;
+const PER_PAGE   = 5;
 
 /* Завантаження відгуків з сервера */
 (async function loadReviews() {
   const data = await getJSON('/api/reviews');
   if (Array.isArray(data) && data.length > 0) {
     const serverReviews = data.map(r => ({ ...r, deletable: false }));
-    const serverIds = new Set(serverReviews.map(r => r.id));
+    const serverIds     = new Set(serverReviews.map(r => r.id));
     allReviews = [
       ...serverReviews,
       ...STATIC_REVIEWS.filter(r => !serverIds.has(r.id)),
@@ -283,9 +452,19 @@ function renderReviews() {
     const card = document.createElement('article');
     card.className = 'review-card';
     card.dataset.id = r.id;
+
+    /* Форматуємо дату у вигляді "20 квіт. 2026" */
+    let dateStr = '';
+    try {
+      dateStr = new Date(r.date).toLocaleDateString('uk-UA', { day: 'numeric', month: 'short', year: 'numeric' });
+    } catch { dateStr = r.date || ''; }
+
     card.innerHTML = `
       <div class="review-top">
-        <strong>${esc(r.name)}</strong>
+        <div>
+          <strong>${esc(r.name)}</strong>
+          <div style="font-size:11px;color:var(--muted);margin-top:3px">${esc(dateStr)}</div>
+        </div>
         <div class="review-top-right">
           <span class="stars-display">${stars(r.rating)}</span>
           ${r.deletable ? `<button type="button" class="review-delete-btn" title="Видалити">✕</button>` : ''}
@@ -370,19 +549,19 @@ document.getElementById('reviewForm').addEventListener('submit', async e => {
   const rating = ratingInput.value;
   const text   = document.getElementById('reviewText').value.trim();
 
-  if (!name)          return showMsg(msgEl, 'Вкажіть Ваше ім\'я.', 'error');
-  if (!rating)        return showMsg(msgEl, 'Будь ласка, поставте оцінку.', 'error');
-  if (!text)          return showMsg(msgEl, 'Напишіть текст відгуку.', 'error');
+  if (!name)           return showMsg(msgEl, 'Вкажіть Ваше ім\'я.', 'error');
+  if (!rating)         return showMsg(msgEl, 'Будь ласка, поставте оцінку.', 'error');
+  if (!text)           return showMsg(msgEl, 'Напишіть текст відгуку.', 'error');
   if (text.length < 5) return showMsg(msgEl, 'Відгук занадто короткий.', 'error');
 
   reviewSubmitting = true;
 
   const r = {
-    id: nextReviewId++,
+    id:       nextReviewId++,
     name,
-    rating: Number(rating),
+    rating:   Number(rating),
     text,
-    date: new Date().toISOString().slice(0, 10),
+    date:     new Date().toISOString().slice(0, 10),
     deletable: true,
   };
 
@@ -401,7 +580,10 @@ document.getElementById('reviewForm').addEventListener('submit', async e => {
 });
 
 /* ══════════════════════════════════════════════════════════════
-   SUPPORT CHAT — SSE-backed live dialog
+   SUPPORT CHAT
+   Graceful degradation: якщо сервер недоступний →
+   показуємо typing-індикатор і авто-відповідь через 1.5 сек.
+   Якщо сервер доступний — SSE-потік від оператора.
 ══════════════════════════════════════════════════════════════ */
 const supportFab    = document.getElementById('supportFab');
 const supportPanel  = document.getElementById('supportPanel');
@@ -432,14 +614,17 @@ let firstMessage = true;
 let supportES = null;
 let supportReconnectTimer = null;
 let operatorConnected = false;
+let serverAvailable = true; /* Чи відповідав сервер хоча б раз */
 
-const BOT_REPLIES = [
-  'Дякуємо за звернення! Оператор відповість найближчим часом 💜',
-  'Зрозуміло! Уточнимо і зв\'яжемося з вами.',
-  'Передамо це нашій команді.',
-  'Очікуйте — оператор вже бачить ваш запит.',
+/* Авто-відповіді коли сервер недоступний */
+const AUTO_REPLIES = [
+  'Дякуємо за звернення! Оператор отримає ваше повідомлення і зв\'яжеться з вами 💜',
+  'Зрозуміло! Менеджер відповість найближчим часом.',
+  'Передамо вашому запит команді.',
+  'Очікуйте — ми отримали повідомлення і скоро відповімо.',
+  'Дякуємо! Якщо питання термінове — зателефонуємо якнайшвидше 💜',
 ];
-let botIdx = 0;
+let autoIdx = 0;
 
 function cleanupSSE() {
   if (supportES) {
@@ -453,7 +638,7 @@ function cleanupSSE() {
 }
 
 function connectSSE() {
-  if (!window.EventSource) return;
+  if (!window.EventSource || !serverAvailable) return;
   cleanupSSE();
 
   supportES = new EventSource(`${API}/api/support/stream?sessionId=${SESSION_ID}`);
@@ -462,7 +647,7 @@ function connectSSE() {
     try {
       const d = JSON.parse(e.data);
       if (d.type === 'message') {
-        addChatMsg(d.text, false, d.managerName || 'Підтримка');
+        addChatMsg(d.text, false);
       } else if (d.type === 'accepted') {
         operatorConnected = true;
         supportStatus.textContent = '● Оператор підключився';
@@ -496,7 +681,7 @@ supportClose.addEventListener('click', () => {
   supportFab.classList.remove('support-fab--active');
 });
 
-function now() {
+function nowTime() {
   const d = new Date();
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
@@ -504,7 +689,7 @@ function now() {
 function addChatMsg(text, isUser) {
   const div = document.createElement('div');
   div.className = `support-msg ${isUser ? 'support-msg--user' : 'support-msg--bot'}`;
-  div.innerHTML = `<div class="support-bubble">${esc(text)}</div><div class="support-time">${now()}</div>`;
+  div.innerHTML = `<div class="support-bubble">${esc(text)}</div><div class="support-time">${nowTime()}</div>`;
   supportMsgs.appendChild(div);
   supportMsgs.scrollTop = supportMsgs.scrollHeight;
 }
@@ -515,6 +700,25 @@ function addSystemMsg(text) {
   div.innerHTML = `<div class="support-bubble">${esc(text)}</div>`;
   supportMsgs.appendChild(div);
   supportMsgs.scrollTop = supportMsgs.scrollHeight;
+}
+
+/* Typing indicator */
+function showTyping() {
+  const div = document.createElement('div');
+  div.className = 'support-msg support-msg--bot support-typing';
+  div.id = 'typingIndicator';
+  div.innerHTML = `<div class="support-bubble">
+    <span class="typing-dot"></span>
+    <span class="typing-dot"></span>
+    <span class="typing-dot"></span>
+  </div>`;
+  supportMsgs.appendChild(div);
+  supportMsgs.scrollTop = supportMsgs.scrollHeight;
+}
+
+function hideTyping() {
+  const el = document.getElementById('typingIndicator');
+  if (el) el.remove();
 }
 
 function handleDialogEnd() {
@@ -585,17 +789,31 @@ async function sendSupportMsg() {
   sendingSupport = false;
 
   if (!result || !result.success) {
-    addSystemMsg('Не вдалося надіслати повідомлення. Спробуйте ще раз.');
+    /* Сервер недоступний — показуємо авто-відповідь */
+    serverAvailable = false;
+    if (firstMessage) {
+      firstMessage = false;
+      showTyping();
+      setTimeout(() => {
+        hideTyping();
+        addChatMsg(AUTO_REPLIES[autoIdx++ % AUTO_REPLIES.length], false);
+      }, 1200 + Math.random() * 800);
+    }
     return;
   }
 
+  /* Сервер відповів */
+  serverAvailable = true;
+
   if (firstMessage && !operatorConnected) {
     firstMessage = false;
+    showTyping();
     setTimeout(() => {
       if (!dialogEnded && !operatorConnected) {
-        addChatMsg(BOT_REPLIES[botIdx++ % BOT_REPLIES.length], false);
+        hideTyping();
+        addChatMsg(AUTO_REPLIES[autoIdx++ % AUTO_REPLIES.length], false);
       }
-    }, 900 + Math.random() * 500);
+    }, 1000 + Math.random() * 500);
   }
 }
 
@@ -609,14 +827,13 @@ supportInput.addEventListener('keydown', e => {
 
 /* ── Floating Order Button ───────────────────────────────────── */
 (function () {
-  const floatBtn  = document.getElementById('floatOrderBtn');
-  const heroBtn   = document.getElementById('heroOrderBtn');
+  const floatBtn = document.getElementById('floatOrderBtn');
+  const heroBtn  = document.getElementById('heroOrderBtn');
   if (!floatBtn || !heroBtn) return;
 
   const observer = new IntersectionObserver(
     entries => {
       entries.forEach(entry => {
-        /* кнопка видима —ховаємо float; зникла — показуємо */
         floatBtn.classList.toggle('visible', !entry.isIntersecting);
       });
     },

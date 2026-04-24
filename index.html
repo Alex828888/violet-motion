@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Violet Motion — стильні кросівки</title>
+  <title>Violet Motion — стильні жіночі кросівки</title>
   <meta name="description" content="Стильні жіночі кросівки у світло-фіолетовому відтінку. Легкі, м'які, зручні та ефектні. Оплата після примірки." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -25,19 +25,23 @@
 </head>
 <body>
 
-  <!-- TICKER -->
+  <!-- TICKER — лічильник синхронізований зі скриптом (17) -->
   <div class="top-ticker">
     <div class="ticker-track">
       <span>✨ Легка вага</span>
       <span>💜 Фіолетовий акцент</span>
       <span>🚚 Доставка по Україні</span>
-      <span>📦 Оплата при отриманні</span>
-      <span>🔥 Залишилось 43 пари</span>
+      <span>📦 Оплата після примірки</span>
+      <span>🔥 Залишилось <span id="tickerStock">17</span> пар</span>
+      <span>⭐ 4.9 рейтинг · 430+ замовлень</span>
+      <span>↩️ Обмін 14 днів без питань</span>
       <span>✨ Легка вага</span>
       <span>💜 Фіолетовий акцент</span>
       <span>🚚 Доставка по Україні</span>
-      <span>📦 Оплата при отриманні</span>
-      <span>🔥 Залишилось 43 пари</span>
+      <span>📦 Оплата після примірки</span>
+      <span>🔥 Залишилось <span class="ticker-stock-mirror">17</span> пар</span>
+      <span>⭐ 4.9 рейтинг · 430+ замовлень</span>
+      <span>↩️ Обмін 14 днів без питань</span>
     </div>
   </div>
 
@@ -51,39 +55,85 @@
       <div class="brand-row">
         <div class="brand">VIOLET MOTION</div>
       </div>
+
       <div class="hero-video-card">
         <video class="hero-video" autoplay muted loop playsinline poster="photo_2026-04-22_13-18-54.jpg">
           <source src="media/shoes-video.mp4" type="video/mp4" />
         </video>
         <img src="photo_2026-04-22_13-18-54.jpg" alt="Кросівки Violet Motion" class="hero-video-fallback" onerror="this.style.display='none'" />
         <div class="hero-video-shine"></div>
+        <!-- LIVE VIEWERS — соціальний тиск на відео -->
+        <div class="hero-live-badge">
+          <span class="live-dot"></span>
+          <span id="heroViewers">24</span>&nbsp;переглядають зараз
+        </div>
       </div>
+
       <div class="hero-badge">нова колекція • soft violet edition</div>
       <h1 class="hero-title">
         Стиль, легкість<br />і комфорт<br />
         <span>в одній парі</span>
       </h1>
       <p class="hero-text">Ефектні жіночі кросівки у світло-фіолетовому стилі. Ідеально для прогулянок, міста, подорожей і щоденного вайбу без втоми в ногах.</p>
-      <div class="hero-price-box">
-        <div class="old-price">1 899 грн</div>
-        <div class="new-price">895 грн</div>
-        <div class="price-note">Лише сьогодні • оплата після примірки</div>
+
+      <!-- СОЦІАЛЬНИЙ ДОКАЗ: аватари + лічильник -->
+      <div class="hero-social-proof">
+        <div class="hero-avatars">
+          <div class="hero-av" style="background:linear-gradient(135deg,#f9a8d4,#c084fc)">О</div>
+          <div class="hero-av" style="background:linear-gradient(135deg,#a5f3fc,#818cf8)">М</div>
+          <div class="hero-av" style="background:linear-gradient(135deg,#fde68a,#f97316)">К</div>
+          <div class="hero-av" style="background:linear-gradient(135deg,#d9f99d,#4ade80)">Н</div>
+          <div class="hero-av" style="background:linear-gradient(135deg,#fecdd3,#fb7185)">Т</div>
+        </div>
+        <span class="hero-social-text">+<strong>430</strong> дівчат замовили цього місяця</span>
       </div>
+
+      <div class="hero-price-box">
+        <div class="price-row-inner">
+          <div>
+            <div class="old-price">1 899 грн</div>
+            <div class="new-price">895 грн</div>
+          </div>
+          <div class="price-badge-save">-53%</div>
+        </div>
+        <div class="price-note">
+          ⏱ Акція закінчується через:&nbsp;<span class="hero-timer-inline" id="heroTimerInline">--:--:--</span>&nbsp;·&nbsp;Оплата після примірки
+        </div>
+      </div>
+
       <div class="hero-actions">
-        <a href="#order" class="main-btn" id="heroOrderBtn">ЗАБРАТИ ЗА 895 ГРН</a>
+        <a href="#order" class="main-btn pulse-cta" id="heroOrderBtn">💜 ЗАБРАТИ ЗА 895 ГРН</a>
         <a href="#features" class="ghost-btn">ПОДИВИТИСЬ ДЕТАЛІ</a>
       </div>
+
       <div class="hero-mini-stats">
         <div class="mini-card"><strong>4.9</strong><span>рейтинг</span></div>
         <div class="mini-card"><strong>430+</strong><span>замовлень</span></div>
         <div class="mini-card"><strong>14 днів</strong><span>обмін</span></div>
+      </div>
+
+      <!-- ГАРАНТІЙНА СТРІЧКА -->
+      <div class="trust-ribbon">
+        <div class="trust-item">🔒 Оплата після примірки</div>
+        <div class="trust-item">🚚 Нова Пошта</div>
+        <div class="trust-item">↩️ Обмін 14 днів</div>
       </div>
     </div>
   </header>
 
   <main>
 
-    <!-- 01 GALLERY (перша секція) -->
+    <!-- ПОПАП СОЦІАЛЬНОГО ДОКАЗУ -->
+    <div class="soc-popup" id="socPopup">
+      <div class="soc-popup-icon">👟</div>
+      <div class="soc-popup-body">
+        <strong id="socPopupName">Олена, Київ</strong>
+        <span id="socPopupMsg">щойно замовила кросівки 💜</span>
+      </div>
+      <button class="soc-popup-close" id="socPopupClose" aria-label="Закрити">✕</button>
+    </div>
+
+    <!-- 01 GALLERY -->
     <section class="section gallery-section" id="gallery">
       <div class="container">
         <div class="section-head">
@@ -92,13 +142,13 @@
         </div>
         <div class="gallery-box">
           <div class="gallery-main">
-            <img id="mainGalleryImage" src="main.jpg">
+            <img id="mainGalleryImage" src="main.jpg" alt="Кросівки Violet Motion" />
           </div>
           <div class="gallery-thumbs">
-            <img class="thumb active" src="main.jpg" data-image="main.jpg">
-            <img class="thumb" src="side.jpg" data-image="side.jpg">
-            <img class="thumb" src="back.jpg" data-image="back.jpg">
-            <img class="thumb" src="top.jpg" data-image="top.jpg">
+            <img class="thumb active" src="main.jpg" data-image="main.jpg" alt="Вид спереду" />
+            <img class="thumb" src="side.jpg" data-image="side.jpg" alt="Вид збоку" />
+            <img class="thumb" src="back.jpg" data-image="back.jpg" alt="Вид ззаду" />
+            <img class="thumb" src="top.jpg" data-image="top.jpg" alt="Вид зверху" />
           </div>
         </div>
       </div>
@@ -226,26 +276,38 @@
             <div class="time-box"><span id="seconds">59</span><small>сек</small></div>
           </div>
           <div class="stock-box">🔥 Залишилось <span id="stockCount">17</span> пар за акційною ціною</div>
+          <a href="#order" class="main-btn sale-cta">ЗАБРАТИ ЗА 895 ГРН</a>
         </div>
       </div>
     </section>
 
-    <!-- 07 ORDER -->
+    <!-- 07 ORDER — форма з соціальним доказом -->
     <section class="section order-section" id="order">
       <div class="container">
         <div class="section-head">
           <span class="section-code">07</span>
           <h2>Оформити <span class="h-glow">замовлення</span></h2>
         </div>
+
+        <!-- СОЦІАЛЬНИЙ ДОКАЗ НАД ФОРМОЮ -->
+        <div class="order-social-proof">
+          <div class="osp-avatars">
+            <div class="osp-av" style="background:linear-gradient(135deg,#f9a8d4,#c084fc)">М</div>
+            <div class="osp-av" style="background:linear-gradient(135deg,#a5f3fc,#818cf8)">О</div>
+            <div class="osp-av" style="background:linear-gradient(135deg,#fde68a,#f97316)">Д</div>
+          </div>
+          <span>Сьогодні вже <strong id="todayOrders">7</strong> замовлень · Останнє — <strong id="lastOrderTime">14 хв тому</strong></span>
+        </div>
+
         <div class="order-card">
           <form id="orderForm" class="order-form">
             <label class="input-group">
               <span>Ваше ім'я</span>
-              <input type="text" id="name" name="name" placeholder="Олександра" />
+              <input type="text" id="name" name="name" placeholder="Олександра" autocomplete="name" />
             </label>
             <label class="input-group">
               <span>Номер телефону</span>
-              <input type="tel" id="phone" name="phone" placeholder="+38 (0__) ___-__-__" />
+              <input type="tel" id="phone" name="phone" placeholder="+38 (0__) ___-__-__" autocomplete="tel" />
             </label>
             <div class="input-group">
               <span>Оберіть розмір</span>
@@ -274,8 +336,15 @@
               </span>
             </label>
 
-            <button type="submit" class="main-btn form-btn">ЗАБРАТИ ЗА 895 ГРН</button>
-            <p class="secure-note">🔒 Оплата лише після примірки. Безпечне замовлення без передоплати.</p>
+            <!-- МІКРО-ГАРАНТІЇ ПРЯМО НАД КНОПКОЮ -->
+            <div class="pre-btn-trust">
+              <span>🔒 Ніякої передоплати</span>
+              <span>📦 Примірка на пошті</span>
+              <span>↩️ Обмін 14 днів</span>
+            </div>
+
+            <button type="submit" class="main-btn form-btn pulse-cta">💜 ЗАБРАТИ ЗА 895 ГРН</button>
+            <p class="secure-note">Оплата лише після примірки. Безпечне замовлення без передоплати.</p>
             <p class="form-agree">Натискаючи кнопку, Ви погоджуєтесь на обробку персональних даних.</p>
             <div class="form-message" id="formMessage"></div>
           </form>
@@ -283,13 +352,28 @@
       </div>
     </section>
 
-    <!-- 08 REVIEWS -->
+    <!-- 08 REVIEWS — 15 відгуків, без фото -->
     <section class="section reviews-section" id="reviews">
       <div class="container">
         <div class="section-head">
           <span class="section-code">08</span>
           <h2><span class="h-soft">Відгуки</span></h2>
         </div>
+
+        <!-- ЗАГАЛЬНИЙ РЕЙТИНГ -->
+        <div class="rating-summary">
+          <div class="rating-big">4.9</div>
+          <div class="rating-summary-right">
+            <div class="rating-stars-big">★★★★★</div>
+            <div class="rating-count-text">на основі 15 відгуків</div>
+            <div class="rating-bars">
+              <div class="rbar-row"><span>5★</span><div class="rbar"><div class="rbar-fill" style="width:87%"></div></div><span>13</span></div>
+              <div class="rbar-row"><span>4★</span><div class="rbar"><div class="rbar-fill" style="width:13%"></div></div><span>2</span></div>
+              <div class="rbar-row"><span>3★</span><div class="rbar"><div class="rbar-fill" style="width:0%"></div></div><span>0</span></div>
+            </div>
+          </div>
+        </div>
+
         <div class="reviews-wrap">
           <div class="reviews-left">
             <div class="reviews-controls">
