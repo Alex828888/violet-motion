@@ -30,32 +30,6 @@ button, input, textarea, select { font: inherit; }
 
 .container { width: min(100% - 32px, var(--container)); margin: 0 auto; }
 
-img[src="photo_2026-04-22_13-18-54.jpg"],
-button[data-image="photo_2026-04-22_13-18-54.jpg"] {
-  display: none !important;
-}
-
-.scroll-reveal {
-  transform: translateZ(0);
-  backface-visibility: hidden;
-}
-
-.scroll-reveal.reveal-in {
-  animation: revealUp 0.72s var(--reveal-delay, 0ms) cubic-bezier(0.22, 1, 0.36, 1) both;
-}
-
-@keyframes revealUp {
-  from {
-    opacity: 0;
-    transform: translate3d(0, 30px, 0) scale(0.985);
-  }
-
-  to {
-    opacity: 1;
-    transform: translate3d(0, 0, 0) scale(1);
-  }
-}
-
 /* ── Heading accents ─────────────────────────────────────────── */
 .h-accent { color: var(--accent); }
 .h-soft   { color: var(--accent-soft); }
@@ -85,7 +59,7 @@ button[data-image="photo_2026-04-22_13-18-54.jpg"] {
 }
 
 /* ── Hero ────────────────────────────────────────────────────── */
-.hero { position: relative; min-height: 100svh; display: flex; align-items: stretch; overflow: hidden; content-visibility: visible; }
+.hero { position: relative; min-height: 100svh; display: flex; align-items: stretch; overflow: hidden; }
 .hero-bg { position: absolute; inset: 0; overflow: hidden; }
 .hero-bg-image { width: 100%; height: 100%; object-fit: cover; }
 .hero-overlay {
@@ -109,8 +83,7 @@ button[data-image="photo_2026-04-22_13-18-54.jpg"] {
   border: 1px solid rgba(255,255,255,0.10);
   background: rgba(10,6,18,0.55);
   box-shadow: 0 22px 50px rgba(0,0,0,0.28);
-  aspect-ratio: 1 / 1;
-  contain: layout paint;
+  aspect-ratio: 16 / 9;
 }
 .hero-video, .hero-video-fallback { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 .hero-video { z-index: 2; } .hero-video-fallback { z-index: 1; }
@@ -166,12 +139,7 @@ button[data-image="photo_2026-04-22_13-18-54.jpg"] {
 .mini-card span { font-size: 12px; color: var(--muted); }
 
 /* ── Section base ────────────────────────────────────────────── */
-.section {
-  position: relative;
-  padding: 70px 0;
-  content-visibility: auto;
-  contain-intrinsic-size: 1px 920px;
-}
+.section { position: relative; padding: 70px 0; }
 .section-head { display: flex; align-items: center; gap: 14px; margin-bottom: 28px; }
 .section-code { color: var(--accent); font-family: "Orbitron", sans-serif; font-size: 13px; font-weight: 700; letter-spacing: 0.2em; }
 .section-head h2 { font-size: clamp(30px, 6vw, 52px); line-height: 1; text-transform: uppercase; letter-spacing: -0.04em; }
@@ -182,7 +150,6 @@ button[data-image="photo_2026-04-22_13-18-54.jpg"] {
   padding: 22px;
   background: linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.03));
   border: 1px solid var(--line); border-radius: var(--radius);
-  contain: layout paint;
 }
 .feature-icon { width: 52px; height: 52px; display: grid; place-items: center; border-radius: 16px; margin-bottom: 14px; background: linear-gradient(135deg, rgba(188,128,255,0.24), rgba(138,60,255,0.08)); font-size: 24px; }
 .feature-card h3 { font-size: 22px; margin-bottom: 8px; }
@@ -195,7 +162,6 @@ button[data-image="photo_2026-04-22_13-18-54.jpg"] {
   background: radial-gradient(circle at top right, rgba(184,108,255,0.16), transparent 25%),
               linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.03));
   border: 1px solid var(--line); overflow: hidden;
-  contain: layout paint;
 }
 .visual-text h2 { font-size: clamp(26px, 5vw, 48px); line-height: 1.0; text-transform: uppercase; margin: 10px 0 14px; }
 .visual-text p { color: var(--muted); line-height: 1.7; margin-bottom: 18px; }
@@ -210,10 +176,9 @@ button[data-image="photo_2026-04-22_13-18-54.jpg"] {
 
 /* ── Gallery ─────────────────────────────────────────────────── */
 .gallery-box { display: grid; gap: 16px; }
-.gallery-main { contain: layout paint; }
 .gallery-main img { width: 100%; border-radius: 28px; aspect-ratio: 1/1; object-fit: cover; border: 1px solid var(--line); box-shadow: var(--shadow); }
 .gallery-thumbs { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; }
-.thumb { border: 1px solid rgba(255,255,255,0.08); background: transparent; border-radius: 18px; overflow: hidden; cursor: pointer; transition: transform 0.2s ease, border-color 0.2s ease; contain: layout paint; }
+.thumb { border: 1px solid rgba(255,255,255,0.08); background: transparent; border-radius: 18px; overflow: hidden; cursor: pointer; transition: transform 0.2s ease, border-color 0.2s ease; }
 .thumb img { width: 100%; aspect-ratio: 1/1; object-fit: cover; }
 .thumb.active { border-color: rgba(190,130,255,0.8); box-shadow: 0 0 0 2px rgba(184,108,255,0.16); }
 
@@ -222,7 +187,6 @@ button[data-image="photo_2026-04-22_13-18-54.jpg"] {
   border-radius: 28px;
   background: linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.03));
   border: 1px solid var(--line); padding: 22px;
-  contain: layout paint;
 }
 .spec-row { display: flex; justify-content: space-between; gap: 14px; padding: 16px 0; border-bottom: 1px solid rgba(255,255,255,0.08); }
 .spec-row:last-child { border-bottom: none; }
@@ -231,7 +195,7 @@ button[data-image="photo_2026-04-22_13-18-54.jpg"] {
 
 /* ── Steps ───────────────────────────────────────────────────── */
 .steps-list { display: grid; gap: 14px; }
-.step-item { display: grid; grid-template-columns: 60px 1fr; gap: 14px; padding: 18px; border-radius: 24px; background: rgba(255,255,255,0.04); border: 1px solid var(--line); contain: layout paint; }
+.step-item { display: grid; grid-template-columns: 60px 1fr; gap: 14px; padding: 18px; border-radius: 24px; background: rgba(255,255,255,0.04); border: 1px solid var(--line); }
 .step-num { width: 52px; height: 52px; display: grid; place-items: center; border-radius: 50%; background: linear-gradient(135deg, #d397ff, #8a3cff); color: #fff; font-weight: 800; box-shadow: 0 10px 24px rgba(138,60,255,0.35); }
 .step-body h3 { font-size: 22px; margin-bottom: 6px; }
 .step-body p { color: var(--muted); line-height: 1.6; }
@@ -431,7 +395,6 @@ button[data-image="photo_2026-04-22_13-18-54.jpg"] {
   display: flex; flex-direction: column; overflow: hidden;
   opacity: 0; transform: translateY(12px) scale(0.96); pointer-events: none;
   transition: opacity 0.28s ease, transform 0.28s ease;
-  contain: layout paint;
 }
 .support-panel--open { opacity: 1; transform: translateY(0) scale(1); pointer-events: all; }
 
@@ -476,87 +439,6 @@ button[data-image="photo_2026-04-22_13-18-54.jpg"] {
 .support-send:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* ── Responsive ──────────────────────────────────────────────── */
-.lite-motion .glow-orb {
-  display: none;
-}
-
-.lite-motion .hero-badge,
-.lite-motion .mini-card,
-.lite-motion .support-panel,
-.lite-motion .order-overlay {
-  backdrop-filter: none;
-}
-
-.lite-motion .support-dot {
-  animation: none;
-}
-
-.lite-motion .ticker-track {
-  animation-duration: 36s;
-}
-
-@media (max-width: 767px), (pointer: coarse) {
-  :root {
-    --shadow: 0 14px 40px rgba(126,51,255,0.18);
-  }
-
-  .hero-overlay {
-    background:
-      linear-gradient(180deg, rgba(8,5,15,0.44) 0%, rgba(8,5,15,0.72) 34%, rgba(8,5,15,0.98) 100%),
-      radial-gradient(circle at 75% 25%, rgba(182,108,255,0.12), transparent 20%);
-  }
-
-  .hero-badge,
-  .mini-card,
-  .support-panel,
-  .order-overlay {
-    backdrop-filter: none;
-  }
-
-  .glow-orb {
-    filter: blur(18px);
-    opacity: 0.72;
-  }
-
-  .main-btn:hover,
-  .ghost-btn:hover,
-  .support-fab:hover,
-  .support-send:hover,
-  .star-btn:hover,
-  .support-rate-star:hover {
-    transform: none;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  html {
-    scroll-behavior: auto;
-  }
-
-  .ticker-track,
-  .scroll-reveal.reveal-in,
-  .review-card--new,
-  .success-ring,
-  .check-path,
-  .support-dot {
-    animation: none !important;
-  }
-
-  .main-btn,
-  .ghost-btn,
-  .thumb,
-  .review-card,
-  .order-overlay,
-  .order-success-card,
-  .support-panel,
-  .support-fab,
-  .support-send,
-  .star-btn,
-  .support-rate-star {
-    transition: none !important;
-  }
-}
-
 @media (min-width: 768px) {
   .container { width: min(100% - 48px, var(--container)); }
   .hero-content { padding-bottom: 100px; }

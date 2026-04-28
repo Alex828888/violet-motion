@@ -48,26 +48,6 @@ function nextId(arr) {
   return arr.length ? Math.max(...arr.map(x => x.id || 0)) + 1 : 1;
 }
 
-function applyStaticHeaders(res, filePath) {
-  const ext = path.extname(filePath).toLowerCase();
-
-  if (ext === '.css') {
-    res.setHeader('Content-Type', 'text/css; charset=utf-8');
-    res.setHeader('Cache-Control', 'public, max-age=86400');
-  } else if (ext === '.js') {
-    res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
-    res.setHeader('Cache-Control', 'public, max-age=86400');
-  } else if (ext === '.json') {
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache');
-  } else if (ext === '.html') {
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache');
-  } else if (['.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg', '.mp4', '.webm', '.woff', '.woff2'].includes(ext)) {
-    res.setHeader('Cache-Control', 'public, max-age=604800');
-  }
-}
-
 /* ── Telegram ──────────────────────────────────────────────── */
 async function tg(text, extra = {}) {
   if (!TG_TOKEN || !TG_CHAT_ID) return null;
@@ -117,17 +97,17 @@ app.use(express.urlencoded({ extended: true }));
 
 /* ── Force correct MIME for key static files ───────────────── */
 app.get('/style.css', (_req, res) => {
-  applyStaticHeaders(res, 'style.css');
+  res.type('text/css');
   res.sendFile(path.join(ROOT, 'style.css'));
 });
 
 app.get('/script.js', (_req, res) => {
-  applyStaticHeaders(res, 'script.js');
+  res.type('application/javascript');
   res.sendFile(path.join(ROOT, 'script.js'));
 });
 
 app.get('/bot.js', (_req, res) => {
-  applyStaticHeaders(res, 'bot.js');
+  res.type('application/javascript');
   res.sendFile(path.join(ROOT, 'bot.js'));
 });
 
@@ -140,7 +120,19 @@ app.get('/favicon.ico', (_req, res) => {
 app.use(express.static(ROOT, {
   extensions: false,
   fallthrough: true,
-  setHeaders: (res, filePath) => applyStaticHeaders(res, filePath),
+  setHeaders: (res, filePath) => {
+    const ext = path.extname(filePath).toLowerCase();
+
+    if (ext === '.css') {
+      res.setHeader('Content-Type', 'text/css; charset=utf-8');
+    } else if (ext === '.js') {
+      res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+    } else if (ext === '.json') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    } else if (ext === '.html') {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    }
+  },
 }));
 
 /* ── Bot auth ──────────────────────────────────────────────── */
