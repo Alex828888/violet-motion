@@ -13,6 +13,27 @@ function fbTrack(event, params = {}) {
 function ttTrack(event, params = {}) {
   if (window.ttq && typeof window.ttq.track === 'function') window.ttq.track(event, params);
 }
+async function sha256Hex(value) {
+  if (!window.crypto?.subtle || !window.TextEncoder) return '';
+  const data = new TextEncoder().encode(value);
+  const hash = await window.crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+function normalizePhoneForTikTok(phone) {
+  let digits = String(phone || '').replace(/\D/g, '');
+  if (digits.startsWith('00')) digits = digits.slice(2);
+  if (digits.startsWith('380')) return `+${digits}`;
+  if (digits.startsWith('38')) return `+${digits}`;
+  if (digits.startsWith('0')) return `+38${digits}`;
+  return digits ? `+${digits}` : '';
+}
+async function ttIdentifyPhone(phone) {
+  if (!window.ttq || typeof window.ttq.identify !== 'function') return;
+  const normalizedPhone = normalizePhoneForTikTok(phone);
+  if (!normalizedPhone) return;
+  const phoneHash = await sha256Hex(normalizedPhone);
+  if (phoneHash) window.ttq.identify({ phone_number: phoneHash });
+}
 
 /* ── Utils ─────────────────────────────────────────────────── */
 function esc(s) {
@@ -461,6 +482,7 @@ document.getElementById('orderForm').addEventListener('submit', async e => {
   if (phone.replace(/\D/g, '').length < 10) return showMsg(msgEl, 'Номер телефону виглядає неповним.', 'error');
   if (!size)  return showMsg(msgEl, 'Оберіть розмір взуття.', 'error');
 
+  await ttIdentifyPhone(phone);
   fbTrack('InitiateCheckout', { content_name: 'Violet Motion Sneakers', content_ids: ['violet-motion-001'], value: 895, currency: 'UAH', num_items: 1 });
   ttTrack('InitiateCheckout', { content_type: 'product', content_ids: ['violet-motion-001'], content_name: 'Violet Motion Sneakers', value: 895, currency: 'UAH', quantity: 1 });
   Analytics.track('form_submit', { size, viaTelegram: viaTg });
