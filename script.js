@@ -10,6 +10,9 @@ const API = '';
 function fbTrack(event, params = {}) {
   if (typeof fbq === 'function') fbq('track', event, params);
 }
+function ttTrack(event, params = {}) {
+  if (window.ttq && typeof window.ttq.track === 'function') window.ttq.track(event, params);
+}
 
 /* ── Utils ─────────────────────────────────────────────────── */
 function esc(s) {
@@ -459,6 +462,7 @@ document.getElementById('orderForm').addEventListener('submit', async e => {
   if (!size)  return showMsg(msgEl, 'Оберіть розмір взуття.', 'error');
 
   fbTrack('InitiateCheckout', { content_name: 'Violet Motion Sneakers', content_ids: ['violet-motion-001'], value: 895, currency: 'UAH', num_items: 1 });
+  ttTrack('InitiateCheckout', { content_type: 'product', content_ids: ['violet-motion-001'], content_name: 'Violet Motion Sneakers', value: 895, currency: 'UAH', quantity: 1 });
   Analytics.track('form_submit', { size, viaTelegram: viaTg });
 
   orderSubmitting = true;
@@ -481,6 +485,7 @@ document.getElementById('orderForm').addEventListener('submit', async e => {
   }
 
   fbTrack('Lead', { content_name: 'Violet Motion Order', value: 895, currency: 'UAH' });
+  ttTrack('Purchase', { content_type: 'product', content_ids: ['violet-motion-001'], content_name: 'Violet Motion Sneakers', value: 895, currency: 'UAH', quantity: 1 });
   Analytics.track('order_success', { size });
 
   e.target.reset();
