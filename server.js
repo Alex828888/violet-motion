@@ -202,8 +202,9 @@ Rules:
 - Stay strictly on product, size, price, delivery, payment, exchange, order flow, and support for this site.
 - Do not invent unavailable facts such as exact delivery price, exact stock per size, or guarantees not listed above.
 - Do not ask for a human operator if you can answer from the facts.
-- Request a human only when the customer explicitly asks for a person/operator/manager, complains about an existing order, asks to change/cancel an order, sends unclear context after one clarification would not be enough, or asks for something outside the known facts.
-- Reject spam, random letters, insults, tests, and unrelated topics without spending words. Ask them to write a real question about the order or sneakers.
+- Request a human only when the customer explicitly asks for a person/operator/manager, complains about an existing order, asks to change/cancel an order, or sends unclear context after one short clarification would not be enough.
+- For spam, random letters, insults, adult/sexual questions, tests, and unrelated topics, do not request a human. Use action "answer" and briefly say that you only help with Violet Motion sneakers, sizes, price, delivery, payment, exchange, or ordering.
+- If a customer asks for a fact not listed here, do not invent it. Use action "answer", say what is known, and offer to leave the question for a manager only if they want.
 - Never collect full personal data in chat. Direct the customer to the order form for name, phone, and size.
 
 Return only compact JSON:
@@ -247,8 +248,22 @@ function wantsHumanOperator(text) {
   return /(оператор|менеджер|людин|человек|жив[а-яіїєґ]*|human|operator|manager|support|позвон|подзвон|передзвон|звонок|дзвінок)/i.test(text);
 }
 
+function offTopicSupportReply(text) {
+  const msg = String(text || '').toLowerCase();
+  if (/(дроч|мастурб|секс|порн|хуй|хуя|пизд|піс[ья]|соси|еба|їба|fuck|sex|porn|dick|cock|pussy)/i.test(msg)) {
+    return 'Я допомагаю тільки з кросівками Violet Motion: розмір, устілка, ціна, доставка, оплата або оформлення замовлення.';
+  }
+  if (/(політик|крипт|казино|ставк|наркот|збро|оруж|домашк|реферат|анекдот|погода|курс валют)/i.test(msg)) {
+    return 'Я можу підказати тільки по Violet Motion: розміри, устілка, ціна, доставка, оплата, обмін або замовлення.';
+  }
+  return null;
+}
+
 function localSupportReply(text) {
   const msg = String(text || '').toLowerCase();
+  const offTopic = offTopicSupportReply(msg);
+  if (offTopic) return offTopic;
+
   const sizeMatch = msg.match(/\b(36|37|38|39|40)\b/);
   const asksInsole = /(устіл|устел|стельк|устил|сант|см|centimeter|centimetre|cm)/i.test(msg);
   const asksSize = /(розмір|размер|size|підійде|подойдет|нога|стоп)/i.test(msg);
@@ -925,24 +940,7 @@ app.post('/api/support', rateLimit(60 * 1000, 10), async (req, res) => {
       return res.json({ success: true, id: current.id, repeated: true, human: true });
     }
 
-    if (isLikelyLowValueSupportMessage(cleanMsg)) {
-      return res.json({
-        success: true,
-        id: current.id,
-        repeated: true,
-        filtered: true,
-        aiReply: 'Напишіть, будь ласка, нормальне питання про кросівки, розмір, оплату або доставку — тоді швидко підкажу.',
-      });
-    }
-
     const needsHuman = wantsHumanOperator(cleanMsg);
-    const localReply = needsHuman ? null : localSupportReply(cleanMsg);
-    if (localReply) {
-      msgs[existingIdx] = { ...current, answered: true, aiHandled: true, localHandled: true, aiLastReply: localReply, updatedAt: new Date().toISOString() };
-      write(F.support, msgs);
-      return res.json({ success: true, id: current.id, repeated: true, aiReply: localReply, local: true });
-    }
-
     const ai = needsHuman ? null : await askSupportAi(sessionId, cleanMsg);
     if (ai?.action === 'answer') {
       msgs[existingIdx] = { ...current, answered: true, aiHandled: true, aiLastReply: ai.reply, updatedAt: new Date().toISOString() };
@@ -950,11 +948,23 @@ app.post('/api/support', rateLimit(60 * 1000, 10), async (req, res) => {
       return res.json({ success: true, id: current.id, repeated: true, aiReply: ai.reply, ai: true });
     }
 
+    if (!needsHuman && !ai) {
+      msgs[existingIdx] = { ...current, answered: false, aiError: true, updatedAt: new Date().toISOString() };
+      write(F.support, msgs);
+      return res.json({
+        success: true,
+        id: current.id,
+        repeated: true,
+        aiError: true,
+        aiReply: 'Gemini зараз не відповів. Перевірте GEMINI_API_KEY / GEMINI_MODEL у Render Logs.',
+      });
+    }
+
     msgs[existingIdx] = {
       ...current,
       accepted: false,
       answered: false,
-      handoffReason: needsHuman ? 'Клієнт попросив менеджера' : (ai?.reason || 'AI не зміг впевнено відповісти'),
+      handoffReason: needsHuman ? 'Клієнт попросив менеджера' : (ai?.reason || 'Gemini попросив передати менеджеру'),
       updatedAt: new Date().toISOString(),
     };
     write(F.support, msgs);
@@ -978,26 +988,7 @@ app.post('/api/support', rateLimit(60 * 1000, 10), async (req, res) => {
     return res.json({ success: true, id: current.id, repeated: true });
   }
 
-  if (isLikelyLowValueSupportMessage(cleanMsg)) {
-    return res.json({
-      success: true,
-      filtered: true,
-      aiReply: 'Напишіть, будь ласка, нормальне питання про кросівки, розмір, оплату або доставку — тоді швидко підкажу.',
-    });
-  }
-
   const requestedHuman = wantsHumanOperator(cleanMsg);
-  const localReply = requestedHuman ? null : localSupportReply(cleanMsg);
-  if (localReply) {
-    const msg = {
-      id: nextId(msgs), message: cleanMsg, sessionId: sessionId || null,
-      timestamp: timestamp || new Date().toISOString(), answered: true, accepted: false,
-      aiHandled: true, localHandled: true, aiLastReply: localReply,
-    };
-    msgs.push(msg); write(F.support, msgs);
-    return res.json({ success: true, id: msg.id, aiReply: localReply, local: true });
-  }
-
   const ai = requestedHuman ? null : await askSupportAi(sessionId, cleanMsg);
 
   if (ai?.action === 'answer') {
@@ -1010,10 +1001,25 @@ app.post('/api/support', rateLimit(60 * 1000, 10), async (req, res) => {
     return res.json({ success: true, id: msg.id, aiReply: ai.reply, ai: true });
   }
 
+  if (!requestedHuman && !ai) {
+    const msg = {
+      id: nextId(msgs), message: cleanMsg, sessionId: sessionId || null,
+      timestamp: timestamp || new Date().toISOString(), answered: false, accepted: false,
+      aiError: true,
+    };
+    msgs.push(msg); write(F.support, msgs);
+    return res.json({
+      success: true,
+      id: msg.id,
+      aiError: true,
+      aiReply: 'Gemini зараз не відповів. Перевірте GEMINI_API_KEY / GEMINI_MODEL у Render Logs.',
+    });
+  }
+
   const handoffMsg = {
     id: nextId(msgs), message: cleanMsg, sessionId: sessionId || null,
     timestamp: timestamp || new Date().toISOString(), answered: false, accepted: false,
-    handoffReason: requestedHuman ? 'Клієнт попросив менеджера' : (ai?.reason || 'AI не зміг впевнено відповісти'),
+    handoffReason: requestedHuman ? 'Клієнт попросив менеджера' : (ai?.reason || 'Gemini попросив передати менеджеру'),
   };
   msgs.push(handoffMsg); write(F.support, msgs);
   await notifySupportRequest(handoffMsg, requestedHuman || ai?.action === 'handoff' ? 'handoff' : 'new');
