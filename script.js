@@ -4,7 +4,7 @@
    Skeleton Loading · Scroll Animations · SSE Chat Fix
 ═══════════════════════════════════════════════════════════ */
 
-const API = (window.VM_API_BASE || document.querySelector('meta[name="api-base"]')?.content || '').replace(/\/$/, '');
+const API = '';
 
 /* ── Facebook Pixel ─────────────────────────────────────────── */
 function fbTrack(event, params = {}) {
@@ -436,9 +436,9 @@ const orderOverlay    = document.getElementById('orderOverlay');
 const successDetails  = document.getElementById('successDetails');
 const successCloseBtn = document.getElementById('successCloseBtn');
 
-function showSuccessOverlay(name, size, delivery = 'Нова Пошта') {
+function showSuccessOverlay(name, size) {
   successDetails.innerHTML =
-    `👤 <b>${esc(name)}</b><br />👟 Розмір: <b>${esc(size)}</b><br />🚚 Доставка: ${esc(delivery)}`;
+    `👤 <b>${esc(name)}</b><br />👟 Розмір: <b>${esc(size)}</b><br />🚚 Доставка: Нова Пошта`;
   orderOverlay.classList.add('visible');
 
   ['.success-ring', '.check-path'].forEach(sel => {
@@ -465,215 +465,6 @@ orderOverlay.addEventListener('click', e => {
    ORDER FORM
 ══════════════════════════════════════════════════════════════ */
 let orderSubmitting = false;
-let resetOrderChatFlow = () => {};
-
-(function initOrderChat() {
-  const form = document.getElementById('orderForm');
-  const body = document.getElementById('orderChatBody');
-  const input = document.getElementById('orderChatInput');
-  const send = document.getElementById('orderChatSend');
-  const options = document.getElementById('orderChatOptions');
-  if (!form || !body || !input || !send || !options) return;
-
-  const fields = {
-    name: document.getElementById('name'),
-    phone: document.getElementById('phone'),
-    size: selectedSizeInput,
-    city: document.getElementById('city'),
-    settlement: document.getElementById('settlement'),
-    novaPostBranch: document.getElementById('novaPostBranch'),
-    contactViaTelegram: document.getElementById('contactViaTelegram'),
-  };
-
-  const steps = [
-    {
-      id: 'name',
-      question: "Вітаю! Допоможу швидко оформити замовлення. Напишіть, будь ласка, ім'я та прізвище.",
-      placeholder: "Наприклад: Олександра Коваль",
-      validate: v => v.length >= 3,
-      error: "Напишіть ім'я та прізвище.",
-    },
-    {
-      id: 'phone',
-      question: "Дякую. Тепер номер телефону для підтвердження замовлення.",
-      placeholder: "+38 (0__) ___-__-__",
-      transform: formatPhone,
-      validate: v => v.replace(/\D/g, '').length >= 10,
-      error: 'Номер виглядає неповним. Напишіть український номер телефону.',
-    },
-    {
-      id: 'size',
-      question: 'Оберіть розмір.',
-      placeholder: '36, 37, 38, 39 або 40',
-      options: ['36', '37', '38', '39', '40'],
-      validate: v => /^(36|37|38|39|40)$/.test(v),
-      error: 'Оберіть розмір 36, 37, 38, 39 або 40.',
-    },
-    {
-      id: 'city',
-      question: 'У яке місто відправляти?',
-      placeholder: 'Наприклад: Київ',
-      validate: v => v.length >= 2,
-      error: 'Напишіть місто доставки.',
-    },
-    {
-      id: 'settlement',
-      question: 'Якщо є село, район або пригород біля міста, напишіть тут. Якщо немає - натисніть "Пропустити".',
-      placeholder: 'Село / пригород / район',
-      options: ['Пропустити'],
-      transform: v => v.toLowerCase() === 'пропустити' ? '' : v,
-      validate: () => true,
-      optional: true,
-    },
-    {
-      id: 'novaPostBranch',
-      question: 'Напишіть відділення або поштомат Нової Пошти.',
-      placeholder: 'Наприклад: Відділення 12',
-      validate: v => v.length >= 1,
-      error: 'Напишіть номер відділення або поштомату Нової Пошти.',
-    },
-    {
-      id: 'contactViaTelegram',
-      question: "Як зручніше зв'язатися для підтвердження?",
-      placeholder: 'Оберіть варіант',
-      options: ['Дзвінок', 'Telegram'],
-      transform: v => v.toLowerCase() === 'telegram' ? true : (v.toLowerCase() === 'дзвінок' ? false : null),
-      validate: v => v !== null,
-      error: 'Оберіть "Дзвінок" або "Telegram".',
-    },
-  ];
-
-  let stepIndex = 0;
-
-  function formatPhone(value) {
-    let x = String(value || '').replace(/\D/g, '').slice(0, 12);
-    if (x.startsWith('380')) x = x.slice(2);
-    else if (x.startsWith('38')) x = x.slice(2);
-    let f = '+38 ';
-    if (x.length > 0) f += '(' + x.slice(0, 3);
-    if (x.length >= 3) f += ') ' + x.slice(3, 6);
-    if (x.length >= 6) f += '-' + x.slice(6, 8);
-    if (x.length >= 8) f += '-' + x.slice(8, 10);
-    return f.trim();
-  }
-
-  function addMsg(text, who = 'bot') {
-    const div = document.createElement('div');
-    div.className = `order-chat-msg order-chat-msg--${who}`;
-    div.textContent = text;
-    body.appendChild(div);
-    body.scrollTop = body.scrollHeight;
-  }
-
-  function renderOptions(step) {
-    options.innerHTML = '';
-    (step.options || []).forEach(label => {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'order-chat-option';
-      btn.textContent = label;
-      btn.addEventListener('click', () => acceptAnswer(label));
-      options.appendChild(btn);
-    });
-  }
-
-  function askCurrentStep() {
-    const step = steps[stepIndex];
-    input.value = '';
-    input.placeholder = step.placeholder || '';
-    input.disabled = false;
-    send.disabled = false;
-    renderOptions(step);
-    addMsg(step.question, 'bot');
-    if (step.options && step.options.length && step.id === 'contactViaTelegram') input.disabled = true;
-    input.focus({ preventScroll: true });
-  }
-
-  function setField(id, value) {
-    if (id === 'contactViaTelegram') fields.contactViaTelegram.checked = !!value;
-    else if (fields[id]) fields[id].value = value;
-  }
-
-  function getDeliveryLabel() {
-    const city = fields.city.value.trim();
-    const settlement = fields.settlement.value.trim();
-    const branch = fields.novaPostBranch.value.trim();
-    return [city, settlement, branch].filter(Boolean).join(', ');
-  }
-
-  function showSummary() {
-    options.innerHTML = '';
-    input.disabled = true;
-    send.disabled = true;
-    const contact = fields.contactViaTelegram.checked ? 'Telegram' : 'дзвінок';
-    addMsg(
-      `Перевірте дані: ${fields.name.value}, ${fields.phone.value}, розмір ${fields.size.value}, доставка ${getDeliveryLabel()}, зв'язок - ${contact}.`,
-      'bot'
-    );
-    ['Підтвердити', 'Змінити'].forEach(label => {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'order-chat-option';
-      btn.textContent = label;
-      btn.addEventListener('click', () => {
-        if (label === 'Змінити') {
-          resetOrderChatFlow();
-          return;
-        }
-        addMsg('Підтверджую', 'user');
-        form.requestSubmit();
-      });
-      options.appendChild(btn);
-    });
-  }
-
-  function acceptAnswer(rawValue) {
-    if (orderSubmitting) return;
-    const step = steps[stepIndex];
-    const typed = String(rawValue ?? input.value).trim();
-    if (!typed && !step.optional) return;
-
-    let value = step.transform ? step.transform(typed) : typed;
-    if (!step.validate(value)) {
-      addMsg(step.error || 'Перевірте відповідь і спробуйте ще раз.', 'bot');
-      return;
-    }
-
-    const displayValue = value === '' ? 'Пропустити' : (step.id === 'contactViaTelegram' ? typed : value);
-    addMsg(displayValue, 'user');
-    setField(step.id, value);
-
-    if (step.id === 'phone') ttIdentifyPhone(value);
-    if (step.id === 'size') Analytics.track('size_select', { size: value });
-
-    stepIndex++;
-    if (stepIndex >= steps.length) showSummary();
-    else setTimeout(askCurrentStep, 260);
-  }
-
-  send.addEventListener('click', () => acceptAnswer());
-  input.addEventListener('keydown', e => {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      acceptAnswer();
-    }
-  });
-
-  resetOrderChatFlow = () => {
-    stepIndex = 0;
-    body.innerHTML = '';
-    options.innerHTML = '';
-    input.disabled = false;
-    send.disabled = false;
-    Object.entries(fields).forEach(([id, field]) => {
-      if (id === 'contactViaTelegram') field.checked = false;
-      else field.value = '';
-    });
-    askCurrentStep();
-  };
-
-  resetOrderChatFlow();
-})();
 
 document.getElementById('orderForm').addEventListener('submit', async e => {
   e.preventDefault();
@@ -684,49 +475,32 @@ document.getElementById('orderForm').addEventListener('submit', async e => {
   const name  = document.getElementById('name').value.trim();
   const phone = document.getElementById('phone').value.trim();
   const size  = selectedSizeInput.value.trim();
-  const city  = document.getElementById('city').value.trim();
-  const settlement = document.getElementById('settlement').value.trim();
-  const novaPostBranch = document.getElementById('novaPostBranch').value.trim();
   const viaTg = document.getElementById('contactViaTelegram').checked;
 
   if (!name)  return showMsg(msgEl, "Вкажіть, будь ласка, Ваше ім'я.", 'error');
   if (!phone) return showMsg(msgEl, 'Вкажіть, будь ласка, номер телефону.', 'error');
   if (phone.replace(/\D/g, '').length < 10) return showMsg(msgEl, 'Номер телефону виглядає неповним.', 'error');
   if (!size)  return showMsg(msgEl, 'Оберіть розмір взуття.', 'error');
-  if (!city)  return showMsg(msgEl, 'Вкажіть місто доставки.', 'error');
-  if (!novaPostBranch) return showMsg(msgEl, 'Вкажіть відділення або поштомат Нової Пошти.', 'error');
+
+  orderSubmitting = true;
+  const originalText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Надсилаємо...';
+  showMsg(msgEl, '', '');
 
   await ttIdentifyPhone(phone);
   fbTrack('InitiateCheckout', { content_name: 'Violet Motion Sneakers', content_ids: ['violet-motion-001'], value: 895, currency: 'UAH', num_items: 1 });
   ttTrack('InitiateCheckout', { content_type: 'product', content_ids: ['violet-motion-001'], content_name: 'Violet Motion Sneakers', value: 895, currency: 'UAH', quantity: 1 });
   Analytics.track('form_submit', { size, viaTelegram: viaTg });
 
-  orderSubmitting = true;
-  const origText = btn.textContent;
-  btn.textContent = 'Надсилаємо…';
-  btn.disabled = true;
-  showMsg(msgEl, '', '');
-
-  const result = await postJSON('/api/order', {
-    name,
-    phone,
-    size,
-    city,
-    settlement,
-    novaPostBranch,
-    contactViaTelegram: viaTg,
-    source: 'chat-order',
-  });
+  const result = await postJSON('/api/order', { name, phone, size, contactViaTelegram: viaTg });
 
   orderSubmitting = false;
-  btn.textContent = origText;
   btn.disabled = false;
+  btn.textContent = originalText;
 
   if (!result || !result.success) {
-    const msg = result?.timeout
-      ? 'Сервер не відповідає. Спробуйте ще раз або напишіть нам у підтримку.'
-      : 'Не вдалося надіслати замовлення. Спробуйте ще раз.';
-    return showMsg(msgEl, msg, 'error');
+    return showMsg(msgEl, result?.timeout ? 'Сервер не відповідає. Спробуйте ще раз.' : 'Не вдалося надіслати замовлення. Спробуйте ще раз.', 'error');
   }
 
   fbTrack('Lead', { content_name: 'Violet Motion Order', value: 895, currency: 'UAH' });
@@ -737,8 +511,7 @@ document.getElementById('orderForm').addEventListener('submit', async e => {
   selectedSizeInput.value = '';
   sizeBtns.forEach(b => b.classList.remove('active'));
   document.getElementById('contactViaTelegram').checked = false;
-  resetOrderChatFlow();
-  showSuccessOverlay(name, size, [city, settlement, novaPostBranch].filter(Boolean).join(', '));
+  showSuccessOverlay(name, size);
 });
 
 /* ══════════════════════════════════════════════════════════════
@@ -1089,6 +862,7 @@ function hideTyping() {
   if (el) el.remove();
 }
 
+
 function handleDialogEnd() {
   if (dialogEnded) return;
   dialogEnded = true; operatorConnected = false;
@@ -1125,12 +899,14 @@ async function sendSupportMsg() {
   sendingSupport = true;
   addChatMsg(text, true);
   supportInput.value = '';
+  if (!operatorConnected) showTyping();
 
   const result = await postJSON('/api/support', {
     message: text, sessionId: SESSION_ID, timestamp: new Date().toISOString(),
   });
 
   sendingSupport = false;
+  hideTyping();
 
   if (!result || !result.success) {
     serverReachable = false;
@@ -1147,6 +923,19 @@ async function sendSupportMsg() {
   }
 
   serverReachable = true;
+  if (result.aiReply) {
+    firstMsg = false;
+    addChatMsg(result.aiReply, false);
+    if (result.handoff) {
+      supportStatus.textContent = '● Очікуємо оператора';
+    }
+    return;
+  }
+
+  if (result.human) {
+    return;
+  }
+
   // If first message and operator hasn't connected yet, show acknowledgement after delay
   if (firstMsg && !operatorConnected) {
     firstMsg = false;
@@ -1208,13 +997,20 @@ supportInput.addEventListener('keydown', e => {
 
   function markVideoLoaded() {
     if (videoCard) videoCard.classList.add('sk-loaded');
+    if (videoSkel) {
+      videoSkel.style.opacity = '0';
+      videoSkel.style.visibility = 'hidden';
+      videoSkel.style.pointerEvents = 'none';
+    }
   }
 
   if (video) {
-    if (video.readyState >= 3) {
+    if (video.readyState >= 2 || !video.paused) {
       markVideoLoaded();
     } else {
-      video.addEventListener('loadeddata', markVideoLoaded, { once: true });
+      ['loadedmetadata', 'loadeddata', 'canplay', 'playing'].forEach(eventName => {
+        video.addEventListener(eventName, markVideoLoaded, { once: true });
+      });
       video.addEventListener('error', () => {
         // Video failed — rely on fallback image
         if (fallbackImg) {
@@ -1228,6 +1024,7 @@ supportInput.addEventListener('keydown', e => {
           setTimeout(markVideoLoaded, 2000);
         }
       }, { once: true });
+      setTimeout(markVideoLoaded, 1800);
     }
   } else {
     setTimeout(markVideoLoaded, 1500);
@@ -1248,6 +1045,7 @@ supportInput.addEventListener('keydown', e => {
 
   // Safety fallback — remove all skeletons after 4s no matter what
   setTimeout(() => {
+    markVideoLoaded();
     document.querySelectorAll('.sk-wrap').forEach(w => w.classList.add('sk-loaded'));
   }, 4000);
 })();

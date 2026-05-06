@@ -515,11 +515,8 @@ function getZvonokStatus(payload) {
 function formatOrderForZvonokMessage(order) {
   return (
     `Имя: ${escapeHtml(order?.name || '-')}\n` +
-    (order?.recipientName ? `Получатель: ${escapeHtml(order.recipientName)}\n` : '') +
     `Телефон: ${escapeHtml(order?.phone || '-')}\n` +
     `Размер: ${escapeHtml(order?.size || '-')}\n` +
-    (order?.city ? `Город: ${escapeHtml(order.city)}\n` : '') +
-    (order?.branch ? `Новая Почта: ${escapeHtml(order.branch)}\n` : '') +
     `Order ID: ${escapeHtml(order?.id || '-')}`
   );
 }
@@ -770,7 +767,7 @@ app.get('/api/support/sessions', authBot, (_req, res) => {
    ORDERS (public)
 ═══════════════════════════════════════════════════════════ */
 app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
-  const { name, phone, size, color, product, price, contactViaTelegram, city, branch, recipientName, orderFlow, skipAutoCall } = req.body;
+  const { name, phone, size, color, product, price, contactViaTelegram } = req.body;
   if (!name || !phone || !size) return res.status(400).json({ error: 'Missing fields' });
 
   const cleanName  = sanitizeStr(name, 100);
@@ -779,11 +776,6 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
   const cleanColor = sanitizeStr(color, 40);
   const cleanProduct = sanitizeStr(product, 100);
   const cleanPrice = sanitizeStr(price, 20);
-  const cleanCity = sanitizeStr(city, 80);
-  const cleanBranch = sanitizeStr(branch, 140);
-  const cleanRecipientName = sanitizeStr(recipientName, 120);
-  const cleanOrderFlow = orderFlow === 'self_checkout' ? 'self_checkout' : 'callcenter';
-  const shouldSkipAutoCall = !!skipAutoCall || cleanOrderFlow === 'callcenter';
   if (!cleanName || !cleanPhone || !cleanSize)
     return res.status(400).json({ error: 'Invalid fields' });
 
@@ -791,24 +783,18 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
   const o = {
     id: nextId(orders), name: cleanName, phone: cleanPhone, size: cleanSize,
     color: cleanColor || null, product: cleanProduct || null, price: cleanPrice || null,
-    city: cleanCity || null, branch: cleanBranch || null, recipientName: cleanRecipientName || null,
-    orderFlow: cleanOrderFlow, skipAutoCall: shouldSkipAutoCall,
     contactViaTelegram: !!contactViaTelegram, status: 'new', createdAt: new Date().toISOString(),
   };
   orders.push(o); write(F.orders, orders);
 
   const ts = new Date(o.createdAt).toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' });
   await tg(
-    `🛒 <b>${o.orderFlow === 'self_checkout' ? 'ЗАМОВЛЕННЯ ПІДТВЕРДЖЕНО НА САЙТІ' : 'НОВЕ ЗАМОВЛЕННЯ'} #${o.id}</b>\n━━━━━━━━━━━━━━━━━━\n` +
+    `🛒 <b>НОВЕ ЗАМОВЛЕННЯ #${o.id}</b>\n━━━━━━━━━━━━━━━━━━\n` +
     (o.product ? `🛍 Товар: <b>${o.product}</b>\n` : '') +
     `👤 Ім'я: <b>${o.name}</b>\n📱 Телефон: <b>${o.phone}</b>\n` +
-    (o.recipientName ? `📦 Отримувач: <b>${o.recipientName}</b>\n` : '') +
     `👟 Розмір: <b>${o.size}</b>\n` +
-    (o.city ? `🏙 Місто: <b>${o.city}</b>\n` : '') +
-    (o.branch ? `🚚 Нова Пошта: <b>${o.branch}</b>\n` : '') +
     (o.color ? `🎨 Колір: <b>${o.color}</b>\n` : '') +
     (o.price ? `💵 Ціна: <b>${o.price} грн</b>\n` : '') +
-    `✅ Сценарій: <b>${o.orderFlow === 'self_checkout' ? 'клієнт заповнив доставку сам' : 'клієнт пропустив, потрібен дзвінок менеджера'}</b>\n` +
     (o.contactViaTelegram ? `💬 Зв'язок: <b>Telegram</b>\n` : `📞 Зв'язок: <b>Дзвінок</b>\n`) +
     `📅 ${ts}\n━━━━━━━━━━━━━━━━━━`,
     { reply_markup: { inline_keyboard: [[
@@ -816,11 +802,8 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
       { text: '❌ Скасувати',  callback_data: `cancel_${o.id}` },
     ]] } }
   );
-  // Zvonok is best-effort and only starts after the client finishes the self-checkout.
-  if (!shouldSkipAutoCall) {
-    try { await startZvonokCall(o, req); }
-    catch (e) { console.error(`[Zvonok] unexpected order #${o.id} error:`, e.message); }
-  }
+  try { await startZvonokCall(o, req); }
+  catch (e) { console.error(`[Zvonok] unexpected order #${o.id} error:`, e.message); }
 
   res.json({ success: true, id: o.id });
 });

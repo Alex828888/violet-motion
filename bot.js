@@ -172,10 +172,7 @@ async function showOrderDetail(chatId, id, msgId = null) {
     `📋 <b>Замовлення #${o.id}</b>\n━━━━━━━━━━━━━━━\n` +
     (o.product ? `🛍 Товар: <b>${o.product}</b>\n` : '') +
     `👤 <b>${o.name}</b>\n📱 ${o.phone}\n` +
-    (o.recipientName ? `📦 Отримувач: ${o.recipientName}\n` : '') +
     `👟 Розмір: ${o.size}\n` +
-    (o.city ? `🏙 Місто: ${o.city}\n` : '') +
-    (o.branch ? `🚚 Нова Пошта: ${o.branch}\n` : '') +
     (o.color ? `🎨 Колір: ${o.color}\n` : '') +
     (o.price ? `💵 Ціна: ${o.price} грн\n` : '') +
     (o.contactViaTelegram ? `💬 Зв'язок: Telegram\n` : `📞 Зв'язок: Дзвінок\n`) +
