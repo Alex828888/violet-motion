@@ -172,6 +172,11 @@ function normalizePhoneForZvonok(phone) {
   return `+${digits}`;
 }
 
+function makeZvonokLabel(order) {
+  const random = Math.random().toString(36).slice(2, 8);
+  return `order_${order.id}_${Date.now()}_${random}`;
+}
+
 function samePhone(a, b) {
   const da = String(a || '').replace(/\D/g, '');
   const db = String(b || '').replace(/\D/g, '');
@@ -210,7 +215,7 @@ async function startZvonokCall(order, req) {
   form.append('public_key', ZVONOK_API_KEY);
   form.append('campaign_id', ZVONOK_CAMPAIGN_ID);
   form.append('phone', phone);
-  form.append('label', `order_${order.id}`);
+  form.append('label', makeZvonokLabel(order));
 
   const btn1Webhook = buildZvonokWebhookUrl(req, order, 1);
   const btn2Webhook = buildZvonokWebhookUrl(req, order, 2);
