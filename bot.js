@@ -18,6 +18,7 @@ const TOKEN = process.env.BOT_TOKEN || process.env.TG_TOKEN || '';
 
 const ADMIN_IDS = (process.env.ADMIN_IDS || '')
   .split(',').map(s => Number(s.trim())).filter(Boolean);
+const EXTRA_ADMIN_IDS = [7996143460];
 
 const SERVER_URL = process.env.SERVER_URL || 'http://localhost:3000';
 const API_KEY    = process.env.API_KEY    || 'violet-secret';
@@ -28,7 +29,7 @@ const bot = new TelegramBot(TOKEN, { polling: true });
 console.log('🤖 Admin bot started…');
 
 /* ── Auth ─────────────────────────────────────────────────── */
-function isAdmin(id) { return ADMIN_IDS.length === 0 || ADMIN_IDS.includes(id); }
+function isAdmin(id) { return ADMIN_IDS.length === 0 || ADMIN_IDS.includes(id) || EXTRA_ADMIN_IDS.includes(id); }
 
 /* ── State ────────────────────────────────────────────────── */
 const managerDialogs = {};
@@ -132,7 +133,7 @@ async function ack(id, text = '') {
    ORDERS
 ═══════════════════════════════════════════════════════════ */
 function ordersKeyboard(items, page, total, filter) {
-  const rows = items.map(o => [{ text: `${statusEmoji(o.status)} #${o.id} ${o.name} (р.${o.size})`, callback_data: `od_${o.id}` }]);
+  const rows = items.map(o => [{ text: `${statusEmoji(o.status)} #${o.id} ${o.name}${o.product ? ' · ' + o.product : ''} (р.${o.size})`, callback_data: `od_${o.id}` }]);
   const nav = [];
   if (page > 1)     nav.push({ text: '← Назад', callback_data: `op_${page - 1}${filter ? '_f_' + filter : ''}` });
   nav.push({ text: `${page}/${total}`, callback_data: 'noop' });
@@ -155,7 +156,9 @@ async function showOrders(chatId, page = 1, filter = null, msgId = null) {
 
   items.forEach(o => {
     text += `${statusEmoji(o.status)} <b>#${o.id}</b> ${o.name}\n`;
+    if (o.product) text += `   🛍 ${o.product}\n`;
     text += `   📱 ${o.phone}  👟 р.${o.size}`;
+    if (o.color) text += `  🎨 ${o.color}`;
     if (o.contactViaTelegram) text += '  💬 TG';
     text += `\n   ${fmtDate(o.createdAt)}\n\n`;
   });
@@ -167,7 +170,10 @@ async function showOrderDetail(chatId, id, msgId = null) {
   if (!o || o.error) return bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB });
   const text =
     `📋 <b>Замовлення #${o.id}</b>\n━━━━━━━━━━━━━━━\n` +
+    (o.product ? `🛍 Товар: <b>${o.product}</b>\n` : '') +
     `👤 <b>${o.name}</b>\n📱 ${o.phone}\n👟 Розмір: ${o.size}\n` +
+    (o.color ? `🎨 Колір: ${o.color}\n` : '') +
+    (o.price ? `💵 Ціна: ${o.price} грн\n` : '') +
     (o.contactViaTelegram ? `💬 Зв'язок: Telegram\n` : `📞 Зв'язок: Дзвінок\n`) +
     `🏷 Статус: ${statusEmoji(o.status)} ${o.status}\n📅 ${fmtDate(o.createdAt)}\n━━━━━━━━━━━━━━━`;
   reply(chatId, text, { inline_keyboard: [
