@@ -436,9 +436,15 @@ const orderOverlay    = document.getElementById('orderOverlay');
 const successDetails  = document.getElementById('successDetails');
 const successCloseBtn = document.getElementById('successCloseBtn');
 
-function showSuccessOverlay(name, size) {
+function showSuccessOverlay(name, size, extra = {}) {
+  const deliveryLine = extra.city && extra.branch
+    ? `🚚 Доставка: <b>${esc(extra.city)}</b>, ${esc(extra.branch)}`
+    : '🚚 Доставка: Нова Пошта';
+  const recipientLine = extra.recipientName
+    ? `<br />📦 Отримувач: <b>${esc(extra.recipientName)}</b>`
+    : '';
   successDetails.innerHTML =
-    `👤 <b>${esc(name)}</b><br />👟 Розмір: <b>${esc(size)}</b><br />🚚 Доставка: Нова Пошта`;
+    `👤 <b>${esc(name)}</b>${recipientLine}<br />📱 Телефон: <b>${esc(extra.phone || '')}</b><br />👟 Розмір: <b>${esc(size)}</b><br />${deliveryLine}`;
   orderOverlay.classList.add('visible');
 
   ['.success-ring', '.check-path'].forEach(sel => {
@@ -469,6 +475,7 @@ let orderSubmitting = false;
 document.getElementById('orderForm').addEventListener('submit', async e => {
   e.preventDefault();
   if (orderSubmitting) return;
+  if (orderWizard.active) { openSupportPanel(); return; }
 
   const msgEl = document.getElementById('formMessage');
   const btn   = e.target.querySelector('.form-btn');
@@ -487,34 +494,8 @@ document.getElementById('orderForm').addEventListener('submit', async e => {
   ttTrack('InitiateCheckout', { content_type: 'product', content_ids: ['violet-motion-001'], content_name: 'Violet Motion Sneakers', value: 895, currency: 'UAH', quantity: 1 });
   Analytics.track('form_submit', { size, viaTelegram: viaTg });
 
-  orderSubmitting = true;
-  const origText = btn.textContent;
-  btn.textContent = 'Надсилаємо…';
-  btn.disabled = true;
-  showMsg(msgEl, '', '');
-
-  const result = await postJSON('/api/order', { name, phone, size, contactViaTelegram: viaTg });
-
-  orderSubmitting = false;
-  btn.textContent = origText;
-  btn.disabled = false;
-
-  if (!result || !result.success) {
-    const msg = result?.timeout
-      ? 'Сервер не відповідає. Спробуйте ще раз або напишіть нам у підтримку.'
-      : 'Не вдалося надіслати замовлення. Спробуйте ще раз.';
-    return showMsg(msgEl, msg, 'error');
-  }
-
-  fbTrack('Lead', { content_name: 'Violet Motion Order', value: 895, currency: 'UAH' });
-  ttTrack('Purchase', { content_type: 'product', content_ids: ['violet-motion-001'], content_name: 'Violet Motion Sneakers', value: 895, currency: 'UAH', quantity: 1 });
-  Analytics.track('order_success', { size });
-
-  e.target.reset();
-  selectedSizeInput.value = '';
-  sizeBtns.forEach(b => b.classList.remove('active'));
-  document.getElementById('contactViaTelegram').checked = false;
-  showSuccessOverlay(name, size);
+  showMsg(msgEl, 'Ще один короткий крок у чаті — оформимо без колцентру за 30 секунд.', 'success');
+  startOrderWizard({ name, phone, size, contactViaTelegram: viaTg }, e.target);
 });
 
 /* ══════════════════════════════════════════════════════════════
@@ -742,6 +723,7 @@ const supportInput  = document.getElementById('supportInput');
 const supportSend   = document.getElementById('supportSend');
 const supportMsgs   = document.getElementById('supportMessages');
 const supportStatus = document.getElementById('supportStatus');
+const orderWizardSkip = document.getElementById('orderWizardSkip');
 
 function getSessionId() {
   let id = sessionStorage.getItem('vm_sess');
@@ -865,6 +847,176 @@ function hideTyping() {
   if (el) el.remove();
 }
 
+const orderWizard = {
+  active: false,
+  step: null,
+  data: null,
+  form: null,
+  sending: false,
+};
+
+function openSupportPanel() {
+  supportPanel.classList.add('support-panel--open');
+  supportFab.classList.add('support-fab--active');
+  setTimeout(() => supportInput.focus(), 220);
+}
+
+function resetOrderForm(form) {
+  form.reset();
+  selectedSizeInput.value = '';
+  sizeBtns.forEach(b => b.classList.remove('active'));
+  document.getElementById('contactViaTelegram').checked = false;
+}
+
+function startOrderWizard(data, form) {
+  orderWizard.active = true;
+  orderWizard.step = 'city';
+  orderWizard.data = { ...data, city: '', branch: '', recipientName: data.name || '' };
+  orderWizard.form = form;
+  orderWizard.sending = false;
+
+  supportMsgs.innerHTML = '';
+  dialogEnded = false;
+  operatorConnected = false;
+  supportStatus.textContent = '● Оформлення замовлення';
+  supportInput.disabled = false;
+  supportSend.disabled = false;
+  supportInput.placeholder = 'Введіть місто...';
+  orderWizardSkip.classList.add('support-skip--visible');
+  openSupportPanel();
+
+  addChatMsg('Оформіть прямо зараз без колцентру — це займає приблизно 30 секунд.', false);
+  addChatMsg('Підкажіть місто для доставки Новою Поштою.', false);
+}
+
+function orderWizardQuestion() {
+  if (orderWizard.step === 'city') return 'Підкажіть місто для доставки Новою Поштою.';
+  if (orderWizard.step === 'branch') return 'Напишіть номер або адресу відділення / поштомату Нової Пошти.';
+  if (orderWizard.step === 'recipient') return "Вкажіть ім'я та прізвище отримувача.";
+  return '';
+}
+
+function orderWizardSubmitText(text) {
+  if (!orderWizard.active || orderWizard.sending) return;
+  const value = text.trim();
+  if (!value) return;
+
+  addChatMsg(value, true);
+  supportInput.value = '';
+
+  if (orderWizard.step === 'city') {
+    orderWizard.data.city = value;
+    orderWizard.step = 'branch';
+    supportInput.placeholder = 'Наприклад: відділення 12 або поштомат...';
+    addChatMsg(orderWizardQuestion(), false);
+    return;
+  }
+
+  if (orderWizard.step === 'branch') {
+    orderWizard.data.branch = value;
+    orderWizard.step = 'recipient';
+    supportInput.placeholder = "Ім'я та прізвище отримувача";
+    addChatMsg(orderWizardQuestion(), false);
+    return;
+  }
+
+  if (orderWizard.step === 'recipient') {
+    orderWizard.data.recipientName = value;
+    orderWizard.step = 'confirm';
+    supportInput.placeholder = 'Перевірте дані та підтвердіть';
+    supportInput.disabled = true;
+    supportSend.disabled = true;
+    addOrderConfirmBox();
+  }
+}
+
+function addOrderConfirmBox() {
+  const d = orderWizard.data;
+  const box = document.createElement('div');
+  box.className = 'order-confirm-box';
+  box.innerHTML = `
+    <p><b>Перевірте дані замовлення:</b></p>
+    <div class="order-confirm-list">
+      <div class="order-confirm-row"><span>Телефон</span><strong>${esc(d.phone)}</strong></div>
+      <div class="order-confirm-row"><span>Розмір</span><strong>${esc(d.size)}</strong></div>
+      <div class="order-confirm-row"><span>Ім'я з форми</span><strong>${esc(d.name)}</strong></div>
+      <div class="order-confirm-row"><span>Отримувач</span><strong>${esc(d.recipientName)}</strong></div>
+      <div class="order-confirm-row"><span>Місто</span><strong>${esc(d.city)}</strong></div>
+      <div class="order-confirm-row"><span>Нова Пошта</span><strong>${esc(d.branch)}</strong></div>
+    </div>
+    <button type="button" class="order-confirm-btn">Підтвердити</button>
+  `;
+  box.querySelector('.order-confirm-btn').addEventListener('click', () => submitOrderWizard(false));
+  supportMsgs.appendChild(box);
+  supportMsgs.scrollTop = supportMsgs.scrollHeight;
+}
+
+async function submitOrderWizard(skipDetails) {
+  if (!orderWizard.active || orderWizard.sending) return;
+  orderWizard.sending = true;
+  const d = orderWizard.data;
+  const payload = {
+    name: d.name,
+    phone: d.phone,
+    size: d.size,
+    contactViaTelegram: d.contactViaTelegram,
+    skipAutoCall: !!skipDetails,
+    orderFlow: skipDetails ? 'callcenter' : 'self_checkout',
+  };
+
+  if (!skipDetails) {
+    payload.city = d.city;
+    payload.branch = d.branch;
+    payload.recipientName = d.recipientName;
+  }
+
+  supportInput.disabled = true;
+  supportSend.disabled = true;
+  orderWizardSkip.disabled = true;
+  showTyping();
+
+  const result = await postJSON('/api/order', payload);
+  hideTyping();
+  orderWizard.sending = false;
+
+  if (!result || !result.success) {
+    supportInput.disabled = false;
+    supportSend.disabled = false;
+    orderWizardSkip.disabled = false;
+    addSystemMsg(result?.timeout ? 'Сервер не відповідає. Спробуйте ще раз.' : 'Не вдалося надіслати замовлення. Спробуйте ще раз.');
+    return;
+  }
+
+  fbTrack('Lead', { content_name: 'Violet Motion Order', value: 895, currency: 'UAH' });
+  ttTrack('Purchase', { content_type: 'product', content_ids: ['violet-motion-001'], content_name: 'Violet Motion Sneakers', value: 895, currency: 'UAH', quantity: 1 });
+  Analytics.track('order_success', { size: d.size, flow: payload.orderFlow });
+
+  orderWizard.active = false;
+  orderWizardSkip.classList.remove('support-skip--visible');
+  orderWizardSkip.disabled = false;
+  supportInput.disabled = false;
+  supportSend.disabled = false;
+  supportInput.placeholder = 'Напишіть повідомлення...';
+  supportStatus.textContent = '● Онлайн';
+
+  resetOrderForm(orderWizard.form);
+  addSystemMsg(skipDetails
+    ? 'Заявку передано менеджеру. Вам зателефонують для підтвердження.'
+    : 'Замовлення підтверджено. Дані вже передані менеджеру.');
+  showSuccessOverlay(d.name, d.size, {
+    phone: d.phone,
+    city: skipDetails ? '' : d.city,
+    branch: skipDetails ? '' : d.branch,
+    recipientName: skipDetails ? '' : d.recipientName,
+  });
+}
+
+orderWizardSkip.addEventListener('click', () => {
+  if (!orderWizard.active || orderWizard.sending) return;
+  addSystemMsg('Оформлення в чаті пропущено. Передаємо заявку менеджеру без автодзвінка.');
+  submitOrderWizard(true);
+});
+
 function handleDialogEnd() {
   if (dialogEnded) return;
   dialogEnded = true; operatorConnected = false;
@@ -887,6 +1039,11 @@ function handleDialogEnd() {
 
 let sendingSupport = false;
 async function sendSupportMsg() {
+  if (orderWizard.active) {
+    orderWizardSubmitText(supportInput.value);
+    return;
+  }
+
   const text = supportInput.value.trim();
   if (!text || sendingSupport) return;
 
