@@ -445,6 +445,7 @@ button, input, textarea, select { font: inherit; }
 }
 .sk-wrap { position: relative; }
 .sk-wrap.sk-loaded .sk-placeholder { opacity: 0; }
+.hero-video-card.sk-loaded .sk-placeholder { opacity: 0; }
 
 /* Gallery main skeleton */
 .gallery-main { position: relative; }
