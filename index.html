@@ -326,34 +326,7 @@
         </div>
 
         <div class="order-card fade-in-up">
-          <div class="ai-order" id="aiOrderAssistant">
-            <div class="ai-order-head">
-              <div class="ai-order-avatar">AI</div>
-              <div>
-                <div class="ai-order-title">Gemini асистент</div>
-                <div class="ai-order-status" id="aiOrderStatus">оформлю замовлення без дзвінка оператора</div>
-              </div>
-            </div>
-
-            <div class="ai-order-messages" id="aiOrderMessages" aria-live="polite">
-              <div class="ai-order-msg ai-order-msg--bot">
-                Вітаю! Я допоможу оформити замовлення на Violet Motion. Напишіть ім'я, телефон, розмір, місто та відділення Нової пошти. Якщо зручніше, можна надсилати по одному пункту.
-              </div>
-            </div>
-
-            <form id="aiOrderForm" class="ai-order-form">
-              <textarea id="aiOrderInput" rows="2" placeholder="Напишіть відповідь..." autocomplete="off"></textarea>
-              <button type="submit" class="main-btn form-btn ai-order-send pulse-cta" data-track="order_submit">Надіслати</button>
-            </form>
-
-            <div class="ai-order-actions">
-              <button type="button" class="ai-order-reset" id="aiOrderReset">Почати заново</button>
-            </div>
-
-            <div class="form-message" id="aiOrderMessage"></div>
-          </div>
-
-          <form id="orderForm" class="order-form order-form--legacy-hidden" aria-hidden="true">
+          <form id="orderForm" class="order-form">
             <label class="input-group">
               <span>Ваше ім'я</span>
               <input type="text" id="name" name="name" placeholder="Олександра" autocomplete="name" />

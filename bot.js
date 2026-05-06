@@ -159,7 +159,6 @@ async function showOrders(chatId, page = 1, filter = null, msgId = null) {
     if (o.product) text += `   🛍 ${o.product}\n`;
     text += `   📱 ${o.phone}  👟 р.${o.size}`;
     if (o.color) text += `  🎨 ${o.color}`;
-    if (o.deliveryCity) text += `  🏙 ${o.deliveryCity}`;
     if (o.contactViaTelegram) text += '  💬 TG';
     text += `\n   ${fmtDate(o.createdAt)}\n\n`;
   });
@@ -174,11 +173,8 @@ async function showOrderDetail(chatId, id, msgId = null) {
     (o.product ? `🛍 Товар: <b>${o.product}</b>\n` : '') +
     `👤 <b>${o.name}</b>\n📱 ${o.phone}\n👟 Розмір: ${o.size}\n` +
     (o.color ? `🎨 Колір: ${o.color}\n` : '') +
-    (o.deliveryCity ? `🏙 Місто: ${o.deliveryCity}\n` : '') +
-    (o.deliveryBranch ? `📦 Нова пошта: ${o.deliveryBranch}\n` : '') +
     (o.price ? `💵 Ціна: ${o.price} грн\n` : '') +
     (o.contactViaTelegram ? `💬 Зв'язок: Telegram\n` : `📞 Зв'язок: Дзвінок\n`) +
-    (o.comment ? `📝 Коментар: ${o.comment}\n` : '') +
     `🏷 Статус: ${statusEmoji(o.status)} ${o.status}\n📅 ${fmtDate(o.createdAt)}\n━━━━━━━━━━━━━━━`;
   reply(chatId, text, { inline_keyboard: [
     [{ text: '✅ Підтвердити', callback_data: `confirm_${o.id}` }, { text: '❌ Скасувати', callback_data: `cancel_${o.id}` }],
