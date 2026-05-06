@@ -146,7 +146,14 @@ async function showOrders(chatId, page = 1, filter = null, msgId = null) {
   let orders = await serverGet('/api/admin/orders');
   if (!Array.isArray(orders)) return reply(chatId, '❌ Не вдалося завантажити замовлення.', MAIN_KB, msgId);
   orders = orders.reverse();
-  if (filter) orders = orders.filter(o => o.name?.toLowerCase().includes(filter) || o.phone?.includes(filter) || String(o.size) === filter);
+  if (filter) orders = orders.filter(o =>
+    o.name?.toLowerCase().includes(filter) ||
+    o.phone?.includes(filter) ||
+    o.city?.toLowerCase().includes(filter) ||
+    o.settlement?.toLowerCase().includes(filter) ||
+    o.novaPostBranch?.toLowerCase().includes(filter) ||
+    String(o.size) === filter
+  );
   if (!orders.length) return reply(chatId, filter ? `🔍 Нічого по "<b>${filter}</b>"` : '📦 Замовлень поки немає.', MAIN_KB, msgId);
 
   const { items, page: p, total } = paginate(orders, page);
@@ -160,6 +167,7 @@ async function showOrders(chatId, page = 1, filter = null, msgId = null) {
     text += `   📱 ${o.phone}  👟 р.${o.size}`;
     if (o.color) text += `  🎨 ${o.color}`;
     if (o.contactViaTelegram) text += '  💬 TG';
+    if (o.city || o.novaPostBranch) text += `\n   🚚 ${[o.city, o.settlement, o.novaPostBranch].filter(Boolean).join(', ')}`;
     text += `\n   ${fmtDate(o.createdAt)}\n\n`;
   });
   reply(chatId, text, ordersKeyboard(items, p, total, filter), msgId);
@@ -172,6 +180,9 @@ async function showOrderDetail(chatId, id, msgId = null) {
     `📋 <b>Замовлення #${o.id}</b>\n━━━━━━━━━━━━━━━\n` +
     (o.product ? `🛍 Товар: <b>${o.product}</b>\n` : '') +
     `👤 <b>${o.name}</b>\n📱 ${o.phone}\n👟 Розмір: ${o.size}\n` +
+    (o.city ? `🏙 Місто: ${o.city}\n` : '') +
+    (o.settlement ? `🏘 Село/пригород: ${o.settlement}\n` : '') +
+    (o.novaPostBranch ? `📦 Нова Пошта: ${o.novaPostBranch}\n` : '') +
     (o.color ? `🎨 Колір: ${o.color}\n` : '') +
     (o.price ? `💵 Ціна: ${o.price} грн\n` : '') +
     (o.contactViaTelegram ? `💬 Зв'язок: Telegram\n` : `📞 Зв'язок: Дзвінок\n`) +
