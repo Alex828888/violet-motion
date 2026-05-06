@@ -2,7 +2,8 @@
  * VIOLET MOTION — SERVER v2
  * node server.js
  *
- * .env: PORT, TG_TOKEN, TG_CHAT_ID, API_KEY, ZVONOK_API_KEY, ZVONOK_CAMPAIGN_ID, ZVONOK_WEBHOOK_SECRET
+ * .env: PORT, TG_TOKEN, TG_CHAT_ID, API_KEY, GEMINI_API_KEY, GEMINI_MODEL,
+ *       SUPPORT_AI_ENABLED, ZVONOK_API_KEY, ZVONOK_CAMPAIGN_ID, ZVONOK_WEBHOOK_SECRET
  *
  * New in v2:
  *  • POST /api/analytics  — receive batched client events
@@ -21,6 +22,10 @@ const PORT       = process.env.PORT       || 3000;
 const TG_TOKEN   = process.env.TG_TOKEN   || '';
 const TG_CHAT_ID = process.env.TG_CHAT_ID || '';
 const API_KEY    = process.env.API_KEY    || 'violet-secret';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const SUPPORT_AI_ENABLED = process.env.SUPPORT_AI_ENABLED !== 'false';
+const SUPPORT_AI_MAX_PER_SESSION = Math.max(1, Number(process.env.SUPPORT_AI_MAX_PER_SESSION || 8));
 const ZVONOK_API_KEY = process.env.ZVONOK_API_KEY || '';
 const ZVONOK_CAMPAIGN_ID = process.env.ZVONOK_CAMPAIGN_ID || '';
 const ZVONOK_WEBHOOK_SECRET = process.env.ZVONOK_WEBHOOK_SECRET || '';
@@ -75,11 +80,16 @@ setInterval(() => {
 /* ── Telegram ──────────────────────────────────────────────── */
 async function tg(text, extra = {}) {
   if (!TG_TOKEN || !TG_CHAT_ID) return null;
+  return tgTo(TG_CHAT_ID, text, extra);
+}
+
+async function tgTo(chatId, text, extra = {}) {
+  if (!TG_TOKEN || !chatId) return null;
   try {
     const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: TG_CHAT_ID, text, parse_mode: 'HTML', ...extra }),
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', ...extra }),
     });
     return await r.json();
   } catch (e) { console.error('[TG]', e.message); return null; }
@@ -160,6 +170,177 @@ function escapeHtml(val) {
   return String(val || '').replace(/[&<>"']/g, ch => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   }[ch]));
+}
+
+const supportAiHistory = {};
+const supportAiUsage = {};
+const SUPPORT_AI_SYSTEM_PROMPT = `
+You are the Violet Motion store support assistant and first-line manager.
+Answer customers in the same language they use: Ukrainian, Russian, or simple mixed UA/RU. Be warm, concise, and practical.
+
+Store facts you may use:
+- Product: Violet Motion women's sneakers, soft violet edition, white / light-violet style.
+- Upper: eco-leather plus breathable mesh. Sole: light, cushioned, comfortable for walking.
+- Best for: daily wear, city walks, travel, spring, summer, and warm autumn.
+- Sizes on site: 36, 37, 38, 39, 40.
+- Promo price: 895 UAH. Old price: 1,899 UAH. Discount: 53%.
+- Payment: only after inspection/fitting on delivery, no prepayment.
+- Delivery: Nova Poshta across Ukraine.
+- Exchange: 14 days.
+- Order flow: customer leaves name, phone, and size in the site form. They can choose Telegram contact without a call. A manager confirms details.
+- Trust signals: 4.9 rating, 430+ orders this month.
+
+Rules:
+- Stay strictly on product, size, price, delivery, payment, exchange, order flow, and support for this site.
+- Do not invent unavailable facts such as exact delivery price, exact stock per size, or guarantees not listed above.
+- Do not ask for a human operator if you can answer from the facts.
+- Request a human only when the customer explicitly asks for a person/operator/manager, complains about an existing order, asks to change/cancel an order, sends unclear context after one clarification would not be enough, or asks for something outside the known facts.
+- Reject spam, random letters, insults, tests, and unrelated topics without spending words. Ask them to write a real question about the order or sneakers.
+- Never collect full personal data in chat. Direct the customer to the order form for name, phone, and size.
+
+Return only compact JSON:
+{"action":"answer","reply":"..."} or {"action":"handoff","reply":"...","reason":"..."}
+`;
+
+function supportSessionKey(sessionId, fallbackId = null) {
+  return String(sessionId || fallbackId || '').trim();
+}
+
+function findOpenSupportIndex(msgs, sessionId) {
+  const key = supportSessionKey(sessionId);
+  if (!key) return -1;
+  let idx = msgs.findIndex(m => supportSessionKey(m.sessionId, m.id) === key && !m.answered);
+  if (idx >= 0) return idx;
+  const numeric = Number(key);
+  return Number.isFinite(numeric) ? msgs.findIndex(m => m.id === numeric && !m.answered) : -1;
+}
+
+function updateSupportRecord(sessionId, patch) {
+  const msgs = read(F.support);
+  const idx = findOpenSupportIndex(msgs, sessionId);
+  if (idx < 0) return null;
+  msgs[idx] = { ...msgs[idx], ...patch, id: msgs[idx].id, updatedAt: new Date().toISOString() };
+  write(F.support, msgs);
+  return msgs[idx];
+}
+
+function isLikelyLowValueSupportMessage(text) {
+  const compact = String(text || '').trim();
+  const letters = compact.replace(/[^a-zа-яіїєґё0-9]/gi, '');
+  if (compact.length < 2) return true;
+  if (letters.length < 2) return true;
+  if (/^(.)\1{3,}$/i.test(letters)) return true;
+  if (/^(test|тест|asdf|qwerty|йцукен|fdfd|dfdf|fgfg|fggf|хз|xs)$/i.test(letters)) return true;
+  const vowels = (letters.match(/[aeiouyаеёиоуыэюяіїє]/gi) || []).length;
+  return letters.length >= 5 && vowels === 0;
+}
+
+function wantsHumanOperator(text) {
+  return /(оператор|менеджер|людин|человек|жив[а-яіїєґ]*|human|operator|manager|support|позвон|подзвон|передзвон|звонок|дзвінок)/i.test(text);
+}
+
+function geminiEndpoint() {
+  const model = GEMINI_MODEL.startsWith('models/') ? GEMINI_MODEL : `models/${GEMINI_MODEL}`;
+  return `https://generativelanguage.googleapis.com/v1beta/${model}:generateContent`;
+}
+
+function parseGeminiJson(raw) {
+  const text = String(raw || '').trim().replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
+  try { return JSON.parse(text); } catch {}
+  const match = text.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  try { return JSON.parse(match[0]); } catch { return null; }
+}
+
+async function askSupportAi(sessionId, message) {
+  if (!SUPPORT_AI_ENABLED || !GEMINI_API_KEY) return null;
+  const key = supportSessionKey(sessionId, 'anonymous');
+  supportAiUsage[key] = supportAiUsage[key] || 0;
+  if (supportAiUsage[key] >= SUPPORT_AI_MAX_PER_SESSION) {
+    return { action: 'handoff', reply: 'Передаю діалог менеджеру, щоб не ганяти вас по колу. Він підключиться й допоможе.', reason: 'ai_session_limit' };
+  }
+
+  const history = (supportAiHistory[key] || []).slice(-8);
+  supportAiUsage[key]++;
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 9000);
+  try {
+    const r = await fetch(geminiEndpoint(), {
+      method: 'POST',
+      signal: ctrl.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': GEMINI_API_KEY,
+      },
+      body: JSON.stringify({
+        system_instruction: { parts: [{ text: SUPPORT_AI_SYSTEM_PROMPT }] },
+        contents: [
+          ...history,
+          { role: 'user', parts: [{ text: message }] },
+        ],
+        generationConfig: {
+          temperature: 0.35,
+          topP: 0.85,
+          maxOutputTokens: 360,
+          responseMimeType: 'application/json',
+        },
+      }),
+    });
+    const data = await r.json().catch(() => null);
+    clearTimeout(timer);
+    if (!r.ok) {
+      console.error('[Gemini]', r.status, data?.error?.message || 'request failed');
+      return null;
+    }
+
+    const raw = data?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('').trim();
+    const parsed = parseGeminiJson(raw);
+    if (!parsed || !parsed.reply) return null;
+
+    const action = parsed.action === 'handoff' ? 'handoff' : 'answer';
+    const reply = sanitizeStr(parsed.reply, 900);
+    if (!reply) return null;
+
+    supportAiHistory[key] = [
+      ...history,
+      { role: 'user', parts: [{ text: message }] },
+      { role: 'model', parts: [{ text: reply }] },
+    ].slice(-10);
+
+    return { action, reply, reason: sanitizeStr(parsed.reason || '', 120) };
+  } catch (e) {
+    clearTimeout(timer);
+    console.error('[Gemini]', e.name === 'AbortError' ? 'timeout' : e.message);
+    return null;
+  }
+}
+
+async function notifySupportRequest(msg, mode = 'new') {
+  const ts = new Date(msg.timestamp || msg.updatedAt || Date.now()).toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' });
+  const title = mode === 'handoff'
+    ? '🤝 <b>ПОТРІБЕН МЕНЕДЖЕР</b>'
+    : mode === 'dialog'
+      ? `💬 <b>НОВЕ ПОВІДОМЛЕННЯ В ДІАЛОЗІ #${msg.id}</b>`
+      : `🎧 <b>ПІДТРИМКА #${msg.id}</b>`;
+  const text =
+    `${title}\n━━━━━━━━━━━━━━\n` +
+    `🆔 <code>${escapeHtml(msg.sessionId || msg.id)}</code>\n` +
+    (msg.handoffReason ? `ℹ️ ${escapeHtml(msg.handoffReason)}\n` : '') +
+    `💬 ${escapeHtml(msg.message)}\n📅 ${ts}`;
+
+  const keyboard = mode === 'dialog' ? undefined : {
+    reply_markup: { inline_keyboard: [[
+      { text: '✋ Прийняти діалог', callback_data: `accept_${msg.sessionId || msg.id}` },
+    ]] },
+  };
+
+  if (mode === 'dialog' && msg.managerId) {
+    await tgTo(msg.managerId, text, keyboard || {});
+    if (TG_CHAT_ID && String(TG_CHAT_ID) !== String(msg.managerId)) await tg(text);
+    return;
+  }
+  await tg(text, keyboard || {});
 }
 
 function normalizePhoneForZvonok(phone) {
@@ -480,19 +661,27 @@ app.post('/api/support/relay', authBot, (req, res) => {
 app.post('/api/support/accept', authBot, (req, res) => {
   const { sessionId, managerId } = req.body;
   if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
-  const sess = getSession(sessionId);
+  const support = updateSupportRecord(sessionId, {
+    accepted: true,
+    answered: false,
+    managerId: managerId || null,
+    acceptedAt: new Date().toISOString(),
+  });
+  const realSessionId = supportSessionKey(support?.sessionId, sessionId);
+  const sess = getSession(realSessionId);
   sess.accepted  = true;
   sess.managerId = managerId;
-  sseWrite(sessionId, { type: 'accepted' });
-  res.json({ success: true });
+  sseWrite(realSessionId, { type: 'accepted' });
+  res.json({ success: true, id: support?.id || null, sessionId: realSessionId });
 });
 
 app.post('/api/support/end', authBot, (req, res) => {
   const { sessionId } = req.body;
   if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
-  sseWrite(sessionId, { type: 'end' });
   const msgs = read(F.support);
-  const idx  = msgs.findIndex(m => m.sessionId === sessionId && !m.answered);
+  const idx  = findOpenSupportIndex(msgs, sessionId);
+  const realSessionId = supportSessionKey(msgs[idx]?.sessionId, sessionId);
+  sseWrite(realSessionId, { type: 'end' });
   if (idx >= 0) {
     msgs[idx].answered = true;
     msgs[idx].endedAt  = new Date().toISOString();
@@ -673,9 +862,7 @@ app.post('/api/support', rateLimit(60 * 1000, 10), async (req, res) => {
   if (!cleanMsg) return res.status(400).json({ error: 'Empty message' });
 
   const msgs = read(F.support);
-  const existingIdx = sessionId
-    ? msgs.findIndex(m => m.sessionId === sessionId && !m.answered)
-    : -1;
+  const existingIdx = findOpenSupportIndex(msgs, sessionId);
 
   if (existingIdx >= 0) {
     msgs[existingIdx].message   = cleanMsg;
@@ -683,6 +870,45 @@ app.post('/api/support', rateLimit(60 * 1000, 10), async (req, res) => {
     msgs[existingIdx].updatedAt = new Date().toISOString();
     write(F.support, msgs);
     const current = msgs[existingIdx];
+    if (current.accepted) {
+      await notifySupportRequest(current, 'dialog');
+      return res.json({ success: true, id: current.id, repeated: true, human: true });
+    }
+
+    if (isLikelyLowValueSupportMessage(cleanMsg)) {
+      return res.json({
+        success: true,
+        id: current.id,
+        repeated: true,
+        filtered: true,
+        aiReply: 'Напишіть, будь ласка, нормальне питання про кросівки, розмір, оплату або доставку — тоді швидко підкажу.',
+      });
+    }
+
+    const needsHuman = wantsHumanOperator(cleanMsg);
+    const ai = needsHuman ? null : await askSupportAi(sessionId, cleanMsg);
+    if (ai?.action === 'answer') {
+      msgs[existingIdx] = { ...current, answered: true, aiHandled: true, aiLastReply: ai.reply, updatedAt: new Date().toISOString() };
+      write(F.support, msgs);
+      return res.json({ success: true, id: current.id, repeated: true, aiReply: ai.reply, ai: true });
+    }
+
+    msgs[existingIdx] = {
+      ...current,
+      accepted: false,
+      answered: false,
+      handoffReason: needsHuman ? 'Клієнт попросив менеджера' : (ai?.reason || 'AI не зміг впевнено відповісти'),
+      updatedAt: new Date().toISOString(),
+    };
+    write(F.support, msgs);
+    await notifySupportRequest(msgs[existingIdx], 'handoff');
+    return res.json({
+      success: true,
+      id: current.id,
+      repeated: true,
+      handoff: true,
+      aiReply: ai?.reply || 'Передаю питання менеджеру. Він підключиться й допоможе з деталями.',
+    });
     const ts = new Date(current.timestamp).toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' });
     if (current.accepted) {
       await tg(`💬 <b>НОВЕ ПОВІДОМЛЕННЯ В ДІАЛОЗІ #${current.id}</b>\n━━━━━━━━━━━━━━\n🆔 <code>${current.sessionId}</code>\n💬 ${current.message}\n📅 ${ts}`);
@@ -694,6 +920,41 @@ app.post('/api/support', rateLimit(60 * 1000, 10), async (req, res) => {
     }
     return res.json({ success: true, id: current.id, repeated: true });
   }
+
+  if (isLikelyLowValueSupportMessage(cleanMsg)) {
+    return res.json({
+      success: true,
+      filtered: true,
+      aiReply: 'Напишіть, будь ласка, нормальне питання про кросівки, розмір, оплату або доставку — тоді швидко підкажу.',
+    });
+  }
+
+  const requestedHuman = wantsHumanOperator(cleanMsg);
+  const ai = requestedHuman ? null : await askSupportAi(sessionId, cleanMsg);
+
+  if (ai?.action === 'answer') {
+    const msg = {
+      id: nextId(msgs), message: cleanMsg, sessionId: sessionId || null,
+      timestamp: timestamp || new Date().toISOString(), answered: true, accepted: false,
+      aiHandled: true, aiLastReply: ai.reply,
+    };
+    msgs.push(msg); write(F.support, msgs);
+    return res.json({ success: true, id: msg.id, aiReply: ai.reply, ai: true });
+  }
+
+  const handoffMsg = {
+    id: nextId(msgs), message: cleanMsg, sessionId: sessionId || null,
+    timestamp: timestamp || new Date().toISOString(), answered: false, accepted: false,
+    handoffReason: requestedHuman ? 'Клієнт попросив менеджера' : (ai?.reason || 'AI не зміг впевнено відповісти'),
+  };
+  msgs.push(handoffMsg); write(F.support, msgs);
+  await notifySupportRequest(handoffMsg, requestedHuman || ai?.action === 'handoff' ? 'handoff' : 'new');
+  return res.json({
+    success: true,
+    id: handoffMsg.id,
+    handoff: true,
+    aiReply: ai?.reply || 'Передаю питання менеджеру. Він підключиться й допоможе з деталями.',
+  });
 
   const msg = {
     id: nextId(msgs), message: cleanMsg, sessionId: sessionId || null,

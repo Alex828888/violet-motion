@@ -901,12 +901,14 @@ async function sendSupportMsg() {
   sendingSupport = true;
   addChatMsg(text, true);
   supportInput.value = '';
+  if (!operatorConnected) showTyping();
 
   const result = await postJSON('/api/support', {
     message: text, sessionId: SESSION_ID, timestamp: new Date().toISOString(),
   });
 
   sendingSupport = false;
+  hideTyping();
 
   if (!result || !result.success) {
     serverReachable = false;
@@ -923,6 +925,19 @@ async function sendSupportMsg() {
   }
 
   serverReachable = true;
+  if (result.aiReply) {
+    firstMsg = false;
+    addChatMsg(result.aiReply, false);
+    if (result.handoff) {
+      supportStatus.textContent = '● Очікуємо оператора';
+    }
+    return;
+  }
+
+  if (result.human) {
+    return;
+  }
+
   // If first message and operator hasn't connected yet, show acknowledgement after delay
   if (firstMsg && !operatorConnected) {
     firstMsg = false;
