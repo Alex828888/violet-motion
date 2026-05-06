@@ -24,7 +24,7 @@ const API_KEY    = process.env.API_KEY    || 'violet-secret';
 
 /* ── Data files ────────────────────────────────────────────── */
 const ROOT = __dirname;
-const DATA = path.join(ROOT, 'data');
+const DATA = path.resolve(process.env.DATA_DIR || path.join(ROOT, 'data'));
 const F = {
   orders:    path.join(DATA, 'orders.json'),
   reviews:   path.join(DATA, 'reviews.json'),
@@ -390,23 +390,28 @@ app.get('/api/support/sessions', authBot, (_req, res) => {
    ORDERS (public)
 ═══════════════════════════════════════════════════════════ */
 app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
-  const { name, phone, size, color, product, price, contactViaTelegram } = req.body;
+  const { name, phone, size, city, settlement, novaPostBranch, color, product, price, contactViaTelegram, source } = req.body;
   if (!name || !phone || !size) return res.status(400).json({ error: 'Missing fields' });
 
   const cleanName  = sanitizeStr(name, 100);
   const cleanPhone = sanitizeStr(phone, 20);
   const cleanSize  = sanitizeStr(size, 10);
+  const cleanCity  = sanitizeStr(city, 80);
+  const cleanSettlement = sanitizeStr(settlement, 100);
+  const cleanNovaPostBranch = sanitizeStr(novaPostBranch, 120);
   const cleanColor = sanitizeStr(color, 40);
   const cleanProduct = sanitizeStr(product, 100);
   const cleanPrice = sanitizeStr(price, 20);
+  const cleanSource = sanitizeStr(source, 40);
   if (!cleanName || !cleanPhone || !cleanSize)
     return res.status(400).json({ error: 'Invalid fields' });
 
   const orders = read(F.orders);
   const o = {
     id: nextId(orders), name: cleanName, phone: cleanPhone, size: cleanSize,
+    city: cleanCity || null, settlement: cleanSettlement || null, novaPostBranch: cleanNovaPostBranch || null,
     color: cleanColor || null, product: cleanProduct || null, price: cleanPrice || null,
-    contactViaTelegram: !!contactViaTelegram, status: 'new', createdAt: new Date().toISOString(),
+    contactViaTelegram: !!contactViaTelegram, source: cleanSource || null, status: 'new', createdAt: new Date().toISOString(),
   };
   orders.push(o); write(F.orders, orders);
 
@@ -416,6 +421,9 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
     (o.product ? `🛍 Товар: <b>${o.product}</b>\n` : '') +
     `👤 Ім'я: <b>${o.name}</b>\n📱 Телефон: <b>${o.phone}</b>\n` +
     `👟 Розмір: <b>${o.size}</b>\n` +
+    (o.city ? `🏙 Місто: <b>${o.city}</b>\n` : '') +
+    (o.settlement ? `🏘 Село/пригород: <b>${o.settlement}</b>\n` : '') +
+    (o.novaPostBranch ? `📦 Нова Пошта: <b>${o.novaPostBranch}</b>\n` : '') +
     (o.color ? `🎨 Колір: <b>${o.color}</b>\n` : '') +
     (o.price ? `💵 Ціна: <b>${o.price} грн</b>\n` : '') +
     (o.contactViaTelegram ? `💬 Зв'язок: <b>Telegram</b>\n` : `📞 Зв'язок: <b>Дзвінок</b>\n`) +
