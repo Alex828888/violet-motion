@@ -174,6 +174,13 @@ function escapeHtml(val) {
 
 const supportAiHistory = {};
 const supportAiUsage = {};
+const SUPPORT_SIZE_CHART = {
+  36: '23 см',
+  37: '23.5 см',
+  38: '24 см',
+  39: '24.5 см',
+  40: '25 см',
+};
 const SUPPORT_AI_SYSTEM_PROMPT = `
 You are the Violet Motion store support assistant and first-line manager.
 Answer customers in the same language they use: Ukrainian, Russian, or simple mixed UA/RU. Be warm, concise, and practical.
@@ -183,6 +190,7 @@ Store facts you may use:
 - Upper: eco-leather plus breathable mesh. Sole: light, cushioned, comfortable for walking.
 - Best for: daily wear, city walks, travel, spring, summer, and warm autumn.
 - Sizes on site: 36, 37, 38, 39, 40.
+- Insole length chart: 36 = 23 cm, 37 = 23.5 cm, 38 = 24 cm, 39 = 24.5 cm, 40 = 25 cm.
 - Promo price: 895 UAH. Old price: 1,899 UAH. Discount: 53%.
 - Payment: only after inspection/fitting on delivery, no prepayment.
 - Delivery: Nova Poshta across Ukraine.
@@ -237,6 +245,48 @@ function isLikelyLowValueSupportMessage(text) {
 
 function wantsHumanOperator(text) {
   return /(оператор|менеджер|людин|человек|жив[а-яіїєґ]*|human|operator|manager|support|позвон|подзвон|передзвон|звонок|дзвінок)/i.test(text);
+}
+
+function localSupportReply(text) {
+  const msg = String(text || '').toLowerCase();
+  const sizeMatch = msg.match(/\b(36|37|38|39|40)\b/);
+  const asksInsole = /(устіл|устел|стельк|устил|сант|см|centimeter|centimetre|cm)/i.test(msg);
+  const asksSize = /(розмір|размер|size|підійде|подойдет|нога|стоп)/i.test(msg);
+
+  if ((asksInsole || asksSize) && sizeMatch && SUPPORT_SIZE_CHART[sizeMatch[1]]) {
+    const size = sizeMatch[1];
+    return `На ${size} розмір устілка орієнтовно ${SUPPORT_SIZE_CHART[size]}. Можна оформити замовлення без передоплати: на Новій Пошті оглянете, приміряєте і тоді оплатите.`;
+  }
+
+  if ((asksInsole || asksSize) && /(таблиц|сетка|сітка|устіл|стельк|сант|см|розмір|размер|size)/i.test(msg)) {
+    return `Розмірна сітка по устілці: 36 — 23 см, 37 — 23.5 см, 38 — 24 см, 39 — 24.5 см, 40 — 25 см. Оплата тільки після огляду та примірки.`;
+  }
+
+  if (/(ціна|цена|скільки кошту|сколько сто|вартість|стоимость|price|грн|895)/i.test(msg)) {
+    return `Зараз акційна ціна Violet Motion — 895 грн замість 1 899 грн. Передоплати немає: оплата після огляду та примірки на Новій Пошті.`;
+  }
+
+  if (/(достав|нова пошта|новою поштою|посилк|відправ|отправ|delivery)/i.test(msg)) {
+    return `Доставляємо Новою Поштою по Україні. Ви оглядаєте і приміряєте пару при отриманні, оплата тільки після цього.`;
+  }
+
+  if (/(оплат|передоплат|налож|наклад|після примір|после пример|при отрим|при получ)/i.test(msg)) {
+    return `Передоплати немає. Оплата тільки після огляду та примірки при отриманні на Новій Пошті.`;
+  }
+
+  if (/(обмін|обмен|поверн|возврат|14)/i.test(msg)) {
+    return `Обмін доступний протягом 14 днів. Якщо розмір не підійде, менеджер допоможе з обміном.`;
+  }
+
+  if (/(замов|заказ|оформ|купить|купити|хочу|беру)/i.test(msg)) {
+    return `Щоб оформити замовлення, оберіть розмір на сайті й залиште ім'я та телефон у формі. Менеджер підтвердить деталі. Можна обрати зв'язок через Telegram без дзвінка.`;
+  }
+
+  if (/(матеріал|материал|якість|качество|верх|підош|подош|колір|цвет|крос)/i.test(msg)) {
+    return `Violet Motion — жіночі кросівки у білому / світло-фіолетовому стилі. Верх: еко-шкіра + дихаюча сітка, підошва легка й амортизуюча, зручні для щоденної ходьби.`;
+  }
+
+  return null;
 }
 
 function geminiEndpoint() {
@@ -886,6 +936,13 @@ app.post('/api/support', rateLimit(60 * 1000, 10), async (req, res) => {
     }
 
     const needsHuman = wantsHumanOperator(cleanMsg);
+    const localReply = needsHuman ? null : localSupportReply(cleanMsg);
+    if (localReply) {
+      msgs[existingIdx] = { ...current, answered: true, aiHandled: true, localHandled: true, aiLastReply: localReply, updatedAt: new Date().toISOString() };
+      write(F.support, msgs);
+      return res.json({ success: true, id: current.id, repeated: true, aiReply: localReply, local: true });
+    }
+
     const ai = needsHuman ? null : await askSupportAi(sessionId, cleanMsg);
     if (ai?.action === 'answer') {
       msgs[existingIdx] = { ...current, answered: true, aiHandled: true, aiLastReply: ai.reply, updatedAt: new Date().toISOString() };
@@ -930,6 +987,17 @@ app.post('/api/support', rateLimit(60 * 1000, 10), async (req, res) => {
   }
 
   const requestedHuman = wantsHumanOperator(cleanMsg);
+  const localReply = requestedHuman ? null : localSupportReply(cleanMsg);
+  if (localReply) {
+    const msg = {
+      id: nextId(msgs), message: cleanMsg, sessionId: sessionId || null,
+      timestamp: timestamp || new Date().toISOString(), answered: true, accepted: false,
+      aiHandled: true, localHandled: true, aiLastReply: localReply,
+    };
+    msgs.push(msg); write(F.support, msgs);
+    return res.json({ success: true, id: msg.id, aiReply: localReply, local: true });
+  }
+
   const ai = requestedHuman ? null : await askSupportAi(sessionId, cleanMsg);
 
   if (ai?.action === 'answer') {
