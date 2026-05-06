@@ -2,7 +2,7 @@
  * VIOLET MOTION — SERVER v2
  * node server.js
  *
- * .env: PORT, TG_TOKEN, TG_CHAT_ID, API_KEY
+ * .env: PORT, TG_TOKEN, TG_CHAT_ID, API_KEY, GEMINI_API_KEY
  *
  * New in v2:
  *  • POST /api/analytics  — receive batched client events
@@ -21,6 +21,8 @@ const PORT       = process.env.PORT       || 3000;
 const TG_TOKEN   = process.env.TG_TOKEN   || '';
 const TG_CHAT_ID = process.env.TG_CHAT_ID || '';
 const API_KEY    = process.env.API_KEY    || 'violet-secret';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '';
+const GEMINI_MODEL   = process.env.GEMINI_MODEL   || 'gemini-2.5-flash';
 
 /* ── Data files ────────────────────────────────────────────── */
 const ROOT = __dirname;
@@ -151,6 +153,88 @@ function authBot(req, res, next) {
 }
 
 function sanitizeStr(val, max = 200) { return String(val || '').trim().slice(0, max); }
+function htmlEscape(val) {
+  return sanitizeStr(val, 2000)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function normalizeOrderPayload(body = {}) {
+  const cleanName  = sanitizeStr(body.name, 100);
+  const cleanPhone = sanitizeStr(body.phone, 30);
+  const cleanSize  = sanitizeStr(body.size, 10);
+  const cleanColor = sanitizeStr(body.color, 40);
+  const cleanProduct = sanitizeStr(body.product, 100);
+  const cleanPrice = sanitizeStr(body.price, 20);
+  const cleanCity = sanitizeStr(body.deliveryCity || body.city, 80);
+  const cleanBranch = sanitizeStr(body.deliveryBranch || body.branch || body.novaPostBranch, 120);
+  const cleanComment = sanitizeStr(body.comment || body.note, 500);
+
+  return {
+    name: cleanName,
+    phone: cleanPhone,
+    size: cleanSize,
+    color: cleanColor || null,
+    product: cleanProduct || null,
+    price: cleanPrice || null,
+    deliveryCity: cleanCity || null,
+    deliveryBranch: cleanBranch || null,
+    comment: cleanComment || null,
+    contactViaTelegram: !!body.contactViaTelegram,
+    source: sanitizeStr(body.source, 30) || 'form',
+  };
+}
+
+function validateOrderPayload(order) {
+  if (!order.name || !order.phone || !order.size) return 'Missing fields';
+  if (order.phone.replace(/\D/g, '').length < 10) return 'Invalid phone';
+  return null;
+}
+
+function orderTelegramText(o) {
+  const ts = new Date(o.createdAt).toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' });
+  return (
+    `🛒 <b>НОВЕ ЗАМОВЛЕННЯ #${o.id}</b>\n━━━━━━━━━━━━━━━━━━\n` +
+    (o.product ? `🛍 Товар: <b>${htmlEscape(o.product)}</b>\n` : '') +
+    `👤 Ім'я: <b>${htmlEscape(o.name)}</b>\n` +
+    `📱 Телефон: <b>${htmlEscape(o.phone)}</b>\n` +
+    `👟 Розмір: <b>${htmlEscape(o.size)}</b>\n` +
+    (o.color ? `🎨 Колір: <b>${htmlEscape(o.color)}</b>\n` : '') +
+    (o.deliveryCity ? `🏙 Місто: <b>${htmlEscape(o.deliveryCity)}</b>\n` : '') +
+    (o.deliveryBranch ? `📦 Нова пошта: <b>${htmlEscape(o.deliveryBranch)}</b>\n` : '') +
+    (o.price ? `💵 Ціна: <b>${htmlEscape(o.price)} грн</b>\n` : '') +
+    (o.contactViaTelegram ? `💬 Зв'язок: <b>Telegram</b>\n` : `📞 Зв'язок: <b>Дзвінок</b>\n`) +
+    (o.comment ? `📝 Коментар: <i>${htmlEscape(o.comment)}</i>\n` : '') +
+    (o.source === 'gemini' ? `🤖 Оформлено через: <b>Gemini AI</b>\n` : '') +
+    `📅 ${ts}\n━━━━━━━━━━━━━━━━━━`
+  );
+}
+
+async function createOrder(body) {
+  const normalized = normalizeOrderPayload(body);
+  const error = validateOrderPayload(normalized);
+  if (error) return { error };
+
+  const orders = read(F.orders);
+  const o = {
+    id: nextId(orders),
+    ...normalized,
+    status: 'new',
+    createdAt: new Date().toISOString(),
+  };
+  orders.push(o);
+  write(F.orders, orders);
+
+  await tg(orderTelegramText(o), {
+    reply_markup: { inline_keyboard: [[
+      { text: '✅ Підтвердити', callback_data: `confirm_${o.id}` },
+      { text: '❌ Скасувати',  callback_data: `cancel_${o.id}` },
+    ]] },
+  });
+
+  return { order: o };
+}
 
 /* ═══════════════════════════════════════════════════════════
    ANALYTICS
@@ -386,22 +470,284 @@ app.get('/api/support/sessions', authBot, (_req, res) => {
   res.json(active);
 });
 
+/* ── Gemini order assistant ───────────────────────────────────── */
+const orderAiSessions = new Map();
+const ORDER_AI_TTL = 2 * 60 * 60 * 1000;
+
+function newOrderAiSession() {
+  return {
+    id: 'ord_' + Date.now() + '_' + Math.random().toString(36).slice(2, 9),
+    fields: {},
+    messages: [],
+    completed: false,
+    orderId: null,
+    updatedAt: Date.now(),
+  };
+}
+
+function getOrderAiSession(id) {
+  let session = id ? orderAiSessions.get(id) : null;
+  if (!session) {
+    session = newOrderAiSession();
+    orderAiSessions.set(session.id, session);
+  }
+  session.updatedAt = Date.now();
+  return session;
+}
+
+setInterval(() => {
+  const cutoff = Date.now() - ORDER_AI_TTL;
+  for (const [id, session] of orderAiSessions.entries()) {
+    if ((session.updatedAt || 0) < cutoff) orderAiSessions.delete(id);
+  }
+}, 30 * 60 * 1000);
+
+function mergeOrderFields(target, incoming = {}) {
+  const textFields = ['name', 'phone', 'size', 'deliveryCity', 'deliveryBranch', 'comment', 'color'];
+  textFields.forEach(key => {
+    const val = sanitizeStr(incoming[key], key === 'comment' ? 500 : 120);
+    if (val) target[key] = val;
+  });
+
+  if (incoming.contactMethod) {
+    const method = sanitizeStr(incoming.contactMethod, 40).toLowerCase();
+    if (method.includes('telegram') || method.includes('tg') || method.includes('телеграм')) {
+      target.contactViaTelegram = true;
+      target.contactMethod = 'telegram';
+    } else if (method.includes('call') || method.includes('phone') || method.includes('дзв') || method.includes('звон')) {
+      target.contactViaTelegram = false;
+      target.contactMethod = 'call';
+    }
+  }
+
+  if (typeof incoming.contactViaTelegram === 'boolean') {
+    target.contactViaTelegram = incoming.contactViaTelegram;
+    target.contactMethod = incoming.contactViaTelegram ? 'telegram' : 'call';
+  }
+
+  const phoneDigits = String(target.phone || '').replace(/\D/g, '');
+  if (target.phone && phoneDigits.length < 10) delete target.phone;
+
+  if (target.size && !/^(3[6-9]|40)$/.test(String(target.size))) delete target.size;
+  return target;
+}
+
+function extractOrderHints(text) {
+  const hints = {};
+  const raw = sanitizeStr(text, 1000);
+  const phone = raw.match(/(?:\+?38)?\s*\(?0\d{2}\)?[\s-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}/);
+  if (phone) hints.phone = phone[0];
+
+  const size = raw.match(/(?:розмір|размер|size|р\.?)\s*(36|37|38|39|40)\b/i) || raw.match(/\b(36|37|38|39|40)\b/);
+  if (size) hints.size = size[1];
+
+  if (/(telegram|телеграм|tg)/i.test(raw)) hints.contactMethod = 'telegram';
+  if (/(дзв|звон|call|телефон)/i.test(raw)) hints.contactMethod = 'call';
+
+  const city = raw.match(/(?:місто|город|city)\s*[:\-]?\s*([A-Za-zА-Яа-яІіЇїЄєҐґ' -]{2,60})/i);
+  if (city) hints.deliveryCity = city[1].trim();
+
+  const branch = raw.match(/(?:відділення|отделение|нова пошта|нп|np)\s*[:#№\-]?\s*([A-Za-zА-Яа-яІіЇїЄєҐґ0-9' .\/-]{1,80})/i);
+  if (branch) hints.deliveryBranch = branch[1].trim();
+
+  const name = raw.match(/(?:мене звати|меня зовут|ім'?я|имя|name)\s*[:\-]?\s*([A-Za-zА-Яа-яІіЇїЄєҐґ' -]{2,50})/i);
+  if (name) hints.name = name[1].trim();
+
+  return hints;
+}
+
+function applyExpectedOrderField(fields, expected, text) {
+  const raw = sanitizeStr(text, 160);
+  if (!raw || fields[expected]) return;
+
+  if (expected === 'name' && raw.length <= 50 && !/\d{5,}/.test(raw)) fields.name = raw;
+  if (expected === 'phone' && raw.replace(/\D/g, '').length >= 10) fields.phone = raw;
+  if (expected === 'size') {
+    const size = raw.match(/\b(36|37|38|39|40)\b/);
+    if (size) fields.size = size[1];
+  }
+  if (expected === 'deliveryCity' && raw.length <= 80) fields.deliveryCity = raw;
+  if (expected === 'deliveryBranch' && raw.length <= 120) fields.deliveryBranch = raw;
+  if (expected === 'contactMethod') {
+    if (/(telegram|телеграм|tg)/i.test(raw)) mergeOrderFields(fields, { contactMethod: 'telegram' });
+    else if (/(дзв|звон|call|телефон)/i.test(raw)) mergeOrderFields(fields, { contactMethod: 'call' });
+  }
+}
+
+function missingOrderFields(fields) {
+  const missing = [];
+  if (!fields.name) missing.push('name');
+  if (!fields.phone) missing.push('phone');
+  if (!fields.size) missing.push('size');
+  if (!fields.deliveryCity) missing.push('deliveryCity');
+  if (!fields.deliveryBranch) missing.push('deliveryBranch');
+  if (!fields.contactMethod) missing.push('contactMethod');
+  return missing;
+}
+
+function fallbackOrderReply(fields) {
+  const missing = missingOrderFields(fields);
+  const next = missing[0];
+  const questions = {
+    name: "Як до вас звертатися?",
+    phone: "Залиште, будь ласка, номер телефону у форматі +380...",
+    size: "Який розмір взуття забронювати: 36, 37, 38, 39 чи 40?",
+    deliveryCity: "У яке місто відправляємо Новою поштою?",
+    deliveryBranch: "Вкажіть номер або адресу відділення Нової пошти.",
+    contactMethod: "Як зручніше підтвердити замовлення: дзвінок чи Telegram?",
+  };
+
+  if (!next) {
+    return {
+      reply: `Супер, все зібрала. Оформлю замовлення: ${fields.name}, ${fields.phone}, розмір ${fields.size}, ${fields.deliveryCity}, НП ${fields.deliveryBranch}.`,
+      complete: true,
+      fields,
+    };
+  }
+
+  return { reply: questions[next], complete: false, fields };
+}
+
+function parseGeminiJson(text) {
+  const cleaned = sanitizeStr(text, 5000).replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```$/i, '').trim();
+  try { return JSON.parse(cleaned); } catch {}
+  const match = cleaned.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  try { return JSON.parse(match[0]); } catch { return null; }
+}
+
+async function askGeminiOrderAssistant(session, userText) {
+  if (!GEMINI_API_KEY) return null;
+
+  const transcript = session.messages
+    .slice(-10)
+    .map(m => `${m.role === 'user' ? 'Клієнт' : 'Асистент'}: ${m.text}`)
+    .join('\n');
+
+  const prompt =
+    `Ти професійний AI-асистент інтернет-магазину Violet Motion. Оформи замовлення на жіночі кросівки Violet Motion за 895 грн.\n` +
+    `Пиши клієнту українською або російською мовою, підлаштовуйся під мову клієнта. Будь короткою, теплою і впевненою.\n` +
+    `Потрібно зібрати: name, phone, size (36-40), deliveryCity, deliveryBranch (Нова пошта), contactMethod (call або telegram). comment необов'язковий.\n` +
+    `Якщо даних бракує, задай одне найважливіше питання. Якщо все є, підтвердь, що замовлення оформляється.\n` +
+    `Поточні дані: ${JSON.stringify(session.fields)}\n` +
+    `Діалог:\n${transcript}\n` +
+    `Останнє повідомлення клієнта: ${userText}\n` +
+    `Поверни тільки JSON без markdown у форматі: {"reply":"...","fields":{"name":"","phone":"","size":"","deliveryCity":"","deliveryBranch":"","contactMethod":"call|telegram","comment":""},"complete":false}`;
+
+  try {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': GEMINI_API_KEY,
+      },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.25,
+          responseMimeType: 'application/json',
+        },
+      }),
+    });
+    if (!r.ok) throw new Error(`Gemini ${r.status}`);
+    const data = await r.json();
+    const text = data?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('').trim();
+    return text ? parseGeminiJson(text) : null;
+  } catch (e) {
+    console.error('[Gemini order]', e.message);
+    return null;
+  }
+}
+
+app.post('/api/order/ai/message', rateLimit(60 * 1000, 15), async (req, res) => {
+  const body = req.body || {};
+  const session = getOrderAiSession(body.sessionId);
+  if (session.completed) {
+    return res.json({
+      success: true,
+      sessionId: session.id,
+      completed: true,
+      order: { id: session.orderId, ...session.fields },
+      reply: 'Замовлення вже оформлено. Дякуємо!',
+    });
+  }
+
+  const userText = sanitizeStr(body.message, 1000);
+  if (!userText) return res.status(400).json({ error: 'Missing message' });
+
+  const expectedField = missingOrderFields(session.fields)[0];
+  mergeOrderFields(session.fields, extractOrderHints(userText));
+  applyExpectedOrderField(session.fields, expectedField, userText);
+  session.messages.push({ role: 'user', text: userText });
+
+  const ai = await askGeminiOrderAssistant(session, userText);
+  if (ai?.fields) mergeOrderFields(session.fields, ai.fields);
+
+  const missing = missingOrderFields(session.fields);
+  const fallback = fallbackOrderReply(session.fields);
+  const complete = missing.length === 0 && (ai?.complete || fallback.complete);
+  const reply = sanitizeStr(ai?.reply, 700) || fallback.reply;
+
+  session.messages.push({ role: 'assistant', text: reply });
+
+  if (!complete) {
+    return res.json({
+      success: true,
+      sessionId: session.id,
+      completed: false,
+      reply,
+      fields: session.fields,
+    });
+  }
+
+  const created = await createOrder({
+    ...session.fields,
+    product: 'Violet Motion',
+    price: '895',
+    source: 'gemini',
+    contactViaTelegram: !!session.fields.contactViaTelegram,
+  });
+
+  if (created.error) return res.status(400).json({ error: created.error, reply: fallback.reply, sessionId: session.id });
+
+  session.completed = true;
+  session.orderId = created.order.id;
+  return res.json({
+    success: true,
+    sessionId: session.id,
+    completed: true,
+    reply,
+    order: created.order,
+  });
+});
+
+app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
+  const body = req.body || {};
+  const created = await createOrder({ ...body, source: body.source || 'form' });
+  if (created.error) return res.status(400).json({ error: created.error });
+  res.json({ success: true, id: created.order.id, order: created.order });
+});
+
 /* ═══════════════════════════════════════════════════════════
    ORDERS (public)
 ═══════════════════════════════════════════════════════════ */
-app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
-  const { name, phone, size, contactViaTelegram } = req.body;
+app.post('/api/order-legacy', rateLimit(60 * 1000, 5), async (req, res) => {
+  const { name, phone, size, color, product, price, contactViaTelegram } = req.body;
   if (!name || !phone || !size) return res.status(400).json({ error: 'Missing fields' });
 
   const cleanName  = sanitizeStr(name, 100);
   const cleanPhone = sanitizeStr(phone, 20);
   const cleanSize  = sanitizeStr(size, 10);
+  const cleanColor = sanitizeStr(color, 40);
+  const cleanProduct = sanitizeStr(product, 100);
+  const cleanPrice = sanitizeStr(price, 20);
   if (!cleanName || !cleanPhone || !cleanSize)
     return res.status(400).json({ error: 'Invalid fields' });
 
   const orders = read(F.orders);
   const o = {
     id: nextId(orders), name: cleanName, phone: cleanPhone, size: cleanSize,
+    color: cleanColor || null, product: cleanProduct || null, price: cleanPrice || null,
     contactViaTelegram: !!contactViaTelegram, status: 'new', createdAt: new Date().toISOString(),
   };
   orders.push(o); write(F.orders, orders);
@@ -409,8 +755,11 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
   const ts = new Date(o.createdAt).toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' });
   await tg(
     `🛒 <b>НОВЕ ЗАМОВЛЕННЯ #${o.id}</b>\n━━━━━━━━━━━━━━━━━━\n` +
+    (o.product ? `🛍 Товар: <b>${o.product}</b>\n` : '') +
     `👤 Ім'я: <b>${o.name}</b>\n📱 Телефон: <b>${o.phone}</b>\n` +
     `👟 Розмір: <b>${o.size}</b>\n` +
+    (o.color ? `🎨 Колір: <b>${o.color}</b>\n` : '') +
+    (o.price ? `💵 Ціна: <b>${o.price} грн</b>\n` : '') +
     (o.contactViaTelegram ? `💬 Зв'язок: <b>Telegram</b>\n` : `📞 Зв'язок: <b>Дзвінок</b>\n`) +
     `📅 ${ts}\n━━━━━━━━━━━━━━━━━━`,
     { reply_markup: { inline_keyboard: [[
