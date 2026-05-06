@@ -2,7 +2,7 @@
  * VIOLET MOTION — SERVER v2
  * node server.js
  *
- * .env: PORT, TG_TOKEN, TG_CHAT_ID, API_KEY
+ * .env: PORT, TG_TOKEN, TG_CHAT_ID, API_KEY, ZVONOK_API_KEY, ZVONOK_CAMPAIGN_ID, ZVONOK_WEBHOOK_SECRET
  *
  * New in v2:
  *  • POST /api/analytics  — receive batched client events
@@ -21,10 +21,14 @@ const PORT       = process.env.PORT       || 3000;
 const TG_TOKEN   = process.env.TG_TOKEN   || '';
 const TG_CHAT_ID = process.env.TG_CHAT_ID || '';
 const API_KEY    = process.env.API_KEY    || 'violet-secret';
+const ZVONOK_API_KEY = process.env.ZVONOK_API_KEY || '';
+const ZVONOK_CAMPAIGN_ID = process.env.ZVONOK_CAMPAIGN_ID || '';
+const ZVONOK_WEBHOOK_SECRET = process.env.ZVONOK_WEBHOOK_SECRET || '';
+const ZVONOK_CALL_URL = 'https://zvonok.com/manager/cabapi_external/api/v1/phones/call/';
 
 /* ── Data files ────────────────────────────────────────────── */
 const ROOT = __dirname;
-const DATA = path.resolve(process.env.DATA_DIR || path.join(ROOT, 'data'));
+const DATA = path.join(ROOT, 'data');
 const F = {
   orders:    path.join(DATA, 'orders.json'),
   reviews:   path.join(DATA, 'reviews.json'),
@@ -151,6 +155,120 @@ function authBot(req, res, next) {
 }
 
 function sanitizeStr(val, max = 200) { return String(val || '').trim().slice(0, max); }
+
+function escapeHtml(val) {
+  return String(val || '').replace(/[&<>"']/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[ch]));
+}
+
+function normalizePhoneForZvonok(phone) {
+  const raw = String(phone || '').trim();
+  const digits = raw.replace(/\D/g, '');
+  if (!digits) return '';
+  if (digits.length === 10 && digits.startsWith('0')) return `+38${digits}`;
+  if (digits.length === 12 && digits.startsWith('380')) return `+${digits}`;
+  if (raw.startsWith('+')) return `+${digits}`;
+  return `+${digits}`;
+}
+
+function samePhone(a, b) {
+  const da = String(a || '').replace(/\D/g, '');
+  const db = String(b || '').replace(/\D/g, '');
+  return !!da && !!db && (da === db || da.endsWith(db) || db.endsWith(da));
+}
+
+function getRequestBaseUrl(req) {
+  const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'http').split(',')[0].trim();
+  const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+  return host ? `${proto}://${host}` : '';
+}
+
+function buildZvonokWebhookUrl(req, order, button) {
+  const base = getRequestBaseUrl(req);
+  if (!base) return '';
+  const url = new URL('/api/zvonok/ivr', base);
+  url.searchParams.set('orderId', order.id);
+  url.searchParams.set('button', button);
+  if (ZVONOK_WEBHOOK_SECRET) url.searchParams.set('secret', ZVONOK_WEBHOOK_SECRET);
+  return url.toString();
+}
+
+async function startZvonokCall(order, req) {
+  if (!ZVONOK_API_KEY || !ZVONOK_CAMPAIGN_ID) {
+    console.warn('[Zvonok] skipped: ZVONOK_API_KEY or ZVONOK_CAMPAIGN_ID is not set');
+    return null;
+  }
+
+  const phone = normalizePhoneForZvonok(order.phone);
+  if (!phone) {
+    console.warn(`[Zvonok] skipped order #${order.id}: invalid phone`);
+    return null;
+  }
+
+  const form = new FormData();
+  form.append('public_key', ZVONOK_API_KEY);
+  form.append('campaign_id', ZVONOK_CAMPAIGN_ID);
+  form.append('phone', phone);
+  form.append('label', `order_${order.id}`);
+
+  const btn1Webhook = buildZvonokWebhookUrl(req, order, 1);
+  const btn2Webhook = buildZvonokWebhookUrl(req, order, 2);
+  if (btn1Webhook) form.append('ivr_lvl_1_btn_1_webhook', btn1Webhook);
+  if (btn2Webhook) form.append('ivr_lvl_1_btn_2_webhook', btn2Webhook);
+
+  const ctrl = new AbortController();
+  const timeout = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const response = await fetch(ZVONOK_CALL_URL, { method: 'POST', body: form, signal: ctrl.signal });
+    const text = await response.text();
+    let data = text;
+    try { data = JSON.parse(text); } catch {}
+    console.log(`[Zvonok] order #${order.id} call start: ${response.status}`, data);
+    return { ok: response.ok, status: response.status, data };
+  } catch (e) {
+    console.error(`[Zvonok] order #${order.id} call start failed:`, e.message);
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function findOrderIndexByZvonokPayload(orders, payload) {
+  const rawOrderId = payload.orderId || payload.order_id || payload.order || payload.id || payload.client_id;
+  let orderId = Number(rawOrderId);
+  if (!orderId && payload.label) {
+    const match = String(payload.label).match(/order[_-](\d+)/i);
+    if (match) orderId = Number(match[1]);
+  }
+  if (orderId) {
+    const byId = orders.findIndex(o => o.id === orderId);
+    if (byId >= 0) return byId;
+  }
+
+  const phone = payload.phone || payload.Phone || payload.called_phone || payload.customer_phone;
+  if (phone) return orders.findLastIndex(o => samePhone(o.phone, phone));
+  return -1;
+}
+
+function getZvonokDigit(payload) {
+  const value = payload.button || payload.digit || payload.button_num || payload.ivr_button || payload.key || payload.user_choice;
+  const match = String(value || '').match(/[12]/);
+  return match ? match[0] : '';
+}
+
+function getZvonokStatus(payload) {
+  return String(payload.status || payload.call_status || payload.dial_status || payload.event || '').toLowerCase();
+}
+
+function formatOrderForZvonokMessage(order) {
+  return (
+    `Имя: ${escapeHtml(order?.name || '-')}\n` +
+    `Телефон: ${escapeHtml(order?.phone || '-')}\n` +
+    `Размер: ${escapeHtml(order?.size || '-')}\n` +
+    `Order ID: ${escapeHtml(order?.id || '-')}`
+  );
+}
 
 /* ═══════════════════════════════════════════════════════════
    ANALYTICS
@@ -390,28 +508,23 @@ app.get('/api/support/sessions', authBot, (_req, res) => {
    ORDERS (public)
 ═══════════════════════════════════════════════════════════ */
 app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
-  const { name, phone, size, city, settlement, novaPostBranch, color, product, price, contactViaTelegram, source } = req.body;
+  const { name, phone, size, color, product, price, contactViaTelegram } = req.body;
   if (!name || !phone || !size) return res.status(400).json({ error: 'Missing fields' });
 
   const cleanName  = sanitizeStr(name, 100);
   const cleanPhone = sanitizeStr(phone, 20);
   const cleanSize  = sanitizeStr(size, 10);
-  const cleanCity  = sanitizeStr(city, 80);
-  const cleanSettlement = sanitizeStr(settlement, 100);
-  const cleanNovaPostBranch = sanitizeStr(novaPostBranch, 120);
   const cleanColor = sanitizeStr(color, 40);
   const cleanProduct = sanitizeStr(product, 100);
   const cleanPrice = sanitizeStr(price, 20);
-  const cleanSource = sanitizeStr(source, 40);
   if (!cleanName || !cleanPhone || !cleanSize)
     return res.status(400).json({ error: 'Invalid fields' });
 
   const orders = read(F.orders);
   const o = {
     id: nextId(orders), name: cleanName, phone: cleanPhone, size: cleanSize,
-    city: cleanCity || null, settlement: cleanSettlement || null, novaPostBranch: cleanNovaPostBranch || null,
     color: cleanColor || null, product: cleanProduct || null, price: cleanPrice || null,
-    contactViaTelegram: !!contactViaTelegram, source: cleanSource || null, status: 'new', createdAt: new Date().toISOString(),
+    contactViaTelegram: !!contactViaTelegram, status: 'new', createdAt: new Date().toISOString(),
   };
   orders.push(o); write(F.orders, orders);
 
@@ -421,9 +534,6 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
     (o.product ? `🛍 Товар: <b>${o.product}</b>\n` : '') +
     `👤 Ім'я: <b>${o.name}</b>\n📱 Телефон: <b>${o.phone}</b>\n` +
     `👟 Розмір: <b>${o.size}</b>\n` +
-    (o.city ? `🏙 Місто: <b>${o.city}</b>\n` : '') +
-    (o.settlement ? `🏘 Село/пригород: <b>${o.settlement}</b>\n` : '') +
-    (o.novaPostBranch ? `📦 Нова Пошта: <b>${o.novaPostBranch}</b>\n` : '') +
     (o.color ? `🎨 Колір: <b>${o.color}</b>\n` : '') +
     (o.price ? `💵 Ціна: <b>${o.price} грн</b>\n` : '') +
     (o.contactViaTelegram ? `💬 Зв'язок: <b>Telegram</b>\n` : `📞 Зв'язок: <b>Дзвінок</b>\n`) +
@@ -433,6 +543,10 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
       { text: '❌ Скасувати',  callback_data: `cancel_${o.id}` },
     ]] } }
   );
+  // Zvonok is best-effort: order creation and Telegram notifications stay intact if it fails.
+  try { await startZvonokCall(o, req); }
+  catch (e) { console.error(`[Zvonok] unexpected order #${o.id} error:`, e.message); }
+
   res.json({ success: true, id: o.id });
 });
 
@@ -451,6 +565,65 @@ app.delete('/api/orders/:id', (req, res) => {
   const id = Number(req.params.id); const arr = read(F.orders);
   if (!arr.some(x => x.id === id)) return res.status(404).json({ error: 'Not found' });
   write(F.orders, arr.filter(x => x.id !== id)); res.json({ success: true });
+});
+
+app.all('/api/zvonok/ivr', async (req, res) => {
+  const payload = { ...req.query, ...req.body };
+
+  if (ZVONOK_WEBHOOK_SECRET) {
+    const secret = payload.secret || req.headers['x-zvonok-secret'];
+    if (secret !== ZVONOK_WEBHOOK_SECRET) return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const orders = read(F.orders);
+  const idx = findOrderIndexByZvonokPayload(orders, payload);
+  if (idx < 0) {
+    console.warn('[Zvonok] webhook order not found:', payload);
+    return res.status(404).json({ error: 'Order not found' });
+  }
+
+  const order = orders[idx];
+  const digit = getZvonokDigit(payload);
+  const status = getZvonokStatus(payload);
+  const noAnswerStatuses = ['no_answer', 'noanswer', 'busy', 'failed', 'fail', 'error', 'unanswered', 'not_available'];
+
+  let nextStatus = null;
+  let message = null;
+
+  if (digit === '1') {
+    nextStatus = 'confirmed';
+    message =
+      `✅ Замовлення підтверджено автоматичним дзвінком\n` +
+      formatOrderForZvonokMessage(order);
+  } else if (digit === '2') {
+    nextStatus = 'cancelled';
+    message =
+      `❌ Клієнт скасував замовлення через автоматичний дзвінок\n` +
+      formatOrderForZvonokMessage(order);
+  } else if (noAnswerStatuses.some(s => status.includes(s))) {
+    nextStatus = 'no_answer';
+    message =
+      `📞 Клієнт не відповів на автоматичний дзвінок — потрібна ручна перевірка\n` +
+      formatOrderForZvonokMessage(order);
+  }
+
+  if (!nextStatus) {
+    console.log(`[Zvonok] webhook received for order #${order.id}:`, payload);
+    return res.json({ success: true, ignored: true });
+  }
+
+  orders[idx] = {
+    ...order,
+    status: nextStatus,
+    updatedAt: new Date().toISOString(),
+    zvonokStatus: status || null,
+    zvonokButton: digit || null,
+  };
+  write(F.orders, orders);
+
+  await tg(message);
+  console.log(`[Zvonok] webhook order #${order.id}: ${nextStatus}`, payload);
+  res.json({ success: true, orderId: order.id, status: nextStatus });
 });
 
 /* ═══════════════════════════════════════════════════════════
