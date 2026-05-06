@@ -475,7 +475,7 @@ let orderSubmitting = false;
 document.getElementById('orderForm').addEventListener('submit', async e => {
   e.preventDefault();
   if (orderSubmitting) return;
-  if (orderWizard.active) { openSupportPanel(); return; }
+  if (orderWizard.active) { openOrderWizardModal(); return; }
 
   const msgEl = document.getElementById('formMessage');
   const btn   = e.target.querySelector('.form-btn');
@@ -723,7 +723,12 @@ const supportInput  = document.getElementById('supportInput');
 const supportSend   = document.getElementById('supportSend');
 const supportMsgs   = document.getElementById('supportMessages');
 const supportStatus = document.getElementById('supportStatus');
+const orderWizardOverlay = document.getElementById('orderWizardOverlay');
+const orderWizardMessages = document.getElementById('orderWizardMessages');
+const orderWizardInput = document.getElementById('orderWizardInput');
+const orderWizardSend = document.getElementById('orderWizardSend');
 const orderWizardSkip = document.getElementById('orderWizardSkip');
+const orderWizardClose = document.getElementById('orderWizardClose');
 
 function getSessionId() {
   let id = sessionStorage.getItem('vm_sess');
@@ -855,17 +860,30 @@ const orderWizard = {
   sending: false,
 };
 
-function openSupportPanel() {
-  supportPanel.classList.add('support-panel--open');
-  supportFab.classList.add('support-fab--active');
-  setTimeout(() => supportInput.focus(), 220);
-}
-
 function resetOrderForm(form) {
   form.reset();
   selectedSizeInput.value = '';
   sizeBtns.forEach(b => b.classList.remove('active'));
   document.getElementById('contactViaTelegram').checked = false;
+}
+
+function openOrderWizardModal() {
+  orderWizardOverlay.classList.add('visible');
+  document.body.style.overflow = 'hidden';
+  setTimeout(() => orderWizardInput.focus(), 180);
+}
+
+function closeOrderWizardModal() {
+  orderWizardOverlay.classList.remove('visible');
+  document.body.style.overflow = '';
+}
+
+function addOrderWizardMsg(text, isUser = false, isSystem = false) {
+  const div = document.createElement('div');
+  div.className = `order-wizard-msg ${isSystem ? 'order-wizard-msg--system' : (isUser ? 'order-wizard-msg--user' : 'order-wizard-msg--bot')}`;
+  div.innerHTML = `<div class="order-wizard-bubble">${esc(text)}</div>`;
+  orderWizardMessages.appendChild(div);
+  orderWizardMessages.scrollTop = orderWizardMessages.scrollHeight;
 }
 
 function startOrderWizard(data, form) {
@@ -875,18 +893,15 @@ function startOrderWizard(data, form) {
   orderWizard.form = form;
   orderWizard.sending = false;
 
-  supportMsgs.innerHTML = '';
-  dialogEnded = false;
-  operatorConnected = false;
-  supportStatus.textContent = '● Оформлення замовлення';
-  supportInput.disabled = false;
-  supportSend.disabled = false;
-  supportInput.placeholder = 'Введіть місто...';
-  orderWizardSkip.classList.add('support-skip--visible');
-  openSupportPanel();
+  orderWizardMessages.innerHTML = '';
+  orderWizardInput.disabled = false;
+  orderWizardSend.disabled = false;
+  orderWizardSkip.disabled = false;
+  orderWizardInput.placeholder = 'Введіть місто...';
+  openOrderWizardModal();
 
-  addChatMsg('Оформіть прямо зараз без колцентру — це займає приблизно 30 секунд.', false);
-  addChatMsg('Підкажіть місто для доставки Новою Поштою.', false);
+  addOrderWizardMsg('Оформіть прямо зараз без колцентру — це займає приблизно 30 секунд.');
+  addOrderWizardMsg('Підкажіть місто для доставки Новою Поштою.');
 }
 
 function orderWizardQuestion() {
@@ -901,31 +916,31 @@ function orderWizardSubmitText(text) {
   const value = text.trim();
   if (!value) return;
 
-  addChatMsg(value, true);
-  supportInput.value = '';
+  addOrderWizardMsg(value, true);
+  orderWizardInput.value = '';
 
   if (orderWizard.step === 'city') {
     orderWizard.data.city = value;
     orderWizard.step = 'branch';
-    supportInput.placeholder = 'Наприклад: відділення 12 або поштомат...';
-    addChatMsg(orderWizardQuestion(), false);
+    orderWizardInput.placeholder = 'Наприклад: відділення 12 або поштомат...';
+    addOrderWizardMsg(orderWizardQuestion());
     return;
   }
 
   if (orderWizard.step === 'branch') {
     orderWizard.data.branch = value;
     orderWizard.step = 'recipient';
-    supportInput.placeholder = "Ім'я та прізвище отримувача";
-    addChatMsg(orderWizardQuestion(), false);
+    orderWizardInput.placeholder = "Ім'я та прізвище отримувача";
+    addOrderWizardMsg(orderWizardQuestion());
     return;
   }
 
   if (orderWizard.step === 'recipient') {
     orderWizard.data.recipientName = value;
     orderWizard.step = 'confirm';
-    supportInput.placeholder = 'Перевірте дані та підтвердіть';
-    supportInput.disabled = true;
-    supportSend.disabled = true;
+    orderWizardInput.placeholder = 'Перевірте дані та підтвердіть';
+    orderWizardInput.disabled = true;
+    orderWizardSend.disabled = true;
     addOrderConfirmBox();
   }
 }
@@ -947,8 +962,8 @@ function addOrderConfirmBox() {
     <button type="button" class="order-confirm-btn">Підтвердити</button>
   `;
   box.querySelector('.order-confirm-btn').addEventListener('click', () => submitOrderWizard(false));
-  supportMsgs.appendChild(box);
-  supportMsgs.scrollTop = supportMsgs.scrollHeight;
+  orderWizardMessages.appendChild(box);
+  orderWizardMessages.scrollTop = orderWizardMessages.scrollHeight;
 }
 
 async function submitOrderWizard(skipDetails) {
@@ -970,20 +985,19 @@ async function submitOrderWizard(skipDetails) {
     payload.recipientName = d.recipientName;
   }
 
-  supportInput.disabled = true;
-  supportSend.disabled = true;
+  orderWizardInput.disabled = true;
+  orderWizardSend.disabled = true;
   orderWizardSkip.disabled = true;
-  showTyping();
+  addOrderWizardMsg('Надсилаємо замовлення...', false, true);
 
   const result = await postJSON('/api/order', payload);
-  hideTyping();
   orderWizard.sending = false;
 
   if (!result || !result.success) {
-    supportInput.disabled = false;
-    supportSend.disabled = false;
+    orderWizardInput.disabled = false;
+    orderWizardSend.disabled = false;
     orderWizardSkip.disabled = false;
-    addSystemMsg(result?.timeout ? 'Сервер не відповідає. Спробуйте ще раз.' : 'Не вдалося надіслати замовлення. Спробуйте ще раз.');
+    addOrderWizardMsg(result?.timeout ? 'Сервер не відповідає. Спробуйте ще раз.' : 'Не вдалося надіслати замовлення. Спробуйте ще раз.', false, true);
     return;
   }
 
@@ -992,17 +1006,15 @@ async function submitOrderWizard(skipDetails) {
   Analytics.track('order_success', { size: d.size, flow: payload.orderFlow });
 
   orderWizard.active = false;
-  orderWizardSkip.classList.remove('support-skip--visible');
   orderWizardSkip.disabled = false;
-  supportInput.disabled = false;
-  supportSend.disabled = false;
-  supportInput.placeholder = 'Напишіть повідомлення...';
-  supportStatus.textContent = '● Онлайн';
+  orderWizardInput.disabled = false;
+  orderWizardSend.disabled = false;
 
   resetOrderForm(orderWizard.form);
-  addSystemMsg(skipDetails
+  addOrderWizardMsg(skipDetails
     ? 'Заявку передано менеджеру. Вам зателефонують для підтвердження.'
-    : 'Замовлення підтверджено. Дані вже передані менеджеру.');
+    : 'Замовлення підтверджено. Дані вже передані менеджеру.', false, true);
+  closeOrderWizardModal();
   showSuccessOverlay(d.name, d.size, {
     phone: d.phone,
     city: skipDetails ? '' : d.city,
@@ -1013,8 +1025,16 @@ async function submitOrderWizard(skipDetails) {
 
 orderWizardSkip.addEventListener('click', () => {
   if (!orderWizard.active || orderWizard.sending) return;
-  addSystemMsg('Оформлення в чаті пропущено. Передаємо заявку менеджеру без автодзвінка.');
+  addOrderWizardMsg('Оформлення пропущено. Передаємо заявку менеджеру без автодзвінка.', false, true);
   submitOrderWizard(true);
+});
+
+orderWizardSend.addEventListener('click', () => orderWizardSubmitText(orderWizardInput.value));
+orderWizardInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); orderWizardSubmitText(orderWizardInput.value); }
+});
+orderWizardClose.addEventListener('click', () => {
+  if (orderWizard.active && !orderWizard.sending) submitOrderWizard(true);
 });
 
 function handleDialogEnd() {
@@ -1039,11 +1059,6 @@ function handleDialogEnd() {
 
 let sendingSupport = false;
 async function sendSupportMsg() {
-  if (orderWizard.active) {
-    orderWizardSubmitText(supportInput.value);
-    return;
-  }
-
   const text = supportInput.value.trim();
   if (!text || sendingSupport) return;
 
