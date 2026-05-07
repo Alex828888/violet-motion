@@ -773,7 +773,7 @@ app.get('/api/support/sessions', authBot, (_req, res) => {
 app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
   const {
     name, phone, size, color, product, price, contactViaTelegram,
-    orderMode, fullName, city, district, postOffice,
+    orderMode, fullName, city, district, postOffice, delivery,
   } = req.body;
   if (!name || !phone || !size) return res.status(400).json({ error: 'Missing fields' });
 
@@ -784,10 +784,11 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
   const cleanProduct = sanitizeStr(product, 100);
   const cleanPrice = sanitizeStr(price, 20);
   const cleanOrderMode = sanitizeStr(orderMode, 20) === 'instant' ? 'instant' : 'manual';
-  const cleanFullName = sanitizeStr(fullName, 140);
-  const cleanCity = sanitizeStr(city, 80);
-  const cleanDistrict = sanitizeStr(district, 80);
-  const cleanPostOffice = sanitizeStr(postOffice, 80);
+  const deliveryData = delivery && typeof delivery === 'object' ? delivery : {};
+  const cleanFullName = sanitizeStr(fullName || deliveryData.fullName || deliveryData.name, 140);
+  const cleanCity = sanitizeStr(city || deliveryData.city, 80);
+  const cleanDistrict = sanitizeStr(district || deliveryData.district || deliveryData.area, 80);
+  const cleanPostOffice = sanitizeStr(postOffice || deliveryData.postOffice || deliveryData.novaPoshta || deliveryData.branch, 80);
   if (!cleanName || !cleanPhone || !cleanSize)
     return res.status(400).json({ error: 'Invalid fields' });
   if (cleanOrderMode === 'instant' && (!cleanFullName || !cleanCity || !cleanPostOffice))
@@ -821,7 +822,7 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
     (o.price ? `💵 Ціна: <b>${o.price} грн</b>\n` : '') +
     (o.contactViaTelegram ? `💬 Зв'язок: <b>Telegram</b>\n` : `📞 Зв'язок: <b>Дзвінок</b>\n`) +
     (isInstant
-      ? `🤖 ZVONOK: <b>запускаємо автоматичне підтвердження</b>\n`
+      ? `✅ Тип: <b>оформлено одразу</b>\n🤖 ZVONOK: <b>запускаємо автоматичне підтвердження</b>\n`
       : `👩‍💼 Обробка: <b>передзвонить менеджер, без ZVONOK</b>\n`) +
     `📅 ${ts}\n━━━━━━━━━━━━━━━━━━`,
     { reply_markup: { inline_keyboard: [[

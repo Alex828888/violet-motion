@@ -499,10 +499,18 @@ async function sendPendingOrder(mode, extra = {}) {
   if (instantOrderBtn) instantOrderBtn.disabled = true;
   if (mode === 'manual' && successCloseBtn) successCloseBtn.textContent = 'Надсилаємо...';
 
+  const fullName = String(extra.fullName || '').trim();
+  const city = String(extra.city || '').trim();
+  const district = String(extra.district || '').trim();
+  const postOffice = String(extra.postOffice || '').trim();
   const payload = {
     ...pendingOrder,
-    ...extra,
     orderMode: mode,
+    fullName,
+    city,
+    district,
+    postOffice,
+    delivery: { fullName, city, district, postOffice },
     product: 'Violet Motion Sneakers',
     price: '895',
   };
@@ -529,7 +537,7 @@ async function sendPendingOrder(mode, extra = {}) {
   Analytics.track('order_success', { size: pendingOrder.size, mode });
   resetOrderForm();
   pendingOrder = null;
-  return true;
+  return { success: true, id: result.id, payload };
 }
 
 successCloseBtn.addEventListener('click', async () => {
@@ -629,15 +637,25 @@ async function finishQuickOrder() {
     addQuickMsg('Не вдалося надіслати. Перевірте інтернет і натисніть OK ще раз.');
     return;
   }
+  closeQuickOrderChat();
   if (orderSuccessSub) {
-    orderSuccessSub.innerHTML = 'Повне замовлення надіслано.<br />ZVONOK зателефонує для підтвердження.';
+    orderSuccessSub.innerHTML = 'Замовлення прийнято.<br />ZVONOK зателефонує для підтвердження.';
+  }
+  if (successDetails && sent.payload) {
+    successDetails.innerHTML =
+      `👤 <b>${esc(sent.payload.name)}</b><br />` +
+      `📱 <b>${esc(sent.payload.phone)}</b><br />` +
+      `👟 Розмір: <b>${esc(sent.payload.size)}</b><br />` +
+      `🧾 <b>${esc(sent.payload.fullName)}</b><br />` +
+      `🏙 Місто: <b>${esc(sent.payload.city)}</b><br />` +
+      (sent.payload.district ? `📍 Район: <b>${esc(sent.payload.district)}</b><br />` : '') +
+      `📦 Нова Пошта: <b>${esc(sent.payload.postOffice)}</b>`;
   }
   if (instantOrderBtn) instantOrderBtn.style.display = 'none';
   if (successCloseBtn) {
     successCloseBtn.disabled = false;
     successCloseBtn.textContent = 'ЗАКРИТИ';
   }
-  addQuickMsg('Готово. Можете закрити це вікно.');
 }
 
 instantOrderBtn.addEventListener('click', openQuickOrderChat);

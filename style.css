@@ -393,7 +393,7 @@ button, input, textarea, select { font: inherit; }
 .instant-order-btn {
   width: 100%;
   min-height: 54px;
-  margin-bottom: 8px;
+  margin: 10px 0 8px;
   background: linear-gradient(135deg, #5cff9d, #1fcf74);
   box-shadow: 0 12px 28px rgba(31,207,116,0.25);
 }
@@ -404,7 +404,7 @@ button, input, textarea, select { font: inherit; }
   margin: 0 auto 14px;
   max-width: 340px;
 }
-.success-close-btn { width: 100%; }
+.success-close-btn { width: 100%; background: linear-gradient(135deg, #d799ff, #b86cff 45%, #7a2aff); }
 
 /* ── Quick order chat ───────────────────────────────────────── */
 .quick-order-overlay {
