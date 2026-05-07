@@ -94,6 +94,7 @@
         Стиль, легкість<br />і комфорт<br />
         <span>в одній парі</span>
       </h1>
+      <div class="hero-trust-line">Офіційний постачальник</div>
       <p class="hero-text">Ефектні жіночі кросівки у світло-фіолетовому стилі. Ідеально для прогулянок, міста, подорожей і щоденного вайбу без втоми в ногах.</p>
 
       <div class="hero-social-proof">
@@ -116,7 +117,7 @@
           <div class="price-badge-save">-53%</div>
         </div>
         <div class="price-note">
-          ⏱ Акція закінчується через:&nbsp;<span class="hero-timer-inline" id="heroTimerInline">--:--:--</span>&nbsp;·&nbsp;Оплата після примірки
+          ⏱ Акція до <span id="deadlineTimeHero">18:00</span> — сьогодні остання партія&nbsp;·&nbsp;<span class="hero-timer-inline" id="heroTimerInline">--:--:--</span>
         </div>
       </div>
 
@@ -189,8 +190,8 @@
         <div class="feature-grid">
           <article class="feature-card fade-in-up">
             <div class="feature-icon">☁️</div>
-            <h3>М'яка посадка</h3>
-            <p>Амортизуюча підошва знижує навантаження під час ходьби протягом дня.</p>
+            <h3>Вага лише 280 г</h3>
+            <p>На 40% легша за звичайні кросівки — ноги менше втомлюються під час прогулянок і справ на весь день.</p>
           </article>
           <article class="feature-card fade-in-up">
             <div class="feature-icon">💜</div>
@@ -199,8 +200,8 @@
           </article>
           <article class="feature-card fade-in-up">
             <div class="feature-icon">🫧</div>
-            <h3>Дихаючий верх</h3>
-            <p>Сітчасті вставки допомагають нозі почуватися комфортно навіть у теплу погоду.</p>
+            <h3>Дихаюча EVA-сітка</h3>
+            <p>Сітка EVA не дає ногам пітніти навіть при +30°C і допомагає зберігати комфорт у теплу погоду.</p>
           </article>
           <article class="feature-card fade-in-up">
             <div class="feature-icon">✨</div>
@@ -220,7 +221,7 @@
             <h2>М'який <span class="h-soft">вайб</span>. Чистий <span class="h-accent">стиль</span>. Максимум <span class="h-glow">жіночності</span>.</h2>
             <p>Це не просто кросівки "під усе". Це пара, яка одразу робить образ акуратнішим, свіжішим і дорожчим на вигляд.</p>
             <ul class="visual-list">
-              <li>легка підошва</li>
+              <li>вага лише 280 г</li>
               <li>приємні пастельні вставки</li>
               <li>зручні на щодень</li>
               <li>гарно виглядають у русі</li>
@@ -247,8 +248,8 @@
         <div class="specs-card fade-in-up">
           <div class="spec-row"><span>Тип</span><strong>Жіночі кросівки</strong></div>
           <div class="spec-row"><span>Колір</span><strong>Білий / світло-фіолетовий</strong></div>
-          <div class="spec-row"><span>Верх</span><strong>Еко-шкіра + дихаюча сітка</strong></div>
-          <div class="spec-row"><span>Підошва</span><strong>Легка, амортизуюча</strong></div>
+          <div class="spec-row"><span>Верх</span><strong>Еко-шкіра + дихаюча EVA-сітка</strong></div>
+          <div class="spec-row"><span>Підошва</span><strong>280 г, амортизуюча, на 40% легша</strong></div>
           <div class="spec-row"><span>Сезон</span><strong>Весна / літо / тепла осінь</strong></div>
           <div class="spec-row"><span>Розміри</span><strong>36–40</strong></div>
         </div>
@@ -295,7 +296,7 @@
             <div class="old-price">1 899 грн</div>
             <div class="new-price">895 грн</div>
           </div>
-          <div class="timer-label">До кінця пропозиції залишилось:</div>
+          <div class="timer-label">Акція до <span id="deadlineTimeSale">18:00</span> — сьогодні остання партія:</div>
           <div class="timer" id="timer">
             <div class="time-box"><span id="hours">23</span><small>год</small></div>
             <div class="time-box"><span id="minutes">59</span><small>хв</small></div>
@@ -339,11 +340,12 @@
               <div class="size-grid" id="sizeGrid">
                 <button type="button" class="size-btn" data-size="36" data-track="size_select">36</button>
                 <button type="button" class="size-btn" data-size="37" data-track="size_select">37</button>
-                <button type="button" class="size-btn" data-size="38" data-track="size_select">38</button>
+                <button type="button" class="size-btn active" data-size="38" data-track="size_select">38</button>
                 <button type="button" class="size-btn" data-size="39" data-track="size_select">39</button>
                 <button type="button" class="size-btn" data-size="40" data-track="size_select">40</button>
               </div>
-              <input type="hidden" id="selectedSize" name="size" />
+              <input type="hidden" id="selectedSize" name="size" value="38" />
+              <div class="size-error" id="sizeError">Оберіть розмір щоб продовжити</div>
             </div>
 
             <label class="tg-option-label" id="tgOptionLabel">
@@ -486,7 +488,29 @@
       <p class="success-sub">Ваше замовлення успішно оформлено.<br />Передзвонимо в найближчий час.</p>
       <div class="success-details" id="successDetails"></div>
       <div class="success-note">🔒 Оплата після примірки · Без передоплати</div>
+      <button class="main-btn instant-order-btn" id="instantOrderBtn">ОФОРМИТИ ОДРАЗУ</button>
+      <div class="instant-order-note">Без колцентра: уточнимо дані в чаті, а ZVONOK підтвердить замовлення автоматичним дзвінком.</div>
       <button class="main-btn success-close-btn" id="successCloseBtn">ЗАКРИТИ</button>
+    </div>
+  </div>
+
+  <!-- QUICK ORDER CHAT -->
+  <div class="quick-order-overlay" id="quickOrderOverlay">
+    <div class="quick-order-card">
+      <div class="quick-order-header">
+        <div>
+          <div class="quick-order-title">Швидке оформлення</div>
+          <div class="quick-order-status">Дані для Нової Пошти</div>
+        </div>
+        <button class="quick-order-close" id="quickOrderClose" aria-label="Закрити">✕</button>
+      </div>
+      <div class="quick-order-messages" id="quickOrderMessages"></div>
+      <div class="quick-order-error" id="quickOrderError"></div>
+      <div class="quick-order-input-row">
+        <input type="text" id="quickOrderInput" class="quick-order-input" placeholder="Напишіть відповідь..." />
+        <button type="button" class="quick-order-skip" id="quickOrderSkip">Пропустити</button>
+        <button type="button" class="quick-order-send" id="quickOrderSend">OK</button>
+      </div>
     </div>
   </div>
 

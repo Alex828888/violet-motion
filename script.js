@@ -197,15 +197,20 @@ document.querySelectorAll('.thumb').forEach(t => {
 /* ── Sizes ──────────────────────────────────────────────────── */
 const sizeBtns          = document.querySelectorAll('.size-btn');
 const selectedSizeInput = document.getElementById('selectedSize');
+const sizeError         = document.getElementById('sizeError');
+
+function setSelectedSize(size, track = false) {
+  sizeBtns.forEach(x => x.classList.toggle('active', x.dataset.size === String(size)));
+  selectedSizeInput.value = String(size || '');
+  if (sizeError) sizeError.classList.remove('visible');
+  if (track && size) Analytics.track('size_select', { size: String(size) });
+}
 
 sizeBtns.forEach(b => {
-  b.addEventListener('click', () => {
-    sizeBtns.forEach(x => x.classList.remove('active'));
-    b.classList.add('active');
-    selectedSizeInput.value = b.dataset.size;
-    Analytics.track('size_select', { size: b.dataset.size });
-  });
+  b.addEventListener('click', () => setSelectedSize(b.dataset.size, true));
 });
+
+setSelectedSize(selectedSizeInput.value || '38');
 
 /* ══════════════════════════════════════════════════════════════
    COUNTDOWN TIMER — syncs hero inline + main timer
@@ -213,8 +218,9 @@ sizeBtns.forEach(b => {
 (function () {
   const KEY = 'vm_timer_end';
   let end = Number(localStorage.getItem(KEY));
-  if (!end || end < Date.now()) {
-    end = Date.now() + 24 * 3600 * 1000;
+  if (!end || end < Date.now() || end - Date.now() > 3 * 3600 * 1000) {
+    const base = Date.now() + (2.25 + Math.random() * 0.5) * 3600 * 1000;
+    end = Math.ceil(base / (15 * 60 * 1000)) * 15 * 60 * 1000;
     localStorage.setItem(KEY, end);
   }
 
@@ -222,6 +228,14 @@ sizeBtns.forEach(b => {
   const m  = document.getElementById('minutes');
   const s  = document.getElementById('seconds');
   const hi = document.getElementById('heroTimerInline');
+  const deadlineHero = document.getElementById('deadlineTimeHero');
+  const deadlineSale = document.getElementById('deadlineTimeSale');
+  const deadlineText = new Date(end).toLocaleTimeString('uk-UA', {
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+  if (deadlineHero) deadlineHero.textContent = deadlineText;
+  if (deadlineSale) deadlineSale.textContent = deadlineText;
 
   function tick() {
     const diff = Math.max(0, Math.floor((end - Date.now()) / 1000));
@@ -432,13 +446,29 @@ if (phoneInput) {
 /* ══════════════════════════════════════════════════════════════
    ORDER SUCCESS OVERLAY
 ══════════════════════════════════════════════════════════════ */
-const orderOverlay    = document.getElementById('orderOverlay');
-const successDetails  = document.getElementById('successDetails');
-const successCloseBtn = document.getElementById('successCloseBtn');
+const orderOverlay       = document.getElementById('orderOverlay');
+const successDetails     = document.getElementById('successDetails');
+const successCloseBtn    = document.getElementById('successCloseBtn');
+const instantOrderBtn    = document.getElementById('instantOrderBtn');
+const orderSuccessSub    = document.querySelector('.success-sub');
+let pendingOrder         = null;
+let successOrderSent     = false;
+let successOrderSending  = false;
 
-function showSuccessOverlay(name, size) {
+function showSuccessOverlay(order) {
   successDetails.innerHTML =
-    `👤 <b>${esc(name)}</b><br />👟 Розмір: <b>${esc(size)}</b><br />🚚 Доставка: Нова Пошта`;
+    `👤 <b>${esc(order.name)}</b><br />📱 <b>${esc(order.phone)}</b><br />👟 Розмір: <b>${esc(order.size)}</b><br />🚚 Доставка: Нова Пошта`;
+  if (orderSuccessSub) {
+    orderSuccessSub.innerHTML = 'Заявку підготували.<br />Натисніть “Закрити” — і ми передамо її менеджеру.';
+  }
+  if (successCloseBtn) {
+    successCloseBtn.disabled = false;
+    successCloseBtn.textContent = 'ЗАКРИТИ';
+  }
+  if (instantOrderBtn) {
+    instantOrderBtn.disabled = false;
+    instantOrderBtn.style.display = '';
+  }
   orderOverlay.classList.add('visible');
 
   ['.success-ring', '.check-path'].forEach(sel => {
@@ -448,17 +478,177 @@ function showSuccessOverlay(name, size) {
     void el.offsetWidth;
     el.style.animation = '';
   });
-
-  setTimeout(closeSuccessOverlay, 8000);
 }
 
 function closeSuccessOverlay() {
   orderOverlay.classList.remove('visible');
 }
 
-successCloseBtn.addEventListener('click', closeSuccessOverlay);
-orderOverlay.addEventListener('click', e => {
-  if (e.target === orderOverlay) closeSuccessOverlay();
+function resetOrderForm() {
+  const form = document.getElementById('orderForm');
+  if (!form) return;
+  form.reset();
+  setSelectedSize('38');
+  document.getElementById('contactViaTelegram').checked = false;
+}
+
+async function sendPendingOrder(mode, extra = {}) {
+  if (!pendingOrder || successOrderSending || successOrderSent) return false;
+  successOrderSending = true;
+  if (successCloseBtn) successCloseBtn.disabled = true;
+  if (instantOrderBtn) instantOrderBtn.disabled = true;
+  if (mode === 'manual' && successCloseBtn) successCloseBtn.textContent = 'Надсилаємо...';
+
+  const payload = {
+    ...pendingOrder,
+    ...extra,
+    orderMode: mode,
+    product: 'Violet Motion Sneakers',
+    price: '895',
+  };
+  const result = await postJSON('/api/order', payload);
+
+  successOrderSending = false;
+  if (!result || !result.success) {
+    if (orderSuccessSub) {
+      orderSuccessSub.innerHTML = result?.timeout
+        ? 'Сервер не відповідає. Спробуйте ще раз.'
+        : 'Не вдалося надіслати замовлення. Спробуйте ще раз.';
+    }
+    if (successCloseBtn) {
+      successCloseBtn.disabled = false;
+      successCloseBtn.textContent = 'СПРОБУВАТИ ЩЕ РАЗ';
+    }
+    if (instantOrderBtn) instantOrderBtn.disabled = false;
+    return false;
+  }
+
+  successOrderSent = true;
+  fbTrack('Lead', { content_name: 'Violet Motion Order', value: 895, currency: 'UAH' });
+  ttTrack('Purchase', { content_type: 'product', content_ids: ['violet-motion-001'], content_name: 'Violet Motion Sneakers', value: 895, currency: 'UAH', quantity: 1 });
+  Analytics.track('order_success', { size: pendingOrder.size, mode });
+  resetOrderForm();
+  pendingOrder = null;
+  return true;
+}
+
+successCloseBtn.addEventListener('click', async () => {
+  if (successOrderSent || !pendingOrder) return closeSuccessOverlay();
+  const sent = await sendPendingOrder('manual');
+  if (sent) closeSuccessOverlay();
+});
+
+/* ══════════════════════════════════════════════════════════════
+   QUICK ORDER CHAT
+══════════════════════════════════════════════════════════════ */
+const quickOrderOverlay  = document.getElementById('quickOrderOverlay');
+const quickOrderMessages = document.getElementById('quickOrderMessages');
+const quickOrderInput    = document.getElementById('quickOrderInput');
+const quickOrderSend     = document.getElementById('quickOrderSend');
+const quickOrderSkip     = document.getElementById('quickOrderSkip');
+const quickOrderClose    = document.getElementById('quickOrderClose');
+const quickOrderError    = document.getElementById('quickOrderError');
+const quickOrderSteps = [
+  { key: 'fullName', prompt: "Напишіть, будь ласка, ім'я та прізвище", required: true },
+  { key: 'city', prompt: 'Ваше місто?', required: true },
+  { key: 'district', prompt: 'Район (можна пропустити)', required: false },
+  { key: 'postOffice', prompt: 'Номер відділення Нової Пошти?', required: true },
+];
+let quickOrderStep = 0;
+let quickOrderData = {};
+let quickOrderDone = false;
+
+function addQuickMsg(text, type = 'bot') {
+  const msg = document.createElement('div');
+  msg.className = `quick-msg quick-msg--${type}`;
+  msg.textContent = text;
+  quickOrderMessages.appendChild(msg);
+  quickOrderMessages.scrollTop = quickOrderMessages.scrollHeight;
+}
+
+function showQuickError(text = '') {
+  quickOrderError.textContent = text;
+  quickOrderError.classList.toggle('visible', !!text);
+}
+
+function askQuickStep() {
+  const step = quickOrderSteps[quickOrderStep];
+  if (!step) return finishQuickOrder();
+  addQuickMsg(step.prompt);
+  quickOrderInput.value = '';
+  quickOrderInput.disabled = false;
+  quickOrderSend.disabled = false;
+  quickOrderSkip.disabled = false;
+  quickOrderSkip.classList.toggle('visible', !step.required);
+  quickOrderInput.focus();
+}
+
+function openQuickOrderChat() {
+  if (!pendingOrder || successOrderSent) return;
+  quickOrderStep = 0;
+  quickOrderData = {};
+  quickOrderDone = false;
+  quickOrderMessages.innerHTML = '';
+  showQuickError('');
+  quickOrderOverlay.classList.add('visible');
+  addQuickMsg('Супер, оформимо одразу без колцентра. Поставлю кілька питань для відправки.');
+  setTimeout(askQuickStep, 350);
+}
+
+function closeQuickOrderChat() {
+  quickOrderOverlay.classList.remove('visible');
+}
+
+async function submitQuickAnswer(skip = false) {
+  if (quickOrderDone) return;
+  const step = quickOrderSteps[quickOrderStep];
+  if (!step) return finishQuickOrder();
+  const value = skip ? '' : quickOrderInput.value.trim();
+  if (step.required && !value) {
+    return showQuickError('Це поле потрібно заповнити, щоб оформити замовлення.');
+  }
+  showQuickError('');
+  quickOrderData[step.key] = value;
+  addQuickMsg(value || 'Пропустити', 'user');
+  quickOrderStep++;
+  setTimeout(askQuickStep, 250);
+}
+
+async function finishQuickOrder() {
+  quickOrderDone = true;
+  quickOrderInput.disabled = true;
+  quickOrderSend.disabled = true;
+  quickOrderSkip.disabled = true;
+  quickOrderSkip.classList.remove('visible');
+  addQuickMsg('Дякуємо. Передаємо повне замовлення і запускаємо автоматичне підтвердження ZVONOK.');
+  const sent = await sendPendingOrder('instant', quickOrderData);
+  if (!sent) {
+    quickOrderDone = false;
+    quickOrderInput.disabled = false;
+    quickOrderSend.disabled = false;
+    addQuickMsg('Не вдалося надіслати. Перевірте інтернет і натисніть OK ще раз.');
+    return;
+  }
+  if (orderSuccessSub) {
+    orderSuccessSub.innerHTML = 'Повне замовлення надіслано.<br />ZVONOK зателефонує для підтвердження.';
+  }
+  if (instantOrderBtn) instantOrderBtn.style.display = 'none';
+  if (successCloseBtn) {
+    successCloseBtn.disabled = false;
+    successCloseBtn.textContent = 'ЗАКРИТИ';
+  }
+  addQuickMsg('Готово. Можете закрити це вікно.');
+}
+
+instantOrderBtn.addEventListener('click', openQuickOrderChat);
+quickOrderSend.addEventListener('click', () => submitQuickAnswer(false));
+quickOrderSkip.addEventListener('click', () => submitQuickAnswer(true));
+quickOrderClose.addEventListener('click', closeQuickOrderChat);
+quickOrderInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    submitQuickAnswer(false);
+  }
 });
 
 /* ══════════════════════════════════════════════════════════════
@@ -480,12 +670,15 @@ document.getElementById('orderForm').addEventListener('submit', async e => {
   if (!name)  return showMsg(msgEl, "Вкажіть, будь ласка, Ваше ім'я.", 'error');
   if (!phone) return showMsg(msgEl, 'Вкажіть, будь ласка, номер телефону.', 'error');
   if (phone.replace(/\D/g, '').length < 10) return showMsg(msgEl, 'Номер телефону виглядає неповним.', 'error');
-  if (!size)  return showMsg(msgEl, 'Оберіть розмір взуття.', 'error');
+  if (!size)  {
+    if (sizeError) sizeError.classList.add('visible');
+    return showMsg(msgEl, 'Оберіть розмір щоб продовжити', 'error');
+  }
 
   orderSubmitting = true;
   const originalText = btn.textContent;
   btn.disabled = true;
-  btn.textContent = 'Надсилаємо...';
+  btn.textContent = 'Готуємо заявку...';
   showMsg(msgEl, '', '');
 
   await ttIdentifyPhone(phone);
@@ -493,25 +686,14 @@ document.getElementById('orderForm').addEventListener('submit', async e => {
   ttTrack('InitiateCheckout', { content_type: 'product', content_ids: ['violet-motion-001'], content_name: 'Violet Motion Sneakers', value: 895, currency: 'UAH', quantity: 1 });
   Analytics.track('form_submit', { size, viaTelegram: viaTg });
 
-  const result = await postJSON('/api/order', { name, phone, size, contactViaTelegram: viaTg });
-
   orderSubmitting = false;
   btn.disabled = false;
   btn.textContent = originalText;
 
-  if (!result || !result.success) {
-    return showMsg(msgEl, result?.timeout ? 'Сервер не відповідає. Спробуйте ще раз.' : 'Не вдалося надіслати замовлення. Спробуйте ще раз.', 'error');
-  }
-
-  fbTrack('Lead', { content_name: 'Violet Motion Order', value: 895, currency: 'UAH' });
-  ttTrack('Purchase', { content_type: 'product', content_ids: ['violet-motion-001'], content_name: 'Violet Motion Sneakers', value: 895, currency: 'UAH', quantity: 1 });
-  Analytics.track('order_success', { size });
-
-  e.target.reset();
-  selectedSizeInput.value = '';
-  sizeBtns.forEach(b => b.classList.remove('active'));
-  document.getElementById('contactViaTelegram').checked = false;
-  showSuccessOverlay(name, size);
+  pendingOrder = { name, phone, size, contactViaTelegram: viaTg };
+  successOrderSent = false;
+  successOrderSending = false;
+  showSuccessOverlay(pendingOrder);
 });
 
 /* ══════════════════════════════════════════════════════════════

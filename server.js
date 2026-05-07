@@ -517,6 +517,10 @@ function formatOrderForZvonokMessage(order) {
     `Имя: ${escapeHtml(order?.name || '-')}\n` +
     `Телефон: ${escapeHtml(order?.phone || '-')}\n` +
     `Размер: ${escapeHtml(order?.size || '-')}\n` +
+    (order?.fullName ? `ФИО: ${escapeHtml(order.fullName)}\n` : '') +
+    (order?.city ? `Город: ${escapeHtml(order.city)}\n` : '') +
+    (order?.district ? `Район: ${escapeHtml(order.district)}\n` : '') +
+    (order?.postOffice ? `Новая Почта: ${escapeHtml(order.postOffice)}\n` : '') +
     `Order ID: ${escapeHtml(order?.id || '-')}`
   );
 }
@@ -767,7 +771,10 @@ app.get('/api/support/sessions', authBot, (_req, res) => {
    ORDERS (public)
 ═══════════════════════════════════════════════════════════ */
 app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
-  const { name, phone, size, color, product, price, contactViaTelegram } = req.body;
+  const {
+    name, phone, size, color, product, price, contactViaTelegram,
+    orderMode, fullName, city, district, postOffice,
+  } = req.body;
   if (!name || !phone || !size) return res.status(400).json({ error: 'Missing fields' });
 
   const cleanName  = sanitizeStr(name, 100);
@@ -776,34 +783,56 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
   const cleanColor = sanitizeStr(color, 40);
   const cleanProduct = sanitizeStr(product, 100);
   const cleanPrice = sanitizeStr(price, 20);
+  const cleanOrderMode = sanitizeStr(orderMode, 20) === 'instant' ? 'instant' : 'manual';
+  const cleanFullName = sanitizeStr(fullName, 140);
+  const cleanCity = sanitizeStr(city, 80);
+  const cleanDistrict = sanitizeStr(district, 80);
+  const cleanPostOffice = sanitizeStr(postOffice, 80);
   if (!cleanName || !cleanPhone || !cleanSize)
     return res.status(400).json({ error: 'Invalid fields' });
+  if (cleanOrderMode === 'instant' && (!cleanFullName || !cleanCity || !cleanPostOffice))
+    return res.status(400).json({ error: 'Missing delivery fields' });
 
   const orders = read(F.orders);
   const o = {
     id: nextId(orders), name: cleanName, phone: cleanPhone, size: cleanSize,
     color: cleanColor || null, product: cleanProduct || null, price: cleanPrice || null,
+    orderMode: cleanOrderMode,
+    fullName: cleanFullName || null,
+    city: cleanCity || null,
+    district: cleanDistrict || null,
+    postOffice: cleanPostOffice || null,
     contactViaTelegram: !!contactViaTelegram, status: 'new', createdAt: new Date().toISOString(),
   };
   orders.push(o); write(F.orders, orders);
 
   const ts = new Date(o.createdAt).toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' });
+  const isInstant = o.orderMode === 'instant';
   await tg(
-    `🛒 <b>НОВЕ ЗАМОВЛЕННЯ #${o.id}</b>\n━━━━━━━━━━━━━━━━━━\n` +
+    `🛒 <b>${isInstant ? 'ПОВНЕ ЗАМОВЛЕННЯ' : 'НОВА ЗАЯВКА'} #${o.id}</b>\n━━━━━━━━━━━━━━━━━━\n` +
     (o.product ? `🛍 Товар: <b>${o.product}</b>\n` : '') +
     `👤 Ім'я: <b>${o.name}</b>\n📱 Телефон: <b>${o.phone}</b>\n` +
     `👟 Розмір: <b>${o.size}</b>\n` +
+    (o.fullName ? `🧾 Ім'я та прізвище: <b>${o.fullName}</b>\n` : '') +
+    (o.city ? `🏙 Місто: <b>${o.city}</b>\n` : '') +
+    (o.district ? `📍 Район: <b>${o.district}</b>\n` : '') +
+    (o.postOffice ? `📦 Відділення Нової Пошти: <b>${o.postOffice}</b>\n` : '') +
     (o.color ? `🎨 Колір: <b>${o.color}</b>\n` : '') +
     (o.price ? `💵 Ціна: <b>${o.price} грн</b>\n` : '') +
     (o.contactViaTelegram ? `💬 Зв'язок: <b>Telegram</b>\n` : `📞 Зв'язок: <b>Дзвінок</b>\n`) +
+    (isInstant
+      ? `🤖 ZVONOK: <b>запускаємо автоматичне підтвердження</b>\n`
+      : `👩‍💼 Обробка: <b>передзвонить менеджер, без ZVONOK</b>\n`) +
     `📅 ${ts}\n━━━━━━━━━━━━━━━━━━`,
     { reply_markup: { inline_keyboard: [[
       { text: '✅ Підтвердити', callback_data: `confirm_${o.id}` },
       { text: '❌ Скасувати',  callback_data: `cancel_${o.id}` },
     ]] } }
   );
-  try { await startZvonokCall(o, req); }
-  catch (e) { console.error(`[Zvonok] unexpected order #${o.id} error:`, e.message); }
+  if (isInstant) {
+    try { await startZvonokCall(o, req); }
+    catch (e) { console.error(`[Zvonok] unexpected order #${o.id} error:`, e.message); }
+  }
 
   res.json({ success: true, id: o.id });
 });
