@@ -97,6 +97,27 @@ function pct(num, total) {
   if (!total) return '0%';
   return Math.round((num / total) * 100) + '%';
 }
+function esc(val) {
+  return String(val ?? '').replace(/[&<>"']/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[ch]));
+}
+function hasDeliveryInfo(o) {
+  return !!(o?.fullName || o?.city || o?.district || o?.postOffice);
+}
+function orderModeLabel(o) {
+  return o?.orderMode === 'instant' ? '⚡ Оформлено одразу' : '👩‍💼 Менеджер передзвонить';
+}
+function deliveryBlock(o) {
+  if (!hasDeliveryInfo(o)) return '';
+  return (
+    `\n<b>Дані доставки:</b>\n` +
+    (o.fullName ? `🧾 Ім'я та прізвище: <b>${esc(o.fullName)}</b>\n` : '') +
+    (o.city ? `🏙 Місто: <b>${esc(o.city)}</b>\n` : '') +
+    (o.district ? `📍 Район: <b>${esc(o.district)}</b>\n` : '') +
+    (o.postOffice ? `📦 Відділення НП: <b>${esc(o.postOffice)}</b>\n` : '')
+  );
+}
 
 /**
  * Unicode bar chart
@@ -155,11 +176,15 @@ async function showOrders(chatId, page = 1, filter = null, msgId = null) {
     : `📦 <b>Замовлення</b> (${orders.length}):\n\n`;
 
   items.forEach(o => {
-    text += `${statusEmoji(o.status)} <b>#${o.id}</b> ${o.name}\n`;
-    if (o.product) text += `   🛍 ${o.product}\n`;
-    text += `   📱 ${o.phone}  👟 р.${o.size}`;
-    if (o.color) text += `  🎨 ${o.color}`;
+    text += `${statusEmoji(o.status)} <b>#${o.id}</b> ${esc(o.name)}${o.orderMode === 'instant' ? ' ⚡' : ''}\n`;
+    if (o.product) text += `   🛍 ${esc(o.product)}\n`;
+    text += `   📱 ${esc(o.phone)}  👟 р.${esc(o.size)}`;
+    if (o.color) text += `  🎨 ${esc(o.color)}`;
     if (o.contactViaTelegram) text += '  💬 TG';
+    if (hasDeliveryInfo(o)) {
+      const cityLine = [o.city, o.postOffice ? `НП ${o.postOffice}` : ''].filter(Boolean).join(' · ');
+      text += `\n   📦 ${esc(cityLine || 'дані доставки заповнені')}`;
+    }
     text += `\n   ${fmtDate(o.createdAt)}\n\n`;
   });
   reply(chatId, text, ordersKeyboard(items, p, total, filter), msgId);
@@ -170,13 +195,15 @@ async function showOrderDetail(chatId, id, msgId = null) {
   if (!o || o.error) return bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB });
   const text =
     `📋 <b>Замовлення #${o.id}</b>\n━━━━━━━━━━━━━━━\n` +
-    (o.product ? `🛍 Товар: <b>${o.product}</b>\n` : '') +
-    `👤 <b>${o.name}</b>\n📱 ${o.phone}\n` +
-    `👟 Розмір: ${o.size}\n` +
-    (o.color ? `🎨 Колір: ${o.color}\n` : '') +
-    (o.price ? `💵 Ціна: ${o.price} грн\n` : '') +
+    (o.product ? `🛍 Товар: <b>${esc(o.product)}</b>\n` : '') +
+    `👤 <b>${esc(o.name)}</b>\n📱 ${esc(o.phone)}\n` +
+    `👟 Розмір: ${esc(o.size)}\n` +
+    (o.color ? `🎨 Колір: ${esc(o.color)}\n` : '') +
+    (o.price ? `💵 Ціна: ${esc(o.price)} грн\n` : '') +
     (o.contactViaTelegram ? `💬 Зв'язок: Telegram\n` : `📞 Зв'язок: Дзвінок\n`) +
-    `🏷 Статус: ${statusEmoji(o.status)} ${o.status}\n📅 ${fmtDate(o.createdAt)}\n━━━━━━━━━━━━━━━`;
+    `🚦 Тип: ${orderModeLabel(o)}\n` +
+    deliveryBlock(o) +
+    `🏷 Статус: ${statusEmoji(o.status)} ${esc(o.status)}\n📅 ${fmtDate(o.createdAt)}\n━━━━━━━━━━━━━━━`;
   reply(chatId, text, { inline_keyboard: [
     [{ text: '✅ Підтвердити', callback_data: `confirm_${o.id}` }, { text: '❌ Скасувати', callback_data: `cancel_${o.id}` }],
     [{ text: '🗑 Видалити', callback_data: `del_order_${o.id}` }],
