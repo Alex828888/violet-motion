@@ -2,7 +2,7 @@
  * VIOLET MOTION — SERVER v2
  * node server.js
  *
- * .env: PORT, TG_TOKEN, TG_CHAT_ID, API_KEY, GEMINI_API_KEY, GEMINI_MODEL,
+ * .env: PORT, TG_TOKEN, TG_CHAT_ID, API_KEY, DATA_DIR, GEMINI_API_KEY, GEMINI_MODEL,
  *       SUPPORT_AI_ENABLED, ZVONOK_API_KEY, ZVONOK_CAMPAIGN_ID, ZVONOK_WEBHOOK_SECRET
  *
  * New in v2:
@@ -33,7 +33,8 @@ const ZVONOK_CALL_URL = 'https://zvonok.com/manager/cabapi_external/api/v1/phone
 
 /* ── Data files ────────────────────────────────────────────── */
 const ROOT = __dirname;
-const DATA = path.join(ROOT, 'data');
+const DEFAULT_DATA = path.join(ROOT, 'data');
+const DATA = path.resolve(process.env.DATA_DIR || DEFAULT_DATA);
 const F = {
   orders:    path.join(DATA, 'orders.json'),
   reviews:   path.join(DATA, 'reviews.json'),
@@ -42,16 +43,25 @@ const F = {
 };
 
 if (!fs.existsSync(DATA)) fs.mkdirSync(DATA, { recursive: true });
-for (const file of Object.values(F)) {
-  if (!fs.existsSync(file)) fs.writeFileSync(file, '[]', 'utf8');
+for (const [name, file] of Object.entries(F)) {
+  if (fs.existsSync(file)) continue;
+  const bundledFile = path.join(DEFAULT_DATA, `${name}.json`);
+  if (DATA !== DEFAULT_DATA && fs.existsSync(bundledFile)) {
+    fs.copyFileSync(bundledFile, file);
+  } else {
+    fs.writeFileSync(file, '[]', 'utf8');
+  }
 }
+console.log(`💾 Data directory: ${DATA}`);
 
 function read(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch { return []; }
 }
 function write(file, data) {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
+  fs.renameSync(tmp, file);
 }
 function nextId(arr) {
   return arr.length ? Math.max(...arr.map(x => x.id || 0)) + 1 : 1;
@@ -688,6 +698,37 @@ app.patch('/api/admin/support/:id', authBot, (req, res) => {
   if (idx < 0) return res.status(404).json({ error: 'Not found' });
   arr[idx] = { ...arr[idx], ...req.body, id: arr[idx].id, updatedAt: new Date().toISOString() };
   write(F.support, arr); res.json(arr[idx]);
+});
+app.get('/api/admin/backup', authBot, (_req, res) => {
+  res.json({
+    exportedAt: new Date().toISOString(),
+    dataDir: DATA,
+    orders: read(F.orders),
+    reviews: read(F.reviews),
+    support: read(F.support),
+    analytics: read(F.analytics),
+  });
+});
+app.post('/api/admin/backup/restore', authBot, (req, res) => {
+  const { orders, reviews, support, analytics } = req.body || {};
+  const restored = {};
+  if (Array.isArray(orders)) {
+    write(F.orders, orders);
+    restored.orders = orders.length;
+  }
+  if (Array.isArray(reviews)) {
+    write(F.reviews, reviews);
+    restored.reviews = reviews.length;
+  }
+  if (Array.isArray(support)) {
+    write(F.support, support);
+    restored.support = support.length;
+  }
+  if (Array.isArray(analytics)) {
+    write(F.analytics, analytics);
+    restored.analytics = analytics.length;
+  }
+  res.json({ success: true, restored });
 });
 
 /* ── SSE endpoint ──────────────────────────────────────────── */
