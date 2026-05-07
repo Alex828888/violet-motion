@@ -16,9 +16,16 @@ const TelegramBot = require('node-telegram-bot-api');
 
 const TOKEN = process.env.BOT_TOKEN || process.env.TG_TOKEN || '';
 
-const ADMIN_IDS = (process.env.ADMIN_IDS || '')
-  .split(',').map(s => Number(s.trim())).filter(Boolean);
+function parseIds(value) {
+  return String(value || '')
+    .split(/[,\s;]+/)
+    .map(s => Number(String(s).trim()))
+    .filter(Number.isFinite);
+}
+
+const ADMIN_IDS = parseIds(process.env.ADMIN_IDS);
 const EXTRA_ADMIN_IDS = [7996143460];
+const ALLOWED_ADMIN_IDS = [...new Set([...ADMIN_IDS, ...EXTRA_ADMIN_IDS])];
 
 const SERVER_URL = (process.env.SERVER_URL || 'http://localhost:3000').replace(/\/+$/, '');
 const API_KEY    = String(process.env.API_KEY || 'violet-secret').trim();
@@ -27,9 +34,14 @@ if (!TOKEN) { console.error('❌ BOT_TOKEN not set'); process.exit(1); }
 
 const bot = new TelegramBot(TOKEN, { polling: true });
 console.log('🤖 Admin bot started…');
+console.log(`🔐 Admin IDs: ${ALLOWED_ADMIN_IDS.length ? ALLOWED_ADMIN_IDS.join(', ') : 'all users (ADMIN_IDS empty)'}`);
 
 /* ── Auth ─────────────────────────────────────────────────── */
-function isAdmin(id) { return ADMIN_IDS.length === 0 || ADMIN_IDS.includes(id) || EXTRA_ADMIN_IDS.includes(id); }
+function isAdmin(id) { return ADMIN_IDS.length === 0 || ALLOWED_ADMIN_IDS.includes(Number(id)); }
+function logDenied(msg, source = 'message') {
+  const user = msg.from || {};
+  console.warn(`[auth] denied ${source}: from=${user.id || '-'} username=${user.username || '-'} chat=${msg.chat?.id || '-'}`);
+}
 
 /* ── State ────────────────────────────────────────────────── */
 const managerDialogs = {};
@@ -495,19 +507,25 @@ async function showAnalyticsReport(chatId, period, view = 'overview', msgId = nu
 /* ═══════════════════════════════════════════════════════════
    COMMANDS
 ═══════════════════════════════════════════════════════════ */
+bot.onText(/\/id/, async msg => {
+  await bot.sendMessage(msg.chat.id,
+    `Ваш Telegram ID: <code>${esc(msg.from.id)}</code>\nChat ID: <code>${esc(msg.chat.id)}</code>\nUsername: ${msg.from.username ? '@' + esc(msg.from.username) : '—'}`,
+    { parse_mode: 'HTML' });
+});
+
 bot.onText(/\/start/, async msg => {
-  if (!isAdmin(msg.from.id)) return;
+  if (!isAdmin(msg.from.id)) { logDenied(msg, '/start'); return; }
   await bot.sendMessage(msg.chat.id,
     `🟣 <b>Violet Motion — Адмін панель</b>\n\nОберіть розділ кнопками нижче:`,
     { parse_mode: 'HTML', reply_markup: MAIN_KB });
 });
 
-bot.onText(/\/analytics/, msg => { if (!isAdmin(msg.from.id)) return; showAnalyticsMenu(msg.chat.id); });
-bot.onText(/\/search (.+)/, (msg, match) => { if (!isAdmin(msg.from.id)) return; showOrders(msg.chat.id, 1, match[1].trim().toLowerCase()); });
-bot.onText(/\/orders/,  msg => { if (!isAdmin(msg.from.id)) return; showOrders(msg.chat.id); });
-bot.onText(/\/reviews/, msg => { if (!isAdmin(msg.from.id)) return; showReviews(msg.chat.id); });
-bot.onText(/\/support/, msg => { if (!isAdmin(msg.from.id)) return; showSupport(msg.chat.id); });
-bot.onText(/\/stats/,   msg => { if (!isAdmin(msg.from.id)) return; showStats(msg.chat.id); });
+bot.onText(/\/analytics/, msg => { if (!isAdmin(msg.from.id)) { logDenied(msg, '/analytics'); return; } showAnalyticsMenu(msg.chat.id); });
+bot.onText(/\/search (.+)/, (msg, match) => { if (!isAdmin(msg.from.id)) { logDenied(msg, '/search'); return; } showOrders(msg.chat.id, 1, match[1].trim().toLowerCase()); });
+bot.onText(/\/orders/,  msg => { if (!isAdmin(msg.from.id)) { logDenied(msg, '/orders'); return; } showOrders(msg.chat.id); });
+bot.onText(/\/reviews/, msg => { if (!isAdmin(msg.from.id)) { logDenied(msg, '/reviews'); return; } showReviews(msg.chat.id); });
+bot.onText(/\/support/, msg => { if (!isAdmin(msg.from.id)) { logDenied(msg, '/support'); return; } showSupport(msg.chat.id); });
+bot.onText(/\/stats/,   msg => { if (!isAdmin(msg.from.id)) { logDenied(msg, '/stats'); return; } showStats(msg.chat.id); });
 
 /* ═══════════════════════════════════════════════════════════
    TEXT MESSAGES
@@ -516,7 +534,7 @@ bot.on('message', async msg => {
   const messageKey = `${msg.chat?.id || 'unknown'}_${msg.message_id}`;
   if (recentlyHandled(seenMessages, messageKey, 30000)) return;
   if (!msg.text || msg.text.startsWith('/')) return;
-  if (!isAdmin(msg.from.id)) return;
+  if (!isAdmin(msg.from.id)) { logDenied(msg); return; }
 
   const chatId = msg.chat.id;
   const text   = msg.text.trim();
@@ -589,7 +607,7 @@ bot.on('callback_query', async q => {
   const data   = q.data;
   const cbKey  = `${chatId}_${msgId}_${data}`;
 
-  if (!isAdmin(q.from.id)) { await ack(q.id, '🚫 Доступ заборонено.'); return; }
+  if (!isAdmin(q.from.id)) { logDenied({ from: q.from, chat: q.message?.chat }, 'callback'); await ack(q.id, '🚫 Доступ заборонено.'); return; }
   if (data === 'noop')      { await ack(q.id); return; }
 
   if (pendingCb.has(cbKey)) { await ack(q.id, '⏳ Зачекайте…'); return; }
