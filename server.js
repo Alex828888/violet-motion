@@ -31,6 +31,8 @@ const ZVONOK_CAMPAIGN_ID = process.env.ZVONOK_CAMPAIGN_ID || '';
 const ZVONOK_WEBHOOK_SECRET = process.env.ZVONOK_WEBHOOK_SECRET || '';
 const ZVONOK_CALL_URL = 'https://zvonok.com/manager/cabapi_external/api/v1/phones/call/';
 
+app.set('trust proxy', 1);
+
 /* ── Data files ────────────────────────────────────────────── */
 const ROOT = __dirname;
 const DEFAULT_DATA = path.join(ROOT, 'data');

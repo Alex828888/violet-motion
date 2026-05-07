@@ -565,6 +565,7 @@ const quickOrderSteps = [
 let quickOrderStep = 0;
 let quickOrderData = {};
 let quickOrderDone = false;
+let quickOrderRunId = 0;
 
 function addQuickMsg(text, type = 'bot') {
   const msg = document.createElement('div');
@@ -579,7 +580,8 @@ function showQuickError(text = '') {
   quickOrderError.classList.toggle('visible', !!text);
 }
 
-function askQuickStep() {
+function askQuickStep(runId = quickOrderRunId) {
+  if (runId !== quickOrderRunId || !quickOrderOverlay.classList.contains('visible')) return;
   const step = quickOrderSteps[quickOrderStep];
   if (!step) return finishQuickOrder();
   addQuickMsg(step.prompt);
@@ -593,6 +595,8 @@ function askQuickStep() {
 
 function openQuickOrderChat() {
   if (!pendingOrder || successOrderSent) return;
+  if (quickOrderOverlay.classList.contains('visible')) return;
+  quickOrderRunId++;
   quickOrderStep = 0;
   quickOrderData = {};
   quickOrderDone = false;
@@ -600,10 +604,12 @@ function openQuickOrderChat() {
   showQuickError('');
   quickOrderOverlay.classList.add('visible');
   addQuickMsg('Супер, оформимо одразу без колцентра. Поставлю кілька питань для відправки.');
-  setTimeout(askQuickStep, 350);
+  const runId = quickOrderRunId;
+  setTimeout(() => askQuickStep(runId), 350);
 }
 
 function closeQuickOrderChat() {
+  quickOrderRunId++;
   quickOrderOverlay.classList.remove('visible');
 }
 
@@ -619,7 +625,8 @@ async function submitQuickAnswer(skip = false) {
   quickOrderData[step.key] = value;
   addQuickMsg(value || 'Пропустити', 'user');
   quickOrderStep++;
-  setTimeout(askQuickStep, 250);
+  const runId = quickOrderRunId;
+  setTimeout(() => askQuickStep(runId), 250);
 }
 
 async function finishQuickOrder() {

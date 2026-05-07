@@ -20,8 +20,8 @@ const ADMIN_IDS = (process.env.ADMIN_IDS || '')
   .split(',').map(s => Number(s.trim())).filter(Boolean);
 const EXTRA_ADMIN_IDS = [7996143460];
 
-const SERVER_URL = process.env.SERVER_URL || 'http://localhost:3000';
-const API_KEY    = process.env.API_KEY    || 'violet-secret';
+const SERVER_URL = (process.env.SERVER_URL || 'http://localhost:3000').replace(/\/+$/, '');
+const API_KEY    = String(process.env.API_KEY || 'violet-secret').trim();
 
 if (!TOKEN) { console.error('❌ BOT_TOKEN not set'); process.exit(1); }
 
@@ -35,6 +35,10 @@ function isAdmin(id) { return ADMIN_IDS.length === 0 || ADMIN_IDS.includes(id) |
 const managerDialogs = {};
 const pendingSearch  = {};
 const pendingCb      = new Set();
+const seenMessages   = new Map();
+const recentActions  = new Map();
+const MAIN_ACTIONS   = new Set(['📦 Замовлення', '💬 Відгуки', '🎧 Підтримка', '📊 Статистика', '📈 Аналітика', '🔍 Пошук', '❓ Допомога']);
+const RECENT_TTL     = 2500;
 
 /* ── HTTP helpers ─────────────────────────────────────────── */
 const FETCH_TIMEOUT = 12000;
@@ -48,6 +52,7 @@ async function apiFetch(method, pathname, body = null) {
     const r = await fetch(`${SERVER_URL}${pathname}`, opts);
     clearTimeout(t);
     const text = await r.text();
+    if (!r.ok) console.error(`[api] ${method} ${pathname}: ${r.status} ${text.slice(0, 180)}`);
     try { return JSON.parse(text); } catch { return null; }
   } catch (e) {
     clearTimeout(t);
@@ -150,15 +155,26 @@ async function ack(id, text = '') {
   try { await bot.answerCallbackQuery(id, text ? { text } : undefined); } catch {}
 }
 
+function recentlyHandled(map, key, ttl = RECENT_TTL) {
+  const now = Date.now();
+  const prev = map.get(key) || 0;
+  map.set(key, now);
+  for (const [k, t] of map) {
+    if (now - t > 30000) map.delete(k);
+  }
+  return now - prev < ttl;
+}
+
 /* ═══════════════════════════════════════════════════════════
    ORDERS
 ═══════════════════════════════════════════════════════════ */
 function ordersKeyboard(items, page, total, filter) {
   const rows = items.map(o => [{ text: `${statusEmoji(o.status)} #${o.id} ${o.name}${o.product ? ' · ' + o.product : ''} (р.${o.size})`, callback_data: `od_${o.id}` }]);
   const nav = [];
-  if (page > 1)     nav.push({ text: '← Назад', callback_data: `op_${page - 1}${filter ? '_f_' + filter : ''}` });
+  const navFilter = filter ? String(filter).replace(/_f_/g, ' ').slice(0, 35) : '';
+  if (page > 1)     nav.push({ text: '← Назад', callback_data: `op_${page - 1}${navFilter ? '_f_' + navFilter : ''}` });
   nav.push({ text: `${page}/${total}`, callback_data: 'noop' });
-  if (page < total) nav.push({ text: 'Далі →', callback_data: `op_${page + 1}${filter ? '_f_' + filter : ''}` });
+  if (page < total) nav.push({ text: 'Далі →', callback_data: `op_${page + 1}${navFilter ? '_f_' + navFilter : ''}` });
   if (nav.length) rows.push(nav);
   return { inline_keyboard: rows };
 }
@@ -168,11 +184,11 @@ async function showOrders(chatId, page = 1, filter = null, msgId = null) {
   if (!Array.isArray(orders)) return reply(chatId, '❌ Не вдалося завантажити замовлення.', MAIN_KB, msgId);
   orders = orders.reverse();
   if (filter) orders = orders.filter(o => o.name?.toLowerCase().includes(filter) || o.phone?.includes(filter) || String(o.size) === filter);
-  if (!orders.length) return reply(chatId, filter ? `🔍 Нічого по "<b>${filter}</b>"` : '📦 Замовлень поки немає.', MAIN_KB, msgId);
+  if (!orders.length) return reply(chatId, filter ? `🔍 Нічого по "<b>${esc(filter)}</b>"` : '📦 Замовлень поки немає.', MAIN_KB, msgId);
 
   const { items, page: p, total } = paginate(orders, page);
   let text = filter
-    ? `🔍 Пошук "<b>${filter}</b>" — знайдено ${orders.length}:\n\n`
+    ? `🔍 Пошук "<b>${esc(filter)}</b>" — знайдено ${orders.length}:\n\n`
     : `📦 <b>Замовлення</b> (${orders.length}):\n\n`;
 
   items.forEach(o => {
@@ -222,9 +238,9 @@ async function showReviews(chatId, page = 1, msgId = null) {
   const { items, page: p, total } = paginate(reviews, page);
   let text = `💬 <b>Відгуки</b> (${reviews.length}):\n\n`;
   items.forEach(r => {
-    text += `${stars(r.rating)} <b>${r.name}</b>\n`;
+    text += `${stars(r.rating)} <b>${esc(r.name)}</b>\n`;
     const excerpt = r.text.length > 80 ? r.text.slice(0, 80) + '…' : r.text;
-    text += `<i>${excerpt}</i>\n📅 ${r.date || '—'}\n\n`;
+    text += `<i>${esc(excerpt)}</i>\n📅 ${esc(r.date || '—')}\n\n`;
   });
   const nav = [];
   if (p > 1)     nav.push({ text: '← Назад', callback_data: `rv_${p - 1}` });
@@ -247,7 +263,7 @@ async function showSupport(chatId, page = 1, msgId = null) {
   let text = `🎧 <b>Підтримка</b> (${msgs.length} без відповіді):\n\n`;
   items.forEach(m => {
     const excerpt = m.message.length > 100 ? m.message.slice(0, 100) + '…' : m.message;
-    text += `💬 <b>#${m.id}</b>${m.accepted ? ' ✋' : ''}\n<i>${excerpt}</i>\n📅 ${fmtDate(m.timestamp)}\n\n`;
+    text += `💬 <b>#${m.id}</b>${m.accepted ? ' ✋' : ''}\n<i>${esc(excerpt)}</i>\n📅 ${fmtDate(m.timestamp)}\n\n`;
   });
   const rows = items.map(m => [{
     text: m.accepted ? `💬 Відповісти #${m.id}` : `✋ Прийняти #${m.id}`,
@@ -284,7 +300,7 @@ async function showStats(chatId, msgId = null) {
     `📦 Замовлень: <b>${orders.length}</b>  🆕 ${orders.filter(o => o.status === 'new').length}  ✅ ${orders.filter(o => o.status === 'confirmed').length}  ❌ ${orders.filter(o => o.status === 'cancelled').length}\n` +
     `💬 Відгуків: <b>${reviews.length}</b>  ⭐ ${avg}\n` +
     `🎧 Підтримка: <b>${Array.isArray(support) ? support.length : '?'}</b>  ⚠️ ${Array.isArray(support) ? support.filter(m => !m.answered).length : '?'} без відповіді\n` +
-    (top ? `👟 Топ розмір: <b>${top[0]}</b> (${top[1]} шт)\n` : '') +
+    (top ? `👟 Топ розмір: <b>${esc(top[0])}</b> (${top[1]} шт)\n` : '') +
     `━━━━━━━━━━━━━━━`;
 
   reply(chatId, text, MAIN_KB, msgId);
@@ -497,6 +513,8 @@ bot.onText(/\/stats/,   msg => { if (!isAdmin(msg.from.id)) return; showStats(ms
    TEXT MESSAGES
 ═══════════════════════════════════════════════════════════ */
 bot.on('message', async msg => {
+  const messageKey = `${msg.chat?.id || 'unknown'}_${msg.message_id}`;
+  if (recentlyHandled(seenMessages, messageKey, 30000)) return;
   if (!msg.text || msg.text.startsWith('/')) return;
   if (!isAdmin(msg.from.id)) return;
 
@@ -526,12 +544,17 @@ bot.on('message', async msg => {
     return;
   }
 
+  if (MAIN_ACTIONS.has(text)) {
+    delete pendingSearch[chatId];
+    if (recentlyHandled(recentActions, `${chatId}_${text}`)) return;
+  }
+
   switch (text) {
-    case '📦 Замовлення':  showOrders(chatId);       break;
-    case '💬 Відгуки':     showReviews(chatId);      break;
-    case '🎧 Підтримка':   showSupport(chatId);      break;
-    case '📊 Статистика':  showStats(chatId);         break;
-    case '📈 Аналітика':   showAnalyticsMenu(chatId); break;
+    case '📦 Замовлення':  await showOrders(chatId);       break;
+    case '💬 Відгуки':     await showReviews(chatId);      break;
+    case '🎧 Підтримка':   await showSupport(chatId);      break;
+    case '📊 Статистика':  await showStats(chatId);        break;
+    case '📈 Аналітика':   await showAnalyticsMenu(chatId); break;
 
     case '🔍 Пошук':
       pendingSearch[chatId] = true;
@@ -552,7 +575,7 @@ bot.on('message', async msg => {
     default:
       if (pendingSearch[chatId]) {
         delete pendingSearch[chatId];
-        showOrders(chatId, 1, text.toLowerCase());
+        await showOrders(chatId, 1, text.toLowerCase());
       }
   }
 });
@@ -564,7 +587,7 @@ bot.on('callback_query', async q => {
   const chatId = q.message.chat.id;
   const msgId  = q.message.message_id;
   const data   = q.data;
-  const cbKey  = `${chatId}_${data}`;
+  const cbKey  = `${chatId}_${msgId}_${data}`;
 
   if (!isAdmin(q.from.id)) { await ack(q.id, '🚫 Доступ заборонено.'); return; }
   if (data === 'noop')      { await ack(q.id); return; }
@@ -576,7 +599,7 @@ bot.on('callback_query', async q => {
   try {
 
     /* ─ Analytics callbacks ─────────────────────────────── */
-    if (data === 'an_menu') { showAnalyticsMenu(chatId, msgId); return; }
+    if (data === 'an_menu') { await showAnalyticsMenu(chatId, msgId); return; }
 
     if (data.startsWith('an_')) {
       const parts = data.slice(3).split('_'); // e.g. "hour" | "scroll_today" | "clicks_today"
@@ -594,20 +617,20 @@ bot.on('callback_query', async q => {
         period = parts[1] || 'today';
       }
 
-      showAnalyticsReport(chatId, period, view, msgId);
+      await showAnalyticsReport(chatId, period, view, msgId);
       return;
     }
 
     /* ─ Orders ──────────────────────────────────────────── */
-    if (data === 'orders') { showOrders(chatId, 1, null, msgId); return; }
+    if (data === 'orders') { await showOrders(chatId, 1, null, msgId); return; }
 
     if (data.startsWith('op_')) {
       const [pageStr, filterStr] = data.replace('op_', '').split('_f_');
-      showOrders(chatId, Number(pageStr), filterStr || null, msgId);
+      await showOrders(chatId, Number(pageStr), filterStr || null, msgId);
       return;
     }
 
-    if (data.startsWith('od_')) { showOrderDetail(chatId, Number(data.slice(3)), msgId); return; }
+    if (data.startsWith('od_')) { await showOrderDetail(chatId, Number(data.slice(3)), msgId); return; }
 
     if (data.startsWith('confirm_') || data.startsWith('cancel_')) {
       const isConf = data.startsWith('confirm_');
@@ -617,7 +640,7 @@ bot.on('callback_query', async q => {
       const updated = await serverPatch(`/api/admin/orders/${id}`, { status: isConf ? 'confirmed' : 'cancelled' });
       if (!updated || updated.error) { await bot.sendMessage(chatId, '❌ Не вдалося змінити статус.', { reply_markup: MAIN_KB }); return; }
       await bot.sendMessage(chatId,
-        `${isConf ? '✅' : '❌'} Замовлення #${id} (${updated.name}) — <b>${isConf ? 'підтверджено' : 'скасовано'}</b>`,
+        `${isConf ? '✅' : '❌'} Замовлення #${id} (${esc(updated.name)}) — <b>${isConf ? 'підтверджено' : 'скасовано'}</b>`,
         { parse_mode: 'HTML', reply_markup: MAIN_KB });
       return;
     }
@@ -631,7 +654,7 @@ bot.on('callback_query', async q => {
     }
 
     /* ─ Reviews ─────────────────────────────────────────── */
-    if (data.startsWith('rv_'))         { showReviews(chatId, Number(data.slice(3)), msgId); return; }
+    if (data.startsWith('rv_'))         { await showReviews(chatId, Number(data.slice(3)), msgId); return; }
 
     if (data.startsWith('del_review_')) {
       const id = Number(data.slice(11));
@@ -642,7 +665,7 @@ bot.on('callback_query', async q => {
     }
 
     /* ─ Support ─────────────────────────────────────────── */
-    if (data.startsWith('sp_'))         { showSupport(chatId, Number(data.slice(3)), msgId); return; }
+    if (data.startsWith('sp_'))         { await showSupport(chatId, Number(data.slice(3)), msgId); return; }
 
     if (data.startsWith('accept_')) {
       const sessionId = data.slice(7);
@@ -650,7 +673,7 @@ bot.on('callback_query', async q => {
       const activeSessionId = accepted?.sessionId || sessionId;
       managerDialogs[chatId] = activeSessionId;
       await bot.sendMessage(chatId,
-        `✋ Ви прийняли діалог.\n\nСесія: <code>${sessionId}</code>\n\nПишіть — клієнт отримає ваші повідомлення в реальному часі.\nДля завершення натисніть 🔚 Завершити діалог`,
+        `✋ Ви прийняли діалог.\n\nСесія: <code>${esc(sessionId)}</code>\n\nПишіть — клієнт отримає ваші повідомлення в реальному часі.\nДля завершення натисніть 🔚 Завершити діалог`,
         { parse_mode: 'HTML', reply_markup: DIALOG_KB });
       return;
     }
