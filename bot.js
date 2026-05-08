@@ -304,10 +304,10 @@ async function showOrders(chatId, page = 1, filter = null, msgId = null) {
 
 function orderDetailKeyboard(o) {
   const id = o.id;
+  const canDelete = ['new', 'cancelled'].includes(o.status || 'new');
   const rowsByStatus = {
     new: [
       [{ text: '✅ Підтвердити', callback_data: `os_${id}_c` }, { text: '❌ Скасувати', callback_data: `os_${id}_x` }],
-      [{ text: '🗑 Видалити', callback_data: `do_${id}` }],
     ],
     confirmed: [
       [{ text: '📦 Відправлено', callback_data: `oi_${id}_tt` }, { text: '❌ Скасувати', callback_data: `os_${id}_x` }],
@@ -324,6 +324,7 @@ function orderDetailKeyboard(o) {
     returned: [],
   };
   const rows = rowsByStatus[o.status || 'new'] || [];
+  if (canDelete) rows.push([{ text: '🗑 Видалити', callback_data: `do_${id}` }]);
   return { inline_keyboard: [...rows, [{ text: '← До списку', callback_data: 'orders' }]] };
 }
 
@@ -1201,7 +1202,7 @@ bot.on('callback_query', async q => {
       const id = Number(data.slice(3));
       const order = await serverGet(`/api/admin/orders/${id}`);
       if (!order || order.error) { await bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB }); return; }
-      if ((order.status || 'new') !== 'new') {
+      if (!['new', 'cancelled'].includes(order.status || 'new')) {
         await bot.sendMessage(chatId, `ℹ️ Замовлення #${id} вже оброблене, видалення недоступне.`, { reply_markup: MAIN_KB });
         return;
       }
@@ -1234,7 +1235,7 @@ bot.on('callback_query', async q => {
       const id = Number(data.slice(10));
       const order = await serverGet(`/api/admin/orders/${id}`);
       if (!order || order.error) { await bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB }); return; }
-      if ((order.status || 'new') !== 'new') {
+      if (!['new', 'cancelled'].includes(order.status || 'new')) {
         await bot.sendMessage(chatId, `ℹ️ Замовлення #${id} вже оброблене, видалення недоступне.`, { reply_markup: MAIN_KB });
         return;
       }
