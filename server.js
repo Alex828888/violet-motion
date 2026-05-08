@@ -42,6 +42,7 @@ const F = {
   reviews:   path.join(DATA, 'reviews.json'),
   support:   path.join(DATA, 'support.json'),
   analytics: path.join(DATA, 'analytics.json'),
+  finance:   path.join(DATA, 'finance.json'),
 };
 
 if (!fs.existsSync(DATA)) fs.mkdirSync(DATA, { recursive: true });
@@ -177,6 +178,80 @@ function authBot(req, res, next) {
 }
 
 function sanitizeStr(val, max = 200) { return String(val || '').trim().slice(0, max); }
+function asMoneyNumber(val) {
+  if (val === null || val === undefined || val === '') return 0;
+  const n = Number(String(val).replace(',', '.').replace(/[^\d.-]/g, ''));
+  return Number.isFinite(n) ? n : 0;
+}
+function orderPaymentStatus(o) {
+  return o?.paymentStatus || (o?.status === 'paid' || o?.status === 'completed' ? 'paid' : o?.status === 'returned' ? 'returned' : 'unpaid');
+}
+function orderExpensesTotal(o) {
+  const list = Array.isArray(o?.expenses) ? o.expenses : [];
+  return list.reduce((sum, e) => sum + asMoneyNumber(e.amount), 0) + asMoneyNumber(o?.extraExpenses || o?.expense || o?.returnExpense);
+}
+function orderProfit(o) {
+  return asMoneyNumber(o?.price) - asMoneyNumber(o?.cost || o?.costPrice || o?.purchasePrice) - orderExpensesTotal(o);
+}
+function periodStart(period) {
+  const now = new Date();
+  if (period === 'all') return null;
+  if (period === 'week') {
+    const d = new Date(now);
+    d.setDate(now.getDate() - 6);
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }
+  if (period === 'month') {
+    const d = new Date(now.getFullYear(), now.getMonth(), 1);
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }
+  const d = new Date(now);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+function inPeriod(iso, period) {
+  const start = periodStart(period);
+  if (!start) return true;
+  const t = new Date(iso || 0).getTime();
+  return Number.isFinite(t) && t >= start.getTime();
+}
+function buildCrmSummary(period = 'today') {
+  const orders = read(F.orders).filter(o => inPeriod(o.createdAt, period));
+  const finance = read(F.finance).filter(x => inPeriod(x.createdAt, period));
+  const income = finance.filter(x => x.type === 'income').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
+  const expense = finance.filter(x => x.type === 'expense').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
+  const adsExpense = finance.filter(x => x.type === 'expense' && x.category === 'ads').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
+  const paidOrders = orders.filter(o => orderPaymentStatus(o) === 'paid' || o.status === 'paid' || o.status === 'completed');
+  const returns = orders.filter(o => orderPaymentStatus(o) === 'returned' || o.status === 'returned');
+  const confirmedOrders = orders.filter(o => o.status === 'confirmed' || o.status === 'shipped' || o.status === 'paid' || o.status === 'completed');
+  const expectedIncome = paidOrders.reduce((s, o) => s + asMoneyNumber(o.price), 0);
+  const returnsExpense = finance.filter(x => x.type === 'expense' && x.category === 'return').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
+  return {
+    period,
+    orders: orders.length,
+    newOrders: orders.filter(o => o.status === 'new').length,
+    confirmedOrders: confirmedOrders.length,
+    shippedOrders: orders.filter(o => o.status === 'shipped').length,
+    paidOrders: paidOrders.length,
+    returns: returns.length,
+    withoutTtn: orders.filter(o => !o.ttn).length,
+    unpaid: orders.filter(o => orderPaymentStatus(o) !== 'paid').length,
+    income,
+    expense,
+    adsExpense,
+    profit: income - expense,
+    expectedIncome,
+    returnsExpense,
+    difference: income - expectedIncome,
+    avgCheck: paidOrders.length ? expectedIncome / paidOrders.length : 0,
+    avgProfit: paidOrders.length ? paidOrders.reduce((s, o) => s + orderProfit(o), 0) / paidOrders.length : 0,
+    leadCost: orders.length ? adsExpense / orders.length : 0,
+    confirmedOrderCost: confirmedOrders.length ? adsExpense / confirmedOrders.length : 0,
+    paidOrderCost: paidOrders.length ? adsExpense / paidOrders.length : 0,
+  };
+}
 
 function escapeHtml(val) {
   return String(val || '').replace(/[&<>"']/g, ch => ({
@@ -687,6 +762,74 @@ app.delete('/api/admin/orders/:id', authBot, (req, res) => {
   if (!arr.some(x => x.id === id)) return res.status(404).json({ error: 'Not found' });
   write(F.orders, arr.filter(x => x.id !== id)); res.json({ success: true });
 });
+app.post('/api/admin/orders/:id/expense', authBot, (req, res) => {
+  const id = Number(req.params.id); const arr = read(F.orders);
+  const idx = arr.findIndex(x => x.id === id);
+  if (idx < 0) return res.status(404).json({ error: 'Not found' });
+  const amount = asMoneyNumber(req.body?.amount);
+  if (!Number.isFinite(amount) || amount < 0) return res.status(400).json({ error: 'Invalid amount' });
+  const expense = {
+    id: nextId(Array.isArray(arr[idx].expenses) ? arr[idx].expenses : []),
+    title: sanitizeStr(req.body?.title || 'Витрата по замовленню', 160),
+    amount,
+    category: sanitizeStr(req.body?.category || 'order', 40),
+    createdAt: new Date().toISOString(),
+  };
+  arr[idx].expenses = [...(Array.isArray(arr[idx].expenses) ? arr[idx].expenses : []), expense];
+  if (expense.category === 'return') arr[idx].returnExpense = amount;
+  arr[idx].updatedAt = new Date().toISOString();
+  write(F.orders, arr); res.json(arr[idx]);
+});
+app.post('/api/admin/orders/:id/comment', authBot, (req, res) => {
+  const id = Number(req.params.id); const arr = read(F.orders);
+  const idx = arr.findIndex(x => x.id === id);
+  if (idx < 0) return res.status(404).json({ error: 'Not found' });
+  arr[idx].managerComment = sanitizeStr(req.body?.comment, 1000);
+  arr[idx].updatedAt = new Date().toISOString();
+  write(F.orders, arr); res.json(arr[idx]);
+});
+app.get('/api/admin/finance', authBot, (_req, res) => res.json(read(F.finance)));
+app.post('/api/admin/finance', authBot, (req, res) => {
+  const arr = read(F.finance);
+  const amount = asMoneyNumber(req.body?.amount);
+  const type = sanitizeStr(req.body?.type, 20);
+  if (!['income', 'expense'].includes(type)) return res.status(400).json({ error: 'Invalid type' });
+  if (!Number.isFinite(amount) || amount < 0) return res.status(400).json({ error: 'Invalid amount' });
+  const item = {
+    id: nextId(arr),
+    type,
+    title: sanitizeStr(req.body?.title || (type === 'income' ? 'Дохід' : 'Витрата'), 180),
+    amount,
+    category: sanitizeStr(req.body?.category || 'manual', 60),
+    source: sanitizeStr(req.body?.source || 'manual', 60),
+    orderId: req.body?.orderId ? Number(req.body.orderId) : null,
+    createdAt: req.body?.createdAt || new Date().toISOString(),
+  };
+  arr.push(item); write(F.finance, arr); res.json(item);
+});
+app.get('/api/admin/finance/summary', authBot, (req, res) => {
+  res.json(buildCrmSummary(sanitizeStr(req.query.period || 'today', 20)));
+});
+app.get('/api/admin/crm/summary', authBot, (req, res) => {
+  res.json(buildCrmSummary(sanitizeStr(req.query.period || 'today', 20)));
+});
+app.get('/api/admin/crm/problems', authBot, (_req, res) => {
+  const orders = read(F.orders).map(o => {
+    const problems = [];
+    const hasReturnExpense = Object.prototype.hasOwnProperty.call(o, 'returnExpense') || (Array.isArray(o.expenses) && o.expenses.some(e => e.category === 'return'));
+    if (o.status === 'confirmed') problems.push('Підтверджено, але не відправлено');
+    if (o.status === 'shipped' && !o.ttn) problems.push('Відправлено, але немає ТТН');
+    if (o.status === 'shipped' && orderPaymentStatus(o) !== 'paid') problems.push('Відправлено, але не оплачено');
+    if ((o.status === 'paid' || orderPaymentStatus(o) === 'paid') && !asMoneyNumber(o.price)) problems.push('Оплачено, але немає ціни');
+    if ((o.status === 'returned' || orderPaymentStatus(o) === 'returned') && !hasReturnExpense) problems.push('Повернення без витрати');
+    if (o.status === 'completed' && orderProfit(o) <= 0) problems.push('Завершено, але прибуток <= 0');
+    return { ...o, problems };
+  }).filter(o => o.problems.length);
+  res.json({ orders });
+});
+app.get('/api/admin/np/track/:ttn', authBot, (_req, res) => {
+  res.status(501).json({ error: 'Nova Poshta tracking is not configured' });
+});
 app.get('/api/admin/reviews',       authBot, (_req, res) => res.json(read(F.reviews)));
 app.delete('/api/admin/reviews/:id', authBot, (req, res) => {
   const id = Number(req.params.id); const arr = read(F.reviews);
@@ -709,10 +852,11 @@ app.get('/api/admin/backup', authBot, (_req, res) => {
     reviews: read(F.reviews),
     support: read(F.support),
     analytics: read(F.analytics),
+    finance: read(F.finance),
   });
 });
 app.post('/api/admin/backup/restore', authBot, (req, res) => {
-  const { orders, reviews, support, analytics } = req.body || {};
+  const { orders, reviews, support, analytics, finance } = req.body || {};
   const restored = {};
   if (Array.isArray(orders)) {
     write(F.orders, orders);
@@ -729,6 +873,10 @@ app.post('/api/admin/backup/restore', authBot, (req, res) => {
   if (Array.isArray(analytics)) {
     write(F.analytics, analytics);
     restored.analytics = analytics.length;
+  }
+  if (Array.isArray(finance)) {
+    write(F.finance, finance);
+    restored.finance = finance.length;
   }
   res.json({ success: true, restored });
 });

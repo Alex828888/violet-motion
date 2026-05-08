@@ -46,10 +46,11 @@ function logDenied(msg, source = 'message') {
 /* ── State ────────────────────────────────────────────────── */
 const managerDialogs = {};
 const pendingSearch  = {};
+const crmPendingInput = {};
 const pendingCb      = new Set();
 const seenMessages   = new Map();
 const recentActions  = new Map();
-const MAIN_ACTIONS   = new Set(['📦 Замовлення', '💬 Відгуки', '🎧 Підтримка', '📊 Статистика', '📈 Аналітика', '🔍 Пошук', '❓ Допомога']);
+const MAIN_ACTIONS   = new Set(['📦 Замовлення', '💬 Відгуки', '🎧 Підтримка', '📊 Статистика', '📈 Аналітика', '💰 Фінанси', '📊 CRM', '📣 Реклама', '🔍 Пошук', '❓ Допомога']);
 const RECENT_TTL     = 2500;
 
 /* ── HTTP helpers ─────────────────────────────────────────── */
@@ -84,7 +85,9 @@ const MAIN_KB = {
   keyboard: [
     ['📦 Замовлення', '💬 Відгуки'],
     ['🎧 Підтримка',  '📊 Статистика'],
-    ['📈 Аналітика',  '🔍 Пошук'],
+    ['📈 Аналітика',  '💰 Фінанси'],
+    ['📊 CRM',        '📣 Реклама'],
+    ['🔍 Пошук'],
     ['❓ Допомога'],
   ],
   resize_keyboard: true,
@@ -99,10 +102,57 @@ const DIALOG_KB = {
 
 /* ── Formatting helpers ───────────────────────────────────── */
 function stars(n)     { return '★'.repeat(n) + '☆'.repeat(5 - n); }
-function statusEmoji(s) { return { new: '🆕', confirmed: '✅', cancelled: '❌' }[s] || '❔'; }
+function statusEmoji(s) {
+  return {
+    new: '🆕', confirmed: '✅', cancelled: '❌', shipped: '📦',
+    paid: '💸', returned: '↩️', completed: '✅',
+  }[s] || '❔';
+}
 function fmtDate(iso) {
   try { return new Date(iso).toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' }); }
   catch { return iso || '—'; }
+}
+function money(n) {
+  const value = Number(n || 0);
+  return Number.isFinite(value) ? `${Math.round(value * 100) / 100} грн` : '—';
+}
+function asNumber(val) {
+  if (val === null || val === undefined || val === '') return 0;
+  const n = Number(String(val).replace(',', '.').replace(/[^\d.-]/g, ''));
+  return Number.isFinite(n) ? n : 0;
+}
+function parseAmount(val) {
+  const raw = String(val || '').trim().replace(',', '.');
+  if (!raw || raw.startsWith('-')) return null;
+  const n = Number(raw.replace(/[^\d.]/g, ''));
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+function parseTitledAmount(text) {
+  const parts = String(text || '').split('|');
+  if (parts.length < 2) return null;
+  const amount = parseAmount(parts.pop());
+  const title = parts.join('|').trim();
+  if (!title || amount === null) return null;
+  return { title, amount };
+}
+function orderExpensesTotal(o) {
+  const list = Array.isArray(o?.expenses) ? o.expenses : [];
+  return list.reduce((sum, e) => sum + asNumber(e.amount), 0) + asNumber(o?.extraExpenses || o?.expense || o?.returnExpense);
+}
+function orderProfit(o) {
+  return asNumber(o?.price) - asNumber(o?.cost || o?.costPrice || o?.purchasePrice) - orderExpensesTotal(o);
+}
+function paymentLabel(o) {
+  return o?.paymentStatus || (o?.status === 'paid' || o?.status === 'completed' ? 'paid' : o?.status === 'returned' ? 'returned' : 'unpaid');
+}
+function deliveryLabel(o) {
+  return o?.deliveryStatus || (o?.status === 'shipped' ? 'shipped' : o?.ttn ? 'ttn_added' : '—');
+}
+function setCrmPending(chatId, action, orderId = null) {
+  crmPendingInput[chatId] = { chatId, action, orderId, createdAt: new Date().toISOString() };
+}
+function clearCrmPending(chatId) {
+  delete crmPendingInput[chatId];
 }
 function fmtDuration(seconds) {
   if (!seconds || seconds <= 0) return '—';
@@ -181,9 +231,28 @@ function recentlyHandled(map, key, ttl = RECENT_TTL) {
    ORDERS
 ═══════════════════════════════════════════════════════════ */
 function ordersKeyboard(items, page, total, filter) {
-  const rows = items.map(o => [{ text: `${statusEmoji(o.status)} #${o.id} ${o.name}${o.product ? ' · ' + o.product : ''} (р.${o.size})`, callback_data: `od_${o.id}` }]);
+  const filterRows = [
+    [
+      { text: 'Всі', callback_data: 'of_all' },
+      { text: 'Нові', callback_data: 'of_new' },
+      { text: 'Підтв.', callback_data: 'of_confirmed' },
+    ],
+    [
+      { text: 'Скас.', callback_data: 'of_cancelled' },
+      { text: 'Відпр.', callback_data: 'of_shipped' },
+      { text: 'Оплач.', callback_data: 'of_paid' },
+    ],
+    [
+      { text: 'Поверн.', callback_data: 'of_returned' },
+      { text: 'Заверш.', callback_data: 'of_completed' },
+      { text: 'Без ТТН', callback_data: 'of_no_ttn' },
+    ],
+    [{ text: 'Не оплачені', callback_data: 'of_unpaid' }],
+  ];
+  const rows = [...filterRows, ...items.map(o => [{ text: `${statusEmoji(o.status)} #${o.id} ${o.name || '—'}${o.product ? ' · ' + o.product : ''} (р.${o.size || '—'})`, callback_data: `od_${o.id}` }])];
   const nav = [];
-  const navFilter = filter ? String(filter).replace(/_f_/g, ' ').slice(0, 35) : '';
+  const navFilterRaw = filter ? String(filter).replace(/_f_/g, ' ').slice(0, 35) : '';
+  const navFilter = Buffer.byteLength(navFilterRaw, 'utf8') <= 32 ? navFilterRaw : '';
   if (page > 1)     nav.push({ text: '← Назад', callback_data: `op_${page - 1}${navFilter ? '_f_' + navFilter : ''}` });
   nav.push({ text: `${page}/${total}`, callback_data: 'noop' });
   if (page < total) nav.push({ text: 'Далі →', callback_data: `op_${page + 1}${navFilter ? '_f_' + navFilter : ''}` });
@@ -195,7 +264,20 @@ async function showOrders(chatId, page = 1, filter = null, msgId = null) {
   let orders = await serverGet('/api/admin/orders');
   if (!Array.isArray(orders)) return reply(chatId, '❌ Не вдалося завантажити замовлення.', MAIN_KB, msgId);
   orders = orders.reverse();
-  if (filter) orders = orders.filter(o => o.name?.toLowerCase().includes(filter) || o.phone?.includes(filter) || String(o.size) === filter);
+  const rawFilter = filter ? String(filter).trim() : '';
+  const query = rawFilter.startsWith('q:') ? rawFilter.slice(2).toLowerCase() : rawFilter.toLowerCase();
+  if (rawFilter.startsWith('st:')) {
+    const st = rawFilter.slice(3);
+    orders = orders.filter(o => o.status === st);
+  } else if (rawFilter === 'no_ttn') {
+    orders = orders.filter(o => !o.ttn);
+  } else if (rawFilter === 'unpaid') {
+    orders = orders.filter(o => paymentLabel(o) !== 'paid');
+  } else if (query) {
+    orders = orders.filter(o => [
+      o.name, o.phone, o.size, o.id, o.ttn, o.status, o.paymentStatus,
+    ].some(v => String(v || '').toLowerCase().includes(query)));
+  }
   if (!orders.length) return reply(chatId, filter ? `🔍 Нічого по "<b>${esc(filter)}</b>"` : '📦 Замовлень поки немає.', MAIN_KB, msgId);
 
   const { items, page: p, total } = paginate(orders, page);
@@ -209,6 +291,8 @@ async function showOrders(chatId, page = 1, filter = null, msgId = null) {
     text += `   📱 ${esc(o.phone)}  👟 р.${esc(o.size)}`;
     if (o.color) text += `  🎨 ${esc(o.color)}`;
     if (o.contactViaTelegram) text += '  💬 TG';
+    text += `\n   🏷 ${esc(o.status || 'new')} · 💳 ${esc(paymentLabel(o))}`;
+    if (o.ttn) text += ` · ТТН ${esc(o.ttn)}`;
     if (hasDeliveryInfo(o)) {
       const cityLine = [o.city, o.postOffice ? `НП ${o.postOffice}` : ''].filter(Boolean).join(' · ');
       text += `\n   📦 ${esc(cityLine || 'дані доставки заповнені')}`;
@@ -221,20 +305,41 @@ async function showOrders(chatId, page = 1, filter = null, msgId = null) {
 async function showOrderDetail(chatId, id, msgId = null) {
   const o = await serverGet(`/api/admin/orders/${id}`);
   if (!o || o.error) return bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB });
+  const price = asNumber(o.price);
+  const cost = asNumber(o.cost || o.costPrice || o.purchasePrice);
+  const expenses = orderExpensesTotal(o);
+  const profit = orderProfit(o);
+  const comment = o.managerComment || o.comment || o.adminComment || '';
   const text =
     `📋 <b>Замовлення #${o.id}</b>\n━━━━━━━━━━━━━━━\n` +
-    (o.product ? `🛍 Товар: <b>${esc(o.product)}</b>\n` : '') +
-    `👤 <b>${esc(o.name)}</b>\n📱 ${esc(o.phone)}\n` +
-    `👟 Розмір: ${esc(o.size)}\n` +
-    (o.color ? `🎨 Колір: ${esc(o.color)}\n` : '') +
-    (o.price ? `💵 Ціна: ${esc(o.price)} грн\n` : '') +
+    `🆔 ID: <b>${esc(o.id)}</b>\n` +
+    `🛍 Товар: <b>${esc(o.product || '—')}</b>\n` +
+    `👤 Ім'я: <b>${esc(o.name || '—')}</b>\n` +
+    `📱 Телефон: <b>${esc(o.phone || '—')}</b>\n` +
+    `👟 Розмір: <b>${esc(o.size || '—')}</b>\n` +
+    `🎨 Колір: <b>${esc(o.color || '—')}</b>\n` +
+    `💵 Ціна продажу: <b>${money(price)}</b>\n` +
+    `🏷 Собівартість: <b>${money(cost)}</b>\n` +
+    `➕ Додаткові витрати: <b>${money(expenses)}</b>\n` +
+    `📈 Чистий прибуток: <b>${money(profit)}</b>\n` +
+    `🏷 Статус замовлення: ${statusEmoji(o.status)} <b>${esc(o.status || 'new')}</b>\n` +
+    `💳 Статус оплати: <b>${esc(paymentLabel(o))}</b>\n` +
+    `🚚 ТТН: <code>${esc(o.ttn || '—')}</code>\n` +
+    `📦 Статус доставки: <b>${esc(deliveryLabel(o))}</b>\n` +
+    `📅 Дата створення: <b>${fmtDate(o.createdAt)}</b>\n` +
+    `📝 Коментар менеджера: <i>${esc(comment || '—')}</i>\n` +
     (o.contactViaTelegram ? `💬 Зв'язок: Telegram\n` : `📞 Зв'язок: Дзвінок\n`) +
     `🚦 Тип: ${orderModeLabel(o)}\n` +
     deliveryBlock(o) +
-    `🏷 Статус: ${statusEmoji(o.status)} ${esc(o.status)}\n📅 ${fmtDate(o.createdAt)}\n━━━━━━━━━━━━━━━`;
+    `━━━━━━━━━━━━━━━`;
   reply(chatId, text, { inline_keyboard: [
-    [{ text: '✅ Підтвердити', callback_data: `confirm_${o.id}` }, { text: '❌ Скасувати', callback_data: `cancel_${o.id}` }],
-    [{ text: '🗑 Видалити', callback_data: `del_order_${o.id}` }],
+    [{ text: '✅ Підтвердити', callback_data: `os_${o.id}_c` }, { text: '❌ Скасувати', callback_data: `os_${o.id}_x` }],
+    [{ text: '📦 Відправлено', callback_data: `oi_${o.id}_tt` }, { text: '💸 Оплачено', callback_data: `os_${o.id}_p` }],
+    [{ text: '↩️ Повернення', callback_data: `os_${o.id}_r` }, { text: '✅ Завершено', callback_data: `os_${o.id}_d` }],
+    [{ text: '✏️ Ціна', callback_data: `oi_${o.id}_pr` }, { text: '✏️ Собівартість', callback_data: `oi_${o.id}_co` }],
+    [{ text: '➕ Витрата', callback_data: `oi_${o.id}_ex` }, { text: '📝 Коментар', callback_data: `oi_${o.id}_cm` }],
+    [{ text: '🔍 Перевірити ТТН', callback_data: `nt_${o.id}` }, { text: '✏️ Змінити ТТН', callback_data: `oi_${o.id}_tt` }],
+    [{ text: '🗑 Видалити', callback_data: `do_${o.id}` }],
     [{ text: '← До списку', callback_data: 'orders' }],
   ]}, msgId);
 }
@@ -316,6 +421,154 @@ async function showStats(chatId, msgId = null) {
     `━━━━━━━━━━━━━━━`;
 
   reply(chatId, text, MAIN_KB, msgId);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   CRM / FINANCE
+═══════════════════════════════════════════════════════════ */
+function financeMenuKb() {
+  return { inline_keyboard: [
+    [{ text: '➕ Додати дохід', callback_data: 'fi_add_i' }, { text: '➖ Додати витрату', callback_data: 'fi_add_e' }],
+    [{ text: '📅 Сьогодні', callback_data: 'fi_today' }, { text: '📆 Тиждень', callback_data: 'fi_week' }, { text: '🗓 Місяць', callback_data: 'fi_month' }],
+    [{ text: '📊 Баланс', callback_data: 'fi_balance' }, { text: '🧾 Звірка каси', callback_data: 'fi_cash' }],
+    [{ text: '← Назад', callback_data: 'main' }],
+  ] };
+}
+
+function crmMenuKb() {
+  return { inline_keyboard: [
+    [{ text: '📅 Сьогодні', callback_data: 'crm_today' }, { text: '📆 Тиждень', callback_data: 'crm_week' }, { text: '🗓 Місяць', callback_data: 'crm_month' }],
+    [{ text: '📦 Замовлення', callback_data: 'crm_orders' }, { text: '💸 Фінанси', callback_data: 'crm_fin' }],
+    [{ text: '📣 Реклама', callback_data: 'crm_ads' }, { text: '🚚 Доставка', callback_data: 'crm_ship' }],
+    [{ text: '↩️ Повернення', callback_data: 'crm_ret' }, { text: '🧾 Проблемні замовлення', callback_data: 'crm_prob' }],
+  ] };
+}
+
+function adsMenuKb() {
+  return { inline_keyboard: [
+    [{ text: '➕ Додати витрати на рекламу', callback_data: 'ad_add' }],
+    [{ text: '📅 Реклама сьогодні', callback_data: 'ad_today' }, { text: '📆 Реклама тиждень', callback_data: 'ad_week' }],
+    [{ text: '🗓 Реклама місяць', callback_data: 'ad_month' }],
+    [{ text: '← Назад', callback_data: 'main' }],
+  ] };
+}
+
+async function showFinanceMenu(chatId, msgId = null) {
+  await reply(chatId, '💰 <b>Фінанси</b>\n\nОберіть дію:', financeMenuKb(), msgId);
+}
+
+async function showCrmMenu(chatId, msgId = null) {
+  await reply(chatId, '📊 <b>CRM</b>\n\nОберіть звіт:', crmMenuKb(), msgId);
+}
+
+async function showAdsMenu(chatId, msgId = null) {
+  await reply(chatId, '📣 <b>Реклама</b>\n\nВитрати на рекламу та ціна заявки/замовлення.', adsMenuKb(), msgId);
+}
+
+function formatFinanceSummary(data, title) {
+  return (
+    `💰 <b>${title}</b>\n━━━━━━━━━━━━━━━\n` +
+    `Дохід: <b>${money(data.income)}</b>\n` +
+    `Витрати: <b>${money(data.expense)}</b>\n` +
+    `Чистий прибуток: <b>${money(data.profit)}</b>\n` +
+    `Оплачених замовлень: <b>${esc(data.paidOrders || 0)}</b>\n` +
+    `Повернень: <b>${esc(data.returns || 0)}</b>\n` +
+    `Середній чек: <b>${money(data.avgCheck)}</b>\n` +
+    `Середній прибуток з замовлення: <b>${money(data.avgProfit)}</b>\n` +
+    `Рекламні витрати: <b>${money(data.adsExpense)}</b>\n` +
+    `Ціна заявки: <b>${money(data.leadCost)}</b>\n` +
+    `Ціна підтвердженого замовлення: <b>${money(data.confirmedOrderCost)}</b>\n` +
+    `Ціна оплаченого замовлення: <b>${money(data.paidOrderCost)}</b>`
+  );
+}
+
+async function showFinanceSummary(chatId, period = 'today', msgId = null) {
+  const data = await serverGet(`/api/admin/finance/summary?period=${period}`);
+  if (!data || data.error) {
+    return reply(chatId, '❌ Фінансовий звіт поки не підключено на сервері.', financeMenuKb(), msgId);
+  }
+  const label = { today: 'Фінанси сьогодні', week: 'Фінанси за тиждень', month: 'Фінанси за місяць' }[period] || 'Баланс';
+  await reply(chatId, formatFinanceSummary(data, label), financeMenuKb(), msgId);
+}
+
+async function showCashReconciliation(chatId, msgId = null) {
+  const data = await serverGet('/api/admin/finance/summary?period=all');
+  if (!data || data.error) {
+    return reply(chatId, '❌ Звірка каси поки не підключена на сервері.', financeMenuKb(), msgId);
+  }
+  const reasons = data.difference === 0
+    ? 'Розбіжностей не знайдено.'
+    : 'Можливі причини: не внесли оплату в журнал, дубль доходу, повернення без витрати, ручна витрата без категорії.';
+  const text =
+    `🧾 <b>Звірка каси</b>\n━━━━━━━━━━━━━━━\n` +
+    `Очікуваний дохід: <b>${money(data.expectedIncome)}</b>\n` +
+    `Внесено доходів: <b>${money(data.income)}</b>\n` +
+    `Витрати: <b>${money(data.expense)}</b>\n` +
+    `Повернення: <b>${money(data.returnsExpense)}</b>\n` +
+    `Чистий результат: <b>${money(data.profit)}</b>\n` +
+    `Різниця: <b>${money(data.difference)}</b>\n\n` +
+    `<i>${esc(reasons)}</i>`;
+  await reply(chatId, text, financeMenuKb(), msgId);
+}
+
+async function showCrmSummary(chatId, period = 'today', view = 'overview', msgId = null) {
+  const data = await serverGet(`/api/admin/crm/summary?period=${period}`);
+  if (!data || data.error) {
+    return reply(chatId, '❌ CRM статистика поки не підключена на сервері.', crmMenuKb(), msgId);
+  }
+  const label = { today: 'сьогодні', week: 'тиждень', month: 'місяць' }[period] || period;
+  const text =
+    `📊 <b>CRM — ${esc(label)}</b>\n━━━━━━━━━━━━━━━\n` +
+    `Заявок: <b>${esc(data.orders || 0)}</b>\n` +
+    `Нові: <b>${esc(data.newOrders || 0)}</b>\n` +
+    `Підтверджені: <b>${esc(data.confirmedOrders || 0)}</b>\n` +
+    `Відправлені: <b>${esc(data.shippedOrders || 0)}</b>\n` +
+    `Оплачені: <b>${esc(data.paidOrders || 0)}</b>\n` +
+    `Повернення: <b>${esc(data.returns || 0)}</b>\n` +
+    `Без ТТН: <b>${esc(data.withoutTtn || 0)}</b>\n` +
+    `Не оплачені: <b>${esc(data.unpaid || 0)}</b>\n\n` +
+    `Дохід: <b>${money(data.income)}</b>\n` +
+    `Витрати: <b>${money(data.expense)}</b>\n` +
+    `Реклама: <b>${money(data.adsExpense)}</b>\n` +
+    `Чистий прибуток: <b>${money(data.profit)}</b>\n\n` +
+    `Ціна заявки: <b>${money(data.leadCost)}</b>\n` +
+    `Ціна підтвердженого: <b>${money(data.confirmedOrderCost)}</b>\n` +
+    `Ціна оплаченого: <b>${money(data.paidOrderCost)}</b>`;
+  await reply(chatId, text, crmMenuKb(), msgId);
+}
+
+async function showProblems(chatId, msgId = null) {
+  const data = await serverGet('/api/admin/crm/problems');
+  if (!data || data.error || !Array.isArray(data.orders)) {
+    return reply(chatId, '❌ Проблемні замовлення поки не підключені на сервері.', crmMenuKb(), msgId);
+  }
+  if (!data.orders.length) return reply(chatId, '🧾 <b>Проблемних замовлень немає.</b>', crmMenuKb(), msgId);
+  let text = `🧾 <b>Проблемні замовлення</b> (${data.orders.length})\n━━━━━━━━━━━━━━━\n\n`;
+  data.orders.slice(0, 20).forEach(o => {
+    text += `${statusEmoji(o.status)} <b>#${esc(o.id)}</b> ${esc(o.name || '—')}\n<i>${esc((o.problems || []).join('; '))}</i>\n\n`;
+  });
+  await reply(chatId, text, {
+    inline_keyboard: [
+      ...data.orders.slice(0, 10).map(o => [{ text: `Відкрити #${o.id}`, callback_data: `od_${o.id}` }]),
+      [{ text: '← CRM', callback_data: 'crm_menu' }],
+    ],
+  }, msgId);
+}
+
+async function showAdsReport(chatId, period = 'today', msgId = null) {
+  const data = await serverGet(`/api/admin/finance/summary?period=${period}`);
+  if (!data || data.error) return reply(chatId, '❌ Рекламний звіт поки не підключено на сервері.', adsMenuKb(), msgId);
+  const label = { today: 'сьогодні', week: 'тиждень', month: 'місяць' }[period] || period;
+  const text =
+    `📣 <b>Реклама — ${esc(label)}</b>\n━━━━━━━━━━━━━━━\n` +
+    `Рекламні витрати: <b>${money(data.adsExpense)}</b>\n` +
+    `Заявок: <b>${esc(data.orders || 0)}</b>\n` +
+    `Підтверджених: <b>${esc(data.confirmedOrders || 0)}</b>\n` +
+    `Оплачених: <b>${esc(data.paidOrders || 0)}</b>\n` +
+    `Ціна заявки: <b>${money(data.leadCost)}</b>\n` +
+    `Ціна підтвердженого замовлення: <b>${money(data.confirmedOrderCost)}</b>\n` +
+    `Ціна оплаченого замовлення: <b>${money(data.paidOrderCost)}</b>`;
+  await reply(chatId, text, adsMenuKb(), msgId);
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -527,6 +780,123 @@ bot.onText(/\/reviews/, msg => { if (!isAdmin(msg.from.id)) { logDenied(msg, '/r
 bot.onText(/\/support/, msg => { if (!isAdmin(msg.from.id)) { logDenied(msg, '/support'); return; } showSupport(msg.chat.id); });
 bot.onText(/\/stats/,   msg => { if (!isAdmin(msg.from.id)) { logDenied(msg, '/stats'); return; } showStats(msg.chat.id); });
 
+async function addFinanceEntry(payload) {
+  return serverPost('/api/admin/finance', {
+    ...payload,
+    amount: asNumber(payload.amount),
+    createdAt: payload.createdAt || new Date().toISOString(),
+  });
+}
+
+async function addOrderExpense(orderId, title, amount, category = 'order') {
+  const posted = await serverPost(`/api/admin/orders/${orderId}/expense`, { title, amount, category });
+  if (posted && !posted.error) return posted;
+  const order = await serverGet(`/api/admin/orders/${orderId}`);
+  if (!order || order.error) return null;
+  const expenses = Array.isArray(order.expenses) ? order.expenses : [];
+  return serverPatch(`/api/admin/orders/${orderId}`, {
+    expenses: [...expenses, { title, amount, category, createdAt: new Date().toISOString() }],
+  });
+}
+
+async function saveOrderComment(orderId, comment) {
+  const posted = await serverPost(`/api/admin/orders/${orderId}/comment`, { comment });
+  if (posted && !posted.error) return posted;
+  return serverPatch(`/api/admin/orders/${orderId}`, { managerComment: comment });
+}
+
+async function handleCrmPendingMessage(chatId, text) {
+  const pending = crmPendingInput[chatId];
+  if (!pending) return false;
+  const age = Date.now() - new Date(pending.createdAt).getTime();
+  if (age > 30 * 60 * 1000) {
+    clearCrmPending(chatId);
+    await bot.sendMessage(chatId, '⌛ Ввід застарів. Натисніть потрібну кнопку ще раз.', { reply_markup: MAIN_KB });
+    return true;
+  }
+
+  const id = pending.orderId;
+  const askAmountAgain = '❌ Сума некоректна. Введіть додатне число без мінуса.';
+  const askTitleAmountAgain = '❌ Формат некоректний. Введіть так: Назва | Сума';
+
+  if (pending.action === 'ttn') {
+    const ttn = text.trim();
+    if (!ttn) {
+      await bot.sendMessage(chatId, '❌ Введіть ТТН текстом.');
+      return true;
+    }
+    const updated = await serverPatch(`/api/admin/orders/${id}`, { ttn, status: 'shipped', deliveryStatus: 'shipped' });
+    clearCrmPending(chatId);
+    if (!updated || updated.error) await bot.sendMessage(chatId, '❌ Не вдалося зберегти ТТН.', { reply_markup: MAIN_KB });
+    else await showOrderDetail(chatId, id);
+    return true;
+  }
+
+  if (pending.action === 'price' || pending.action === 'cost') {
+    const amount = parseAmount(text);
+    if (amount === null) {
+      await bot.sendMessage(chatId, askAmountAgain);
+      return true;
+    }
+    const field = pending.action === 'price' ? 'price' : 'cost';
+    const updated = await serverPatch(`/api/admin/orders/${id}`, { [field]: amount });
+    clearCrmPending(chatId);
+    if (!updated || updated.error) await bot.sendMessage(chatId, '❌ Не вдалося зберегти суму.', { reply_markup: MAIN_KB });
+    else await showOrderDetail(chatId, id);
+    return true;
+  }
+
+  if (pending.action === 'order_expense' || pending.action === 'return_expense') {
+    let parsed = parseTitledAmount(text);
+    if (!parsed) {
+      const amount = parseAmount(text);
+      if (amount !== null) parsed = { title: pending.action === 'return_expense' ? 'Втрати на поверненні' : 'Витрата по замовленню', amount };
+    }
+    if (!parsed) {
+      await bot.sendMessage(chatId, pending.action === 'return_expense' ? askAmountAgain : askTitleAmountAgain);
+      return true;
+    }
+    const category = pending.action === 'return_expense' ? 'return' : 'order';
+    const updated = await addOrderExpense(id, parsed.title, parsed.amount, category);
+    await addFinanceEntry({ type: 'expense', title: `${parsed.title} #${id}`, amount: parsed.amount, category, source: 'order', orderId: id });
+    clearCrmPending(chatId);
+    if (!updated || updated.error) await bot.sendMessage(chatId, '❌ Не вдалося зберегти витрату.', { reply_markup: MAIN_KB });
+    else await showOrderDetail(chatId, id);
+    return true;
+  }
+
+  if (pending.action === 'comment') {
+    const updated = await saveOrderComment(id, text);
+    clearCrmPending(chatId);
+    if (!updated || updated.error) await bot.sendMessage(chatId, '❌ Не вдалося зберегти коментар.', { reply_markup: MAIN_KB });
+    else await showOrderDetail(chatId, id);
+    return true;
+  }
+
+  if (['income', 'expense', 'ads'].includes(pending.action)) {
+    const parsed = parseTitledAmount(text);
+    if (!parsed) {
+      await bot.sendMessage(chatId, askTitleAmountAgain);
+      return true;
+    }
+    const payload = {
+      type: pending.action === 'income' ? 'income' : 'expense',
+      title: parsed.title,
+      amount: parsed.amount,
+      category: pending.action === 'ads' ? 'ads' : 'manual',
+      source: pending.action === 'ads' ? 'ads' : 'manual',
+    };
+    const saved = await addFinanceEntry(payload);
+    clearCrmPending(chatId);
+    if (!saved || saved.error) await bot.sendMessage(chatId, '❌ Фінансовий запис не збережено. Endpoint поки не підключено.', { reply_markup: MAIN_KB });
+    else await bot.sendMessage(chatId, `✅ Запис збережено: <b>${esc(parsed.title)}</b> — ${money(parsed.amount)}`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
+    return true;
+  }
+
+  clearCrmPending(chatId);
+  return false;
+}
+
 /* ═══════════════════════════════════════════════════════════
    TEXT MESSAGES
 ═══════════════════════════════════════════════════════════ */
@@ -564,7 +934,11 @@ bot.on('message', async msg => {
 
   if (MAIN_ACTIONS.has(text)) {
     delete pendingSearch[chatId];
+    clearCrmPending(chatId);
     if (recentlyHandled(recentActions, `${chatId}_${text}`)) return;
+  } else if (crmPendingInput[chatId]) {
+    const handled = await handleCrmPendingMessage(chatId, text);
+    if (handled) return;
   }
 
   switch (text) {
@@ -573,10 +947,13 @@ bot.on('message', async msg => {
     case '🎧 Підтримка':   await showSupport(chatId);      break;
     case '📊 Статистика':  await showStats(chatId);        break;
     case '📈 Аналітика':   await showAnalyticsMenu(chatId); break;
+    case '💰 Фінанси':     await showFinanceMenu(chatId);  break;
+    case '📊 CRM':         await showCrmMenu(chatId);      break;
+    case '📣 Реклама':     await showAdsMenu(chatId);      break;
 
     case '🔍 Пошук':
       pendingSearch[chatId] = true;
-      await bot.sendMessage(chatId, "🔍 Введіть ім'я, телефон або розмір:", {
+      await bot.sendMessage(chatId, "🔍 Введіть ім'я, телефон, розмір, ID, ТТН або статус:", {
         reply_markup: { inline_keyboard: [[{ text: '← Скасувати', callback_data: 'orders' }]] },
       });
       break;
@@ -584,6 +961,9 @@ bot.on('message', async msg => {
     case '❓ Допомога':
       await bot.sendMessage(chatId,
         `<b>Команди:</b>\n/orders — замовлення\n/reviews — відгуки\n/support — підтримка\n/stats — статистика\n/analytics — аналітика\n/search Ім'я — пошук\n\n` +
+        `💰 <b>Фінанси:</b> доходи, витрати, баланс, звірка каси.\n` +
+        `📊 <b>CRM:</b> статуси, доставка, повернення, проблемні замовлення.\n` +
+        `📣 <b>Реклама:</b> витрати та ціна заявки/замовлення.\n\n` +
         `📈 <b>Аналітика:</b> кнопка в меню або /analytics\nПоказує: сесії, скрол, кліки, воронку, останні дії.\n\n` +
         `💬 <b>Підтримка:</b> коли приймаєте діалог — всі ваші повідомлення йдуть клієнту у реальному часі. Для завершення — 🔚 Завершити діалог`,
         { parse_mode: 'HTML', reply_markup: MAIN_KB }
@@ -593,7 +973,7 @@ bot.on('message', async msg => {
     default:
       if (pendingSearch[chatId]) {
         delete pendingSearch[chatId];
-        await showOrders(chatId, 1, text.toLowerCase());
+        await showOrders(chatId, 1, `q:${text.toLowerCase()}`);
       }
   }
 });
@@ -609,12 +989,17 @@ bot.on('callback_query', async q => {
 
   if (!isAdmin(q.from.id)) { logDenied({ from: q.from, chat: q.message?.chat }, 'callback'); await ack(q.id, '🚫 Доступ заборонено.'); return; }
   if (data === 'noop')      { await ack(q.id); return; }
+  clearCrmPending(chatId);
 
   if (pendingCb.has(cbKey)) { await ack(q.id, '⏳ Зачекайте…'); return; }
   pendingCb.add(cbKey);
   await ack(q.id);
 
   try {
+    if (data === 'main') {
+      await reply(chatId, '🟣 <b>Violet Motion — Адмін панель</b>\n\nОберіть розділ кнопками нижче:', MAIN_KB, msgId);
+      return;
+    }
 
     /* ─ Analytics callbacks ─────────────────────────────── */
     if (data === 'an_menu') { await showAnalyticsMenu(chatId, msgId); return; }
@@ -639,8 +1024,67 @@ bot.on('callback_query', async q => {
       return;
     }
 
+    /* ─ CRM / Finance callbacks ─────────────────────────── */
+    if (data === 'fi_menu') { await showFinanceMenu(chatId, msgId); return; }
+    if (data === 'crm_menu') { await showCrmMenu(chatId, msgId); return; }
+    if (data === 'ad_menu') { await showAdsMenu(chatId, msgId); return; }
+
+    if (data === 'fi_add_i' || data === 'fi_add_e') {
+      setCrmPending(chatId, data === 'fi_add_i' ? 'income' : 'expense');
+      await bot.sendMessage(chatId, data === 'fi_add_i'
+        ? '➕ Введіть дохід у форматі: Назва | Сума\nНаприклад: Оплата замовлення #15 | 895'
+        : '➖ Введіть витрату у форматі: Назва | Сума\nНаприклад: Реклама Facebook | 440', {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '← Скасувати', callback_data: 'fi_menu' }]] },
+      });
+      return;
+    }
+
+    if (data === 'fi_today' || data === 'fi_week' || data === 'fi_month' || data === 'fi_balance') {
+      const period = data === 'fi_balance' ? 'all' : data.replace('fi_', '');
+      await showFinanceSummary(chatId, period, msgId);
+      return;
+    }
+
+    if (data === 'fi_cash') { await showCashReconciliation(chatId, msgId); return; }
+
+    if (data === 'crm_today' || data === 'crm_week' || data === 'crm_month') {
+      await showCrmSummary(chatId, data.replace('crm_', ''), 'overview', msgId);
+      return;
+    }
+    if (data === 'crm_prob') { await showProblems(chatId, msgId); return; }
+    if (data === 'crm_orders') { await showOrders(chatId, 1, null, msgId); return; }
+    if (data === 'crm_fin') { await showFinanceSummary(chatId, 'month', msgId); return; }
+    if (data === 'crm_ads') { await showAdsReport(chatId, 'month', msgId); return; }
+    if (data === 'crm_ship') { await showOrders(chatId, 1, 'st:shipped', msgId); return; }
+    if (data === 'crm_ret') { await showOrders(chatId, 1, 'st:returned', msgId); return; }
+
+    if (data === 'ad_add') {
+      setCrmPending(chatId, 'ads');
+      await bot.sendMessage(chatId, '📣 Введіть рекламну витрату у форматі: Facebook | 440', {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '← Скасувати', callback_data: 'ad_menu' }]] },
+      });
+      return;
+    }
+    if (data === 'ad_today' || data === 'ad_week' || data === 'ad_month') {
+      await showAdsReport(chatId, data.replace('ad_', ''), msgId);
+      return;
+    }
+
     /* ─ Orders ──────────────────────────────────────────── */
     if (data === 'orders') { await showOrders(chatId, 1, null, msgId); return; }
+
+    if (data.startsWith('of_')) {
+      const key = data.slice(3);
+      const map = {
+        all: null, new: 'st:new', confirmed: 'st:confirmed', cancelled: 'st:cancelled',
+        shipped: 'st:shipped', paid: 'st:paid', returned: 'st:returned',
+        completed: 'st:completed', no_ttn: 'no_ttn', unpaid: 'unpaid',
+      };
+      await showOrders(chatId, 1, map[key] || null, msgId);
+      return;
+    }
 
     if (data.startsWith('op_')) {
       const [pageStr, filterStr] = data.replace('op_', '').split('_f_');
@@ -649,6 +1093,100 @@ bot.on('callback_query', async q => {
     }
 
     if (data.startsWith('od_')) { await showOrderDetail(chatId, Number(data.slice(3)), msgId); return; }
+
+    if (data.startsWith('os_')) {
+      const [, idStr, code] = data.split('_');
+      const id = Number(idStr);
+      const order = await serverGet(`/api/admin/orders/${id}`);
+      if (!order || order.error) { await bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB }); return; }
+
+      if (code === 'p') {
+        const amount = asNumber(order.price);
+        const updated = await serverPatch(`/api/admin/orders/${id}`, {
+          paymentStatus: 'paid', status: 'paid', paidAt: new Date().toISOString(),
+        });
+        if (!updated || updated.error) { await bot.sendMessage(chatId, '❌ Не вдалося змінити оплату.', { reply_markup: MAIN_KB }); return; }
+        if (amount > 0) {
+          await addFinanceEntry({
+            type: 'income', source: 'order', orderId: id, amount,
+            title: `Оплата замовлення #${id}`,
+          });
+        }
+        await showOrderDetail(chatId, id, msgId);
+        return;
+      }
+
+      if (code === 'r') {
+        const updated = await serverPatch(`/api/admin/orders/${id}`, {
+          paymentStatus: 'returned', status: 'returned', returnedAt: new Date().toISOString(),
+        });
+        if (!updated || updated.error) { await bot.sendMessage(chatId, '❌ Не вдалося оформити повернення.', { reply_markup: MAIN_KB }); return; }
+        setCrmPending(chatId, 'return_expense', id);
+        await bot.sendMessage(chatId, '↩️ Введіть суму втрат на доставці/поверненні:', { parse_mode: 'HTML' });
+        return;
+      }
+
+      const statusMap = { c: 'confirmed', x: 'cancelled', d: 'completed' };
+      const status = statusMap[code];
+      if (status) {
+        const updated = await serverPatch(`/api/admin/orders/${id}`, { status });
+        if (!updated || updated.error) { await bot.sendMessage(chatId, '❌ Не вдалося змінити статус.', { reply_markup: MAIN_KB }); return; }
+        await showOrderDetail(chatId, id, msgId);
+        return;
+      }
+    }
+
+    if (data.startsWith('oi_')) {
+      const [, idStr, code] = data.split('_');
+      const id = Number(idStr);
+      const prompts = {
+        tt: ['ttn', '📦 Введіть ТТН для замовлення:'],
+        pr: ['price', '✏️ Введіть ціну продажу числом:'],
+        co: ['cost', '✏️ Введіть собівартість числом:'],
+        ex: ['order_expense', '➕ Введіть витрату у форматі: Назва | Сума'],
+        cm: ['comment', '📝 Введіть коментар менеджера:'],
+      };
+      const item = prompts[code];
+      if (item) {
+        setCrmPending(chatId, item[0], id);
+        await bot.sendMessage(chatId, item[1], {
+          parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '← Скасувати', callback_data: `od_${id}` }]] },
+        });
+        return;
+      }
+    }
+
+    if (data.startsWith('nt_')) {
+      const id = Number(data.slice(3));
+      const order = await serverGet(`/api/admin/orders/${id}`);
+      if (!order || order.error) { await bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB }); return; }
+      if (!order.ttn) { await bot.sendMessage(chatId, '❌ У замовленні немає ТТН.', { reply_markup: MAIN_KB }); return; }
+      const track = await serverGet(`/api/admin/np/track/${encodeURIComponent(order.ttn)}`);
+      if (!track || track.error) {
+        await bot.sendMessage(chatId, '❌ Перевірка ТТН поки не підключена на сервері.', { reply_markup: MAIN_KB });
+        return;
+      }
+      const text =
+        `🔍 <b>ТТН ${esc(order.ttn)}</b>\n━━━━━━━━━━━━━━━\n` +
+        `Статус посилки: <b>${esc(track.status || '—')}</b>\n` +
+        `Місто: <b>${esc(track.city || '—')}</b>\n` +
+        `Відділення: <b>${esc(track.warehouse || '—')}</b>\n` +
+        `Дата відправки: <b>${esc(track.sentAt || '—')}</b>\n` +
+        `Дата отримання: <b>${esc(track.receivedAt || '—')}</b>\n` +
+        `Отримано: <b>${track.received ? 'так' : 'ні'}</b>\n` +
+        `Повернення: <b>${track.returned ? 'так' : 'ні'}</b>`;
+      await reply(chatId, text, { inline_keyboard: [[{ text: '← До замовлення', callback_data: `od_${id}` }]] }, msgId);
+      return;
+    }
+
+    if (data.startsWith('do_')) {
+      const id = Number(data.slice(3));
+      const deleted = await serverDelete(`/api/admin/orders/${id}`);
+      if (!deleted || deleted.error) { await bot.sendMessage(chatId, `❌ Не вдалося видалити #${id}.`, { reply_markup: MAIN_KB }); return; }
+      await bot.sendMessage(chatId, `🗑 Замовлення #${id} видалено.`, { reply_markup: MAIN_KB });
+      return;
+    }
 
     if (data.startsWith('confirm_') || data.startsWith('cancel_')) {
       const isConf = data.startsWith('confirm_');
