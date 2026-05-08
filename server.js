@@ -43,6 +43,7 @@ const F = {
   support:   path.join(DATA, 'support.json'),
   analytics: path.join(DATA, 'analytics.json'),
   finance:   path.join(DATA, 'finance.json'),
+  orderNotify: path.join(DATA, 'order-notify.json'),
 };
 
 if (!fs.existsSync(DATA)) fs.mkdirSync(DATA, { recursive: true });
@@ -106,6 +107,18 @@ async function tgTo(chatId, text, extra = {}) {
     });
     return await r.json();
   } catch (e) { console.error('[TG]', e.message); return null; }
+}
+
+async function tgEdit(chatId, messageId, text, extra = {}) {
+  if (!TG_TOKEN || !chatId || !messageId) return null;
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/editMessageText`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, message_id: messageId, text, parse_mode: 'HTML', ...extra }),
+    });
+    return await r.json();
+  } catch (e) { console.error('[TG edit]', e.message); return null; }
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -257,6 +270,55 @@ function escapeHtml(val) {
   return String(val || '').replace(/[&<>"']/g, ch => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   }[ch]));
+}
+
+function orderQueueNoticeText(latestOrder = null) {
+  const orders = read(F.orders);
+  const fresh = orders.filter(o => (o.status || 'new') === 'new');
+  const latest = latestOrder || fresh[fresh.length - 1] || orders[orders.length - 1] || null;
+  const now = new Date().toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' });
+
+  let text = fresh.length
+    ? `🆕 <b>Нові замовлення</b>\nВ черзі: <b>${fresh.length}</b>`
+    : `✅ <b>Нових замовлень немає</b>\nВ черзі: <b>0</b>`;
+
+  if (latest) {
+    text +=
+      `\n\nОстаннє: <b>#${escapeHtml(latest.id)}</b> ${escapeHtml(latest.name || '—')}` +
+      `\n📱 ${escapeHtml(latest.phone || '—')}` +
+      `\n👟 ${escapeHtml(latest.size || '—')}` +
+      (latest.product ? ` · ${escapeHtml(latest.product)}` : '') +
+      (latest.price ? `\n💵 ${escapeHtml(latest.price)} грн` : '');
+  }
+
+  text += `\n\nОновлено: <code>${escapeHtml(now)}</code>`;
+  return text;
+}
+
+async function updateOrderQueueNotice(latestOrder = null) {
+  if (!TG_TOKEN || !TG_CHAT_ID) return null;
+  const state = read(F.orderNotify);
+  const messageId = state && !Array.isArray(state) ? state.messageId : null;
+  const latestId = latestOrder?.id || null;
+  const keyboard = { reply_markup: { inline_keyboard: [
+    ...(latestId ? [[{ text: `Відкрити #${latestId}`, callback_data: `od_${latestId}` }]] : []),
+    [{ text: '📦 Всі замовлення', callback_data: 'orders' }],
+  ] } };
+  const text = orderQueueNoticeText(latestOrder);
+
+  if (messageId) {
+    const edited = await tgEdit(TG_CHAT_ID, messageId, text, keyboard);
+    if (edited?.ok) {
+      write(F.orderNotify, { messageId, updatedAt: new Date().toISOString() });
+      return edited;
+    }
+  }
+
+  const sent = await tg(text, keyboard);
+  if (sent?.ok && sent.result?.message_id) {
+    write(F.orderNotify, { messageId: sent.result.message_id, updatedAt: new Date().toISOString() });
+  }
+  return sent;
 }
 
 const supportAiHistory = {};
@@ -755,7 +817,9 @@ app.patch('/api/admin/orders/:id', authBot, (req, res) => {
   const idx = arr.findIndex(x => x.id === id);
   if (idx < 0) return res.status(404).json({ error: 'Not found' });
   arr[idx] = { ...arr[idx], ...req.body, id: arr[idx].id, updatedAt: new Date().toISOString() };
-  write(F.orders, arr); res.json(arr[idx]);
+  write(F.orders, arr);
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, 'status')) updateOrderQueueNotice(arr[idx]).catch(e => console.error('[order notice]', e.message));
+  res.json(arr[idx]);
 });
 app.delete('/api/admin/orders/:id', authBot, (req, res) => {
   const id = Number(req.params.id); const arr = read(F.orders);
@@ -997,6 +1061,7 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
     contactViaTelegram: !!contactViaTelegram, status: 'new', createdAt: new Date().toISOString(),
   };
   orders.push(o); write(F.orders, orders);
+  await updateOrderQueueNotice(o);
 
   const ts = new Date(o.createdAt).toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' });
   const isInstant = o.orderMode === 'instant';
@@ -1038,7 +1103,9 @@ app.patch('/api/orders/:id',  (req, res) => {
   const arr = read(F.orders); const idx = arr.findIndex(x => x.id === +req.params.id);
   if (idx < 0) return res.status(404).json({ error: 'Not found' });
   arr[idx] = { ...arr[idx], ...req.body, id: arr[idx].id, updatedAt: new Date().toISOString() };
-  write(F.orders, arr); res.json(arr[idx]);
+  write(F.orders, arr);
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, 'status')) updateOrderQueueNotice(arr[idx]).catch(e => console.error('[order notice]', e.message));
+  res.json(arr[idx]);
 });
 app.delete('/api/orders/:id', (req, res) => {
   const id = Number(req.params.id); const arr = read(F.orders);
