@@ -822,7 +822,7 @@ async function handleCrmPendingMessage(chatId, text) {
 
   const id = pending.orderId;
   const askAmountAgain = '❌ Сума некоректна. Введіть додатне число без мінуса.';
-  const askTitleAmountAgain = '❌ Формат некоректний. Введіть так: Назва | Сума';
+  const askTitleAmountAgain = '❌ Формат некоректний. Введіть суму числом або так: Назва | Сума';
 
   if (pending.action === 'ttn') {
     const ttn = text.trim();
@@ -879,7 +879,18 @@ async function handleCrmPendingMessage(chatId, text) {
   }
 
   if (['income', 'expense', 'ads'].includes(pending.action)) {
-    const parsed = parseTitledAmount(text);
+    let parsed = parseTitledAmount(text);
+    if (!parsed) {
+      const amount = parseAmount(text);
+      if (amount !== null) {
+        const titleMap = {
+          income: 'Дохід вручну',
+          expense: 'Витрата вручну',
+          ads: 'Реклама',
+        };
+        parsed = { title: titleMap[pending.action], amount };
+      }
+    }
     if (!parsed) {
       await bot.sendMessage(chatId, askTitleAmountAgain);
       return true;
@@ -1037,8 +1048,8 @@ bot.on('callback_query', async q => {
     if (data === 'fi_add_i' || data === 'fi_add_e') {
       setCrmPending(chatId, data === 'fi_add_i' ? 'income' : 'expense');
       await bot.sendMessage(chatId, data === 'fi_add_i'
-        ? '➕ Введіть дохід у форматі: Назва | Сума\nНаприклад: Оплата замовлення #15 | 895'
-        : '➖ Введіть витрату у форматі: Назва | Сума\nНаприклад: Реклама Facebook | 440', {
+        ? '➕ Введіть суму доходу. Можна просто: 895\nАбо з назвою: Оплата замовлення #15 | 895'
+        : '➖ Введіть суму витрати. Можна просто: 440\nАбо з назвою: Реклама Facebook | 440', {
         parse_mode: 'HTML',
         reply_markup: { inline_keyboard: [[{ text: '← Скасувати', callback_data: 'fi_menu' }]] },
       });
@@ -1066,7 +1077,7 @@ bot.on('callback_query', async q => {
 
     if (data === 'ad_add') {
       setCrmPending(chatId, 'ads');
-      await bot.sendMessage(chatId, '📣 Введіть рекламну витрату у форматі: Facebook | 440', {
+      await bot.sendMessage(chatId, '📣 Введіть суму реклами. Можна просто: 440\nАбо з назвою: Facebook | 440', {
         parse_mode: 'HTML',
         reply_markup: { inline_keyboard: [[{ text: '← Скасувати', callback_data: 'ad_menu' }]] },
       });
