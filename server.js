@@ -212,8 +212,20 @@ function orderExpensesTotal(o) {
   const list = Array.isArray(o?.expenses) ? o.expenses : [];
   return list.reduce((sum, e) => sum + asMoneyNumber(e.amount), 0) + asMoneyNumber(o?.extraExpenses || o?.expense || o?.returnExpense);
 }
+function orderUpsell(o) {
+  return o?.upsell && typeof o.upsell === 'object' ? o.upsell : null;
+}
+function orderPaidNet(o) {
+  const basePaid = o?.baseIncomePosted || o?.basePaidAt || orderPaymentStatus(o) === 'paid' || o?.status === 'paid' || o?.status === 'completed';
+  const upsell = orderUpsell(o);
+  const upsellPaid = upsell && (upsell.incomePosted || upsell.paidAt || upsell.paymentStatus === 'paid');
+  let total = 0;
+  if (basePaid) total += asMoneyNumber(o?.price) - asMoneyNumber(o?.cost || o?.costPrice || o?.purchasePrice);
+  if (upsellPaid) total += asMoneyNumber(upsell.price) - asMoneyNumber(upsell.cost);
+  return total;
+}
 function orderProfit(o) {
-  return asMoneyNumber(o?.price) - asMoneyNumber(o?.cost || o?.costPrice || o?.purchasePrice) - orderExpensesTotal(o);
+  return orderPaidNet(o) - orderExpensesTotal(o);
 }
 function periodStart(period) {
   const now = new Date();
@@ -248,7 +260,7 @@ function buildCrmSummary(period = 'today') {
   const paidOrders = orders.filter(o => orderPaymentStatus(o) === 'paid' || o.status === 'paid' || o.status === 'completed');
   const returns = orders.filter(o => orderPaymentStatus(o) === 'returned' || o.status === 'returned');
   const confirmedOrders = orders.filter(o => o.status === 'confirmed' || o.status === 'shipped' || o.status === 'paid' || o.status === 'completed');
-  const expectedIncome = paidOrders.reduce((s, o) => s + asMoneyNumber(o.price), 0);
+  const expectedIncome = orders.reduce((s, o) => s + orderPaidNet(o), 0);
   const returnsExpense = finance.filter(x => x.type === 'expense' && x.category === 'return').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
   return {
     period,
