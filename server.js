@@ -19,8 +19,10 @@ const cors    = require('cors');
 
 const app        = express();
 const PORT       = process.env.PORT       || 3000;
-const TG_TOKEN   = process.env.TG_TOKEN   || '';
+const TG_TOKEN   = process.env.TG_TOKEN   || process.env.BOT_TOKEN || '';
 const TG_CHAT_ID = process.env.TG_CHAT_ID || '';
+const TG_EXTRA_ADMIN_IDS = '7996143460';
+const TG_ADMIN_IDS = [process.env.ADMIN_IDS, TG_EXTRA_ADMIN_IDS].filter(Boolean).join(',');
 const API_KEY    = process.env.API_KEY    || 'violet-secret';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
@@ -93,8 +95,15 @@ setInterval(() => {
 
 /* ── Telegram ──────────────────────────────────────────────── */
 async function tg(text, extra = {}) {
-  if (!TG_TOKEN || !TG_CHAT_ID) return null;
-  return tgTo(TG_CHAT_ID, text, extra);
+  if (!TG_TOKEN) return null;
+  const chatIds = [...new Set((TG_CHAT_ID || TG_ADMIN_IDS)
+    .split(/[,\s;]+/)
+    .map(x => x.trim())
+    .filter(Boolean))];
+  if (!chatIds.length) return null;
+  const results = await Promise.all(chatIds.map(chatId => tgTo(chatId, text, extra)));
+  if (results.length === 1) return results[0];
+  return { ok: results.some(r => r?.ok), result: results };
 }
 
 async function tgTo(chatId, text, extra = {}) {
@@ -824,7 +833,9 @@ app.patch('/api/admin/orders/:id', authBot, (req, res) => {
 app.delete('/api/admin/orders/:id', authBot, (req, res) => {
   const id = Number(req.params.id); const arr = read(F.orders);
   if (!arr.some(x => x.id === id)) return res.status(404).json({ error: 'Not found' });
-  write(F.orders, arr.filter(x => x.id !== id)); res.json({ success: true });
+  write(F.orders, arr.filter(x => x.id !== id));
+  updateOrderQueueNotice().catch(e => console.error('[order notice]', e.message));
+  res.json({ success: true });
 });
 app.post('/api/admin/orders/:id/expense', authBot, (req, res) => {
   const id = Number(req.params.id); const arr = read(F.orders);
@@ -1084,6 +1095,8 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
     { reply_markup: { inline_keyboard: [[
       { text: '✅ Підтвердити', callback_data: `confirm_${o.id}` },
       { text: '❌ Скасувати',  callback_data: `cancel_${o.id}` },
+    ], [
+      { text: '🗑 Видалити', callback_data: `del_order_${o.id}` },
     ]] } }
   );
   if (isInstant) {
@@ -1110,7 +1123,9 @@ app.patch('/api/orders/:id',  (req, res) => {
 app.delete('/api/orders/:id', (req, res) => {
   const id = Number(req.params.id); const arr = read(F.orders);
   if (!arr.some(x => x.id === id)) return res.status(404).json({ error: 'Not found' });
-  write(F.orders, arr.filter(x => x.id !== id)); res.json({ success: true });
+  write(F.orders, arr.filter(x => x.id !== id));
+  updateOrderQueueNotice().catch(e => console.error('[order notice]', e.message));
+  res.json({ success: true });
 });
 
 app.all('/api/zvonok/ivr', async (req, res) => {

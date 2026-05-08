@@ -307,6 +307,7 @@ function orderDetailKeyboard(o) {
   const rowsByStatus = {
     new: [
       [{ text: '✅ Підтвердити', callback_data: `os_${id}_c` }, { text: '❌ Скасувати', callback_data: `os_${id}_x` }],
+      [{ text: '🗑 Видалити', callback_data: `do_${id}` }],
     ],
     confirmed: [
       [{ text: '📦 Відправлено', callback_data: `oi_${id}_tt` }, { text: '❌ Скасувати', callback_data: `os_${id}_x` }],
@@ -1198,8 +1199,15 @@ bot.on('callback_query', async q => {
 
     if (data.startsWith('do_')) {
       const id = Number(data.slice(3));
+      const order = await serverGet(`/api/admin/orders/${id}`);
+      if (!order || order.error) { await bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB }); return; }
+      if ((order.status || 'new') !== 'new') {
+        await bot.sendMessage(chatId, `ℹ️ Замовлення #${id} вже оброблене, видалення недоступне.`, { reply_markup: MAIN_KB });
+        return;
+      }
       const deleted = await serverDelete(`/api/admin/orders/${id}`);
       if (!deleted || deleted.error) { await bot.sendMessage(chatId, `❌ Не вдалося видалити #${id}.`, { reply_markup: MAIN_KB }); return; }
+      try { await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId }); } catch {}
       await bot.sendMessage(chatId, `🗑 Замовлення #${id} видалено.`, { reply_markup: MAIN_KB });
       return;
     }
@@ -1211,6 +1219,11 @@ bot.on('callback_query', async q => {
       if (!order || order.error) { await bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB }); return; }
       const updated = await serverPatch(`/api/admin/orders/${id}`, { status: isConf ? 'confirmed' : 'cancelled' });
       if (!updated || updated.error) { await bot.sendMessage(chatId, '❌ Не вдалося змінити статус.', { reply_markup: MAIN_KB }); return; }
+      try {
+        await bot.editMessageReplyMarkup({
+          inline_keyboard: [[{ text: '📋 Відкрити замовлення', callback_data: `od_${id}` }]],
+        }, { chat_id: chatId, message_id: msgId });
+      } catch {}
       await bot.sendMessage(chatId,
         `${isConf ? '✅' : '❌'} Замовлення #${id} (${esc(updated.name)}) — <b>${isConf ? 'підтверджено' : 'скасовано'}</b>`,
         { parse_mode: 'HTML', reply_markup: MAIN_KB });
@@ -1219,8 +1232,15 @@ bot.on('callback_query', async q => {
 
     if (data.startsWith('del_order_')) {
       const id = Number(data.slice(10));
+      const order = await serverGet(`/api/admin/orders/${id}`);
+      if (!order || order.error) { await bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB }); return; }
+      if ((order.status || 'new') !== 'new') {
+        await bot.sendMessage(chatId, `ℹ️ Замовлення #${id} вже оброблене, видалення недоступне.`, { reply_markup: MAIN_KB });
+        return;
+      }
       const deleted = await serverDelete(`/api/admin/orders/${id}`);
       if (!deleted || deleted.error) { await bot.sendMessage(chatId, `❌ Не вдалося видалити #${id}.`, { reply_markup: MAIN_KB }); return; }
+      try { await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId }); } catch {}
       await bot.sendMessage(chatId, `🗑 Замовлення #${id} видалено.`, { reply_markup: MAIN_KB });
       return;
     }
