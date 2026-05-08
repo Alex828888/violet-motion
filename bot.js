@@ -302,46 +302,51 @@ async function showOrders(chatId, page = 1, filter = null, msgId = null) {
   reply(chatId, text, ordersKeyboard(items, p, total, filter), msgId);
 }
 
+function orderDetailKeyboard(o) {
+  const id = o.id;
+  const rowsByStatus = {
+    new: [
+      [{ text: '✅ Підтвердити', callback_data: `os_${id}_c` }, { text: '❌ Скасувати', callback_data: `os_${id}_x` }],
+    ],
+    confirmed: [
+      [{ text: '📦 Відправлено', callback_data: `oi_${id}_tt` }, { text: '❌ Скасувати', callback_data: `os_${id}_x` }],
+    ],
+    shipped: [
+      [{ text: '💸 Оплачено', callback_data: `os_${id}_p` }, { text: '↩️ Повернення', callback_data: `os_${id}_r` }],
+      [{ text: '✏️ Змінити ТТН', callback_data: `oi_${id}_tt` }],
+    ],
+    paid: [
+      [{ text: '✅ Завершено', callback_data: `os_${id}_d` }, { text: '↩️ Повернення', callback_data: `os_${id}_r` }],
+    ],
+    cancelled: [],
+    completed: [],
+    returned: [],
+  };
+  const rows = rowsByStatus[o.status || 'new'] || [];
+  return { inline_keyboard: [...rows, [{ text: '← До списку', callback_data: 'orders' }]] };
+}
+
 async function showOrderDetail(chatId, id, msgId = null) {
   const o = await serverGet(`/api/admin/orders/${id}`);
   if (!o || o.error) return bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB });
   const price = asNumber(o.price);
-  const cost = asNumber(o.cost || o.costPrice || o.purchasePrice);
-  const expenses = orderExpensesTotal(o);
-  const profit = orderProfit(o);
-  const comment = o.managerComment || o.comment || o.adminComment || '';
   const text =
     `📋 <b>Замовлення #${o.id}</b>\n━━━━━━━━━━━━━━━\n` +
     `🆔 ID: <b>${esc(o.id)}</b>\n` +
-    `🛍 Товар: <b>${esc(o.product || '—')}</b>\n` +
     `👤 Ім'я: <b>${esc(o.name || '—')}</b>\n` +
     `📱 Телефон: <b>${esc(o.phone || '—')}</b>\n` +
+    `🛍 Товар: <b>${esc(o.product || '—')}</b>\n` +
     `👟 Розмір: <b>${esc(o.size || '—')}</b>\n` +
     `🎨 Колір: <b>${esc(o.color || '—')}</b>\n` +
-    `💵 Ціна продажу: <b>${money(price)}</b>\n` +
-    `🏷 Собівартість: <b>${money(cost)}</b>\n` +
-    `➕ Додаткові витрати: <b>${money(expenses)}</b>\n` +
-    `📈 Чистий прибуток: <b>${money(profit)}</b>\n` +
+    `💵 Ціна: <b>${money(price)}</b>\n` +
     `🏷 Статус замовлення: ${statusEmoji(o.status)} <b>${esc(o.status || 'new')}</b>\n` +
     `💳 Статус оплати: <b>${esc(paymentLabel(o))}</b>\n` +
     `🚚 ТТН: <code>${esc(o.ttn || '—')}</code>\n` +
     `📦 Статус доставки: <b>${esc(deliveryLabel(o))}</b>\n` +
-    `📅 Дата створення: <b>${fmtDate(o.createdAt)}</b>\n` +
-    `📝 Коментар менеджера: <i>${esc(comment || '—')}</i>\n` +
-    (o.contactViaTelegram ? `💬 Зв'язок: Telegram\n` : `📞 Зв'язок: Дзвінок\n`) +
-    `🚦 Тип: ${orderModeLabel(o)}\n` +
+    `📅 Дата: <b>${fmtDate(o.createdAt)}</b>\n` +
     deliveryBlock(o) +
     `━━━━━━━━━━━━━━━`;
-  reply(chatId, text, { inline_keyboard: [
-    [{ text: '✅ Підтвердити', callback_data: `os_${o.id}_c` }, { text: '❌ Скасувати', callback_data: `os_${o.id}_x` }],
-    [{ text: '📦 Відправлено', callback_data: `oi_${o.id}_tt` }, { text: '💸 Оплачено', callback_data: `os_${o.id}_p` }],
-    [{ text: '↩️ Повернення', callback_data: `os_${o.id}_r` }, { text: '✅ Завершено', callback_data: `os_${o.id}_d` }],
-    [{ text: '✏️ Ціна', callback_data: `oi_${o.id}_pr` }, { text: '✏️ Собівартість', callback_data: `oi_${o.id}_co` }],
-    [{ text: '➕ Витрата', callback_data: `oi_${o.id}_ex` }, { text: '📝 Коментар', callback_data: `oi_${o.id}_cm` }],
-    [{ text: '🔍 Перевірити ТТН', callback_data: `nt_${o.id}` }, { text: '✏️ Змінити ТТН', callback_data: `oi_${o.id}_tt` }],
-    [{ text: '🗑 Видалити', callback_data: `do_${o.id}` }],
-    [{ text: '← До списку', callback_data: 'orders' }],
-  ]}, msgId);
+  reply(chatId, text, orderDetailKeyboard(o), msgId);
 }
 
 /* ═══════════════════════════════════════════════════════════
