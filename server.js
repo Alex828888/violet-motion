@@ -32,11 +32,20 @@ const ZVONOK_API_KEY = process.env.ZVONOK_API_KEY || '';
 const ZVONOK_CAMPAIGN_ID = process.env.ZVONOK_CAMPAIGN_ID || '';
 const ZVONOK_WEBHOOK_SECRET = process.env.ZVONOK_WEBHOOK_SECRET || '';
 const ZVONOK_CALL_URL = 'https://zvonok.com/manager/cabapi_external/api/v1/phones/call/';
+const SHOP_NAME = process.env.SHOP_NAME || 'Violet Motion';
+const PRODUCT_NAME = process.env.PRODUCT_NAME || 'Violet Motion sneakers';
+const PRODUCT_DESCRIPTION = process.env.PRODUCT_DESCRIPTION || 'women\'s sneakers, soft violet edition, white / light-violet style';
+const PRODUCT_UPPER = process.env.PRODUCT_UPPER || 'eco-leather plus breathable mesh';
+const PRODUCT_SOLE = process.env.PRODUCT_SOLE || 'light, cushioned, comfortable for walking';
+const PRODUCT_BEST_FOR = process.env.PRODUCT_BEST_FOR || 'daily wear, city walks, travel, spring, summer, and warm autumn';
+const PRODUCT_PRICE = process.env.PRODUCT_PRICE || '895';
+const PRODUCT_OLD_PRICE = process.env.PRODUCT_OLD_PRICE || '1899';
 
 app.set('trust proxy', 1);
 
 /* ── Data files ────────────────────────────────────────────── */
 const ROOT = __dirname;
+const PUBLIC_ROOT = path.resolve(ROOT, process.env.LANDING_DIR || '.');
 const DEFAULT_DATA = path.join(ROOT, 'data');
 const DATA = path.resolve(process.env.DATA_DIR || DEFAULT_DATA);
 const F = {
@@ -178,11 +187,11 @@ app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 /* ── Static files ──────────────────────────────────────────── */
-app.get('/style.css',  (_req, res) => { res.type('text/css'); res.sendFile(path.join(ROOT, 'style.css')); });
-app.get('/script.js',  (_req, res) => { res.type('application/javascript'); res.sendFile(path.join(ROOT, 'script.js')); });
+app.get('/style.css',  (_req, res) => { res.type('text/css'); res.sendFile(path.join(PUBLIC_ROOT, 'style.css')); });
+app.get('/script.js',  (_req, res) => { res.type('application/javascript'); res.sendFile(path.join(PUBLIC_ROOT, 'script.js')); });
 app.get('/favicon.ico', (_req, res) => res.status(204).end());
 
-app.use(express.static(ROOT, {
+app.use(express.static(PUBLIC_ROOT, {
   extensions: false, fallthrough: true,
   setHeaders: (res, filePath) => {
     const ext = path.extname(filePath).toLowerCase();
@@ -352,16 +361,16 @@ const SUPPORT_SIZE_CHART = {
   40: '25 см',
 };
 const SUPPORT_AI_SYSTEM_PROMPT = `
-You are the Violet Motion store support assistant and first-line manager.
+You are the ${SHOP_NAME} store support assistant and first-line manager.
 Answer customers in the same language they use: Ukrainian, Russian, or simple mixed UA/RU. Be warm, concise, and practical.
 
 Store facts you may use:
-- Product: Violet Motion women's sneakers, soft violet edition, white / light-violet style.
-- Upper: eco-leather plus breathable mesh. Sole: light, cushioned, comfortable for walking.
-- Best for: daily wear, city walks, travel, spring, summer, and warm autumn.
+- Product: ${PRODUCT_NAME}, ${PRODUCT_DESCRIPTION}.
+- Upper: ${PRODUCT_UPPER}. Sole: ${PRODUCT_SOLE}.
+- Best for: ${PRODUCT_BEST_FOR}.
 - Sizes on site: 36, 37, 38, 39, 40.
 - Insole length chart: 36 = 23 cm, 37 = 23.5 cm, 38 = 24 cm, 39 = 24.5 cm, 40 = 25 cm.
-- Promo price: 895 UAH. Old price: 1,899 UAH. Discount: 53%.
+- Promo price: ${PRODUCT_PRICE} UAH. Old price: ${PRODUCT_OLD_PRICE} UAH.
 - Payment: only after inspection/fitting on delivery, no prepayment.
 - Delivery: Nova Poshta across Ukraine.
 - Exchange: 14 days.
@@ -373,7 +382,7 @@ Rules:
 - Do not invent unavailable facts such as exact delivery price, exact stock per size, or guarantees not listed above.
 - Do not ask for a human operator if you can answer from the facts.
 - Request a human only when the customer explicitly asks for a person/operator/manager, complains about an existing order, asks to change/cancel an order, or sends unclear context after one short clarification would not be enough.
-- For spam, random letters, insults, adult/sexual questions, tests, and unrelated topics, do not request a human. Use action "answer" and briefly say that you only help with Violet Motion sneakers, sizes, price, delivery, payment, exchange, or ordering.
+- For spam, random letters, insults, adult/sexual questions, tests, and unrelated topics, do not request a human. Use action "answer" and briefly say that you only help with ${PRODUCT_NAME}, sizes, price, delivery, payment, exchange, or ordering.
 - If a customer asks for a fact not listed here, do not invent it. Use action "answer", say what is known, and offer to leave the question for a manager only if they want.
 - Never collect full personal data in chat. Direct the customer to the order form for name, phone, and size.
 
@@ -421,10 +430,10 @@ function wantsHumanOperator(text) {
 function offTopicSupportReply(text) {
   const msg = String(text || '').toLowerCase();
   if (/(дроч|мастурб|секс|порн|хуй|хуя|пизд|піс[ья]|соси|еба|їба|fuck|sex|porn|dick|cock|pussy)/i.test(msg)) {
-    return 'Я допомагаю тільки з кросівками Violet Motion: розмір, устілка, ціна, доставка, оплата або оформлення замовлення.';
+    return `Я допомагаю тільки з ${PRODUCT_NAME}: розмір, устілка, ціна, доставка, оплата або оформлення замовлення.`;
   }
   if (/(політик|крипт|казино|ставк|наркот|збро|оруж|домашк|реферат|анекдот|погода|курс валют)/i.test(msg)) {
-    return 'Я можу підказати тільки по Violet Motion: розміри, устілка, ціна, доставка, оплата, обмін або замовлення.';
+    return `Я можу підказати тільки по ${PRODUCT_NAME}: розміри, устілка, ціна, доставка, оплата, обмін або замовлення.`;
   }
   return null;
 }
@@ -448,7 +457,7 @@ function localSupportReply(text) {
   }
 
   if (/(ціна|цена|скільки кошту|сколько сто|вартість|стоимость|price|грн|895)/i.test(msg)) {
-    return `Зараз акційна ціна Violet Motion — 895 грн замість 1 899 грн. Передоплати немає: оплата після огляду та примірки на Новій Пошті.`;
+    return `Зараз акційна ціна ${PRODUCT_NAME} — ${PRODUCT_PRICE} грн замість ${PRODUCT_OLD_PRICE} грн. Передоплати немає: оплата після огляду та примірки на Новій Пошті.`;
   }
 
   if (/(достав|нова пошта|новою поштою|посилк|відправ|отправ|delivery)/i.test(msg)) {
@@ -467,8 +476,8 @@ function localSupportReply(text) {
     return `Щоб оформити замовлення, оберіть розмір на сайті й залиште ім'я та телефон у формі. Менеджер підтвердить деталі. Можна обрати зв'язок через Telegram без дзвінка.`;
   }
 
-  if (/(матеріал|материал|якість|качество|верх|підош|подош|колір|цвет|крос)/i.test(msg)) {
-    return `Violet Motion — жіночі кросівки у білому / світло-фіолетовому стилі. Верх: еко-шкіра + дихаюча сітка, підошва легка й амортизуюча, зручні для щоденної ходьби.`;
+  if (/(матеріал|материал|якість|качество|верх|підош|подош|колір|цвет|крос|сандал)/i.test(msg)) {
+    return `${PRODUCT_NAME}: ${PRODUCT_DESCRIPTION}. Верх: ${PRODUCT_UPPER}, підошва: ${PRODUCT_SOLE}.`;
   }
 
   return null;
@@ -1367,18 +1376,19 @@ app.patch('/api/support/:id',  (req, res) => {
 });
 
 /* ── Frontend fallback ─────────────────────────────────────── */
-app.get('/', (_req, res) => { res.type('text/html'); res.sendFile(path.join(ROOT, 'index.html')); });
+app.get('/', (_req, res) => { res.type('text/html'); res.sendFile(path.join(PUBLIC_ROOT, 'index.html')); });
 app.get('*', (req, res, next) => {
   if (req.path.startsWith('/api/')) return next();
-  const possibleFile = path.join(ROOT, req.path);
+  const possibleFile = path.join(PUBLIC_ROOT, req.path);
   if (fs.existsSync(possibleFile) && fs.statSync(possibleFile).isFile())
     return res.sendFile(possibleFile);
   res.type('text/html');
-  res.sendFile(path.join(ROOT, 'index.html'));
+  res.sendFile(path.join(PUBLIC_ROOT, 'index.html'));
 });
 
 app.listen(PORT, () => {
-  console.log(`🟣 Violet Motion → http://localhost:${PORT}`);
+  console.log(`🟣 ${SHOP_NAME} → http://localhost:${PORT}`);
+  console.log(`🖥️  Landing directory: ${PUBLIC_ROOT}`);
   if (!TG_TOKEN) console.warn('⚠️  TG_TOKEN not set — Telegram disabled');
   console.log(`🔑 API key: ${API_KEY}`);
 });

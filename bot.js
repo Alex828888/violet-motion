@@ -211,7 +211,7 @@ function paymentScopeLabel(scope) {
 function paymentScopeKeyboard(id) {
   return { inline_keyboard: [
     [{ text: '✅ Обидва товари', callback_data: `pay_${id}_both` }],
-    [{ text: '👟 Тільки кросівки', callback_data: `pay_${id}_base` }],
+    [{ text: '🛍 Тільки товар', callback_data: `pay_${id}_base` }],
     [{ text: '➕ Тільки апселл', callback_data: `pay_${id}_upsell` }],
     [{ text: '← До замовлення', callback_data: `od_${id}` }],
   ] };
@@ -219,7 +219,7 @@ function paymentScopeKeyboard(id) {
 function returnScopeKeyboard(id) {
   return { inline_keyboard: [
     [{ text: '↩️ Повернення обох', callback_data: `ret_${id}_both` }],
-    [{ text: '👟 Повернення кросівок', callback_data: `ret_${id}_base` }],
+    [{ text: '🛍 Повернення товару', callback_data: `ret_${id}_base` }],
     [{ text: '➕ Повернення апселлу', callback_data: `ret_${id}_upsell` }],
     [{ text: '← До замовлення', callback_data: `od_${id}` }],
   ] };
@@ -879,7 +879,7 @@ async function settleOrderPayment(chatId, orderId, scope, baseCost = null, msgId
     const { net } = await addNetIncome(orderId, `Чистий дохід замовлення #${orderId}`, order.price, effectiveBaseCost);
     patch.baseIncomePosted = true;
     patch.basePaidAt = now;
-    lines.push(`👟 Кросівки: ${money(order.price)} - ${money(effectiveBaseCost)} = <b>${money(net)}</b>`);
+    lines.push(`🛍 Товар: ${money(order.price)} - ${money(effectiveBaseCost)} = <b>${money(net)}</b>`);
   }
 
   if (includeUpsell && upsell && !upsell.incomePosted) {
@@ -1340,7 +1340,7 @@ bot.on('callback_query', async q => {
       if (!order || order.error) { await bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB }); return; }
       if ((scope === 'base' || scope === 'both') && !asNumber(order.cost)) {
         setCrmPending(chatId, 'paid_cost', id, { scope });
-        await bot.sendMessage(chatId, '🏷 Впишіть собівартість кросівок:');
+        await bot.sendMessage(chatId, '🏷 Впишіть собівартість товару:');
         return;
       }
       await settleOrderPayment(chatId, id, scope, null, msgId);
