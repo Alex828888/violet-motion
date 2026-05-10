@@ -1061,6 +1061,7 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
   const {
     name, phone, size, color, product, price, contactViaTelegram,
     orderMode, fullName, city, district, postOffice, delivery,
+    replaceOrderId, clientOrderKey,
   } = req.body;
   if (!name || !phone || !size) return res.status(400).json({ error: 'Missing fields' });
 
@@ -1070,6 +1071,7 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
   const cleanColor = sanitizeStr(color, 40);
   const cleanProduct = sanitizeStr(product, 100);
   const cleanPrice = sanitizeStr(price, 20);
+  const cleanClientOrderKey = sanitizeStr(clientOrderKey, 80);
   const cleanOrderMode = sanitizeStr(orderMode, 20) === 'instant' ? 'instant' : 'manual';
   const deliveryData = delivery && typeof delivery === 'object' ? delivery : {};
   const cleanFullName = sanitizeStr(fullName || deliveryData.fullName || deliveryData.name, 140);
@@ -1082,17 +1084,38 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
     return res.status(400).json({ error: 'Missing delivery fields' });
 
   const orders = read(F.orders);
+  if (cleanOrderMode === 'manual' && cleanClientOrderKey) {
+    const existing = orders.find(x => x.clientOrderKey === cleanClientOrderKey);
+    if (existing) return res.json({ success: true, id: existing.id, duplicate: true });
+  }
+  let activeOrders = orders;
+  let replacedOrderId = null;
+  const replaceId = Number(replaceOrderId || 0);
+  if (cleanOrderMode === 'instant' && replaceId) {
+    const replaceIdx = orders.findIndex(x => (
+      x.id === replaceId &&
+      (x.status || 'new') === 'new' &&
+      (x.orderMode || 'manual') === 'manual' &&
+      String(x.phone || '').replace(/\D/g, '') === cleanPhone.replace(/\D/g, '')
+    ));
+    if (replaceIdx >= 0) {
+      replacedOrderId = orders[replaceIdx].id;
+      activeOrders = orders.filter(x => x.id !== replacedOrderId);
+    }
+  }
   const o = {
     id: nextId(orders), name: cleanName, phone: cleanPhone, size: cleanSize,
     color: cleanColor || null, product: cleanProduct || null, price: cleanPrice || null,
+    clientOrderKey: cleanClientOrderKey || null,
     orderMode: cleanOrderMode,
+    replacedOrderId,
     fullName: cleanFullName || null,
     city: cleanCity || null,
     district: cleanDistrict || null,
     postOffice: cleanPostOffice || null,
     contactViaTelegram: !!contactViaTelegram, status: 'new', createdAt: new Date().toISOString(),
   };
-  orders.push(o); write(F.orders, orders);
+  activeOrders.push(o); write(F.orders, activeOrders);
   await updateOrderQueueNotice(o);
 
   const ts = new Date(o.createdAt).toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' });
@@ -1112,6 +1135,7 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
     (isInstant
       ? `✅ Тип: <b>оформлено одразу</b>\n🤖 ZVONOK: <b>запускаємо автоматичне підтвердження</b>\n`
       : `👩‍💼 Обробка: <b>передзвонить менеджер, без ZVONOK</b>\n`) +
+    (replacedOrderId ? `🔁 Попередню заявку #${replacedOrderId} видалено\n` : '') +
     `📅 ${ts}\n━━━━━━━━━━━━━━━━━━`,
     { reply_markup: { inline_keyboard: [[
       { text: '✅ Підтвердити', callback_data: `confirm_${o.id}` },

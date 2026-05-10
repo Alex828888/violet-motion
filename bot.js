@@ -105,7 +105,7 @@ function stars(n)     { return '★'.repeat(n) + '☆'.repeat(5 - n); }
 function statusEmoji(s) {
   return {
     new: '🆕', confirmed: '✅', cancelled: '❌', shipped: '📦',
-    paid: '💸', returned: '↩️', completed: '✅',
+    paid: '💸', returned: '↩️', completed: '🏁',
   }[s] || '❔';
 }
 function fmtDate(iso) {

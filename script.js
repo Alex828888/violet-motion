@@ -454,12 +454,15 @@ const orderSuccessSub    = document.querySelector('.success-sub');
 let pendingOrder         = null;
 let successOrderSent     = false;
 let successOrderSending  = false;
+let pendingManualOrderId = null;
+let instantOrderSent     = false;
+let pendingOrderKey      = '';
 
 function showSuccessOverlay(order) {
   successDetails.innerHTML =
     `👤 <b>${esc(order.name)}</b><br />📱 <b>${esc(order.phone)}</b><br />👟 Розмір: <b>${esc(order.size)}</b><br />🚚 Доставка: Нова Пошта`;
   if (orderSuccessSub) {
-    orderSuccessSub.innerHTML = 'Заявку підготували.<br />Натисніть “Закрити” — і ми передамо її менеджеру.';
+    orderSuccessSub.innerHTML = 'Заявку вже передаємо менеджеру.<br />Можете закрити вікно або оформити одразу.';
   }
   if (successCloseBtn) {
     successCloseBtn.disabled = false;
@@ -493,7 +496,11 @@ function resetOrderForm() {
 }
 
 async function sendPendingOrder(mode, extra = {}) {
-  if (!pendingOrder || successOrderSending || successOrderSent) return false;
+  if (!pendingOrder || successOrderSending) return false;
+  if (mode === 'manual' && pendingManualOrderId) {
+    return { success: true, id: pendingManualOrderId, payload: { ...pendingOrder, orderMode: 'manual' } };
+  }
+  if (mode === 'instant' && instantOrderSent) return false;
   successOrderSending = true;
   if (successCloseBtn) successCloseBtn.disabled = true;
   if (instantOrderBtn) instantOrderBtn.disabled = true;
@@ -511,6 +518,8 @@ async function sendPendingOrder(mode, extra = {}) {
     district,
     postOffice,
     delivery: { fullName, city, district, postOffice },
+    replaceOrderId: mode === 'instant' ? pendingManualOrderId : null,
+    clientOrderKey: pendingOrderKey,
     product: 'Violet Motion Sneakers',
     price: '895',
   };
@@ -531,7 +540,26 @@ async function sendPendingOrder(mode, extra = {}) {
     return false;
   }
 
+  if (mode === 'manual') {
+    pendingManualOrderId = result.id;
+    successOrderSending = false;
+    if (orderSuccessSub) {
+      orderSuccessSub.innerHTML = 'Заявку передано менеджеру.<br />Можете закрити вікно або оформити одразу.';
+    }
+    if (successCloseBtn) {
+      successCloseBtn.disabled = false;
+      successCloseBtn.textContent = 'ЗАКРИТИ';
+    }
+    if (instantOrderBtn) instantOrderBtn.disabled = false;
+    fbTrack('Lead', { content_name: 'Violet Motion Order', value: 895, currency: 'UAH' });
+    Analytics.track('order_success', { size: pendingOrder.size, mode });
+    return { success: true, id: result.id, payload };
+  }
+
   successOrderSent = true;
+  instantOrderSent = true;
+  pendingManualOrderId = null;
+  pendingOrderKey = '';
   fbTrack('Lead', { content_name: 'Violet Motion Order', value: 895, currency: 'UAH' });
   ttTrack('Purchase', { content_type: 'product', content_ids: ['violet-motion-001'], content_name: 'Violet Motion Sneakers', value: 895, currency: 'UAH', quantity: 1 });
   Analytics.track('order_success', { size: pendingOrder.size, mode });
@@ -541,7 +569,7 @@ async function sendPendingOrder(mode, extra = {}) {
 }
 
 successCloseBtn.addEventListener('click', async () => {
-  if (successOrderSent || !pendingOrder) return closeSuccessOverlay();
+  if (!pendingOrder || pendingManualOrderId || successOrderSent) return closeSuccessOverlay();
   const sent = await sendPendingOrder('manual');
   if (sent) closeSuccessOverlay();
 });
@@ -594,7 +622,7 @@ function askQuickStep(runId = quickOrderRunId) {
 }
 
 function openQuickOrderChat() {
-  if (!pendingOrder || successOrderSent) return;
+  if (!pendingOrder || instantOrderSent) return;
   if (quickOrderOverlay.classList.contains('visible')) return;
   quickOrderRunId++;
   quickOrderStep = 0;
@@ -718,7 +746,25 @@ document.getElementById('orderForm').addEventListener('submit', async e => {
   pendingOrder = { name, phone, size, contactViaTelegram: viaTg };
   successOrderSent = false;
   successOrderSending = false;
+  pendingManualOrderId = null;
+  instantOrderSent = false;
+  pendingOrderKey = `order_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   showSuccessOverlay(pendingOrder);
+  sendPendingOrder('manual');
+});
+
+window.addEventListener('beforeunload', () => {
+  if (!pendingOrder || pendingManualOrderId || instantOrderSent || !pendingOrderKey || !navigator.sendBeacon) return;
+  const payload = {
+    ...pendingOrder,
+    orderMode: 'manual',
+    clientOrderKey: pendingOrderKey,
+    product: 'Violet Motion Sneakers',
+    price: '895',
+  };
+  try {
+    navigator.sendBeacon('/api/order', new Blob([JSON.stringify(payload)], { type: 'application/json' }));
+  } catch {}
 });
 
 /* ══════════════════════════════════════════════════════════════
