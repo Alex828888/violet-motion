@@ -92,6 +92,39 @@ function normalizePhone(phone) {
   return digits;
 }
 
+function normalizeCityQuery(value) {
+  let text = String(value || '').trim();
+  if (!text) return '';
+  text = text
+    .replace(/\b(україна|украина|ukraine)\b/ig, ' ')
+    .replace(/\b(закарпатська|волинська|львівська|івано-франківська|тернопільська|рівненська|чернівецька|хмельницька|житомирська|вінницька|київська|черкаська|кіровоградська|полтавська|сумська|чернігівська|харківська|луганська|донецька|дніпропетровська|запорізька|херсонська|миколаївська|одеська)\s+область\b/ig, ' ')
+    .replace(/\b(область|обл\.?|район|р-н)\b/ig, ' ')
+    .replace(/\b(місто|город|м\.|г\.)\b/ig, ' ')
+    .replace(/[,\.;]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const match = text.match(/(?:місто|город|м\.|г\.)\s*([А-ЯІЇЄҐA-Z][\p{L}'’ʼ-]+)/iu);
+  if (match?.[1]) return match[1].trim();
+  const tokens = text.split(/\s+/).filter(Boolean);
+  return tokens.length > 1 ? tokens[tokens.length - 1] : text;
+}
+
+function normalizeWarehouseQuery(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return { raw: '', number: '', search: '' };
+  const number = raw.match(/\d+/)?.[0] || '';
+  const withoutNoise = raw
+    .replace(/відділення|отделение|номер|№|#|нп|нова\s+пошта|нової\s+пошти/ig, ' ')
+    .replace(/[,\.;:]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return {
+    raw,
+    number,
+    search: number || withoutNoise || raw,
+  };
+}
+
 function todayNpDate() {
   const now = new Date();
   return formatNpDate(now);
@@ -374,7 +407,7 @@ async function resolveSenderConfig() {
 }
 
 async function resolveCity(cityName) {
-  const query = String(cityName || '').trim();
+  const query = normalizeCityQuery(cityName);
   if (!query) throw new NovaPoshtaError('Recipient city is required');
   const cacheKey = query.toLowerCase();
   const cached = cacheGet(cityCache, cacheKey);
@@ -394,30 +427,51 @@ async function resolveCity(cityName) {
 
   const cities = await callNovaPoshta('Address', 'getCities', { FindByString: query, Limit: 10 });
   const city = cities.data?.[0] || null;
-  if (!city?.Ref) throw new NovaPoshtaError('Nova Poshta city was not found', { city: query });
+  if (!city?.Ref) throw new NovaPoshtaError('Nova Poshta city was not found', { city: query, originalCity: cityName });
   return cacheSet(cityCache, cacheKey, { ref: city.Ref, settlementRef: city.SettlementRef || null, description: city.Description || query, raw: city });
 }
 
 async function resolveWarehouse(cityRef, warehouseQuery) {
-  const query = String(warehouseQuery || '').trim();
+  const normalized = normalizeWarehouseQuery(warehouseQuery);
+  const query = normalized.search;
   if (!cityRef) throw new NovaPoshtaError('Recipient city ref is required');
   if (!query) throw new NovaPoshtaError('Recipient warehouse is required');
   const cacheKey = `${cityRef}:${query.toLowerCase()}`;
   const cached = cacheGet(warehouseCache, cacheKey);
   if (cached) return cached;
 
-  const result = await callNovaPoshta('Address', 'getWarehouses', {
-    CityRef: cityRef,
-    FindByString: query,
-    Limit: 50,
-    Page: 1,
-  });
-  const digits = query.match(/\d+/)?.[0] || '';
-  const list = result.data || [];
+  const digits = normalized.number || query.match(/\d+/)?.[0] || '';
+  const attempts = [...new Set([query, normalized.raw, digits].filter(Boolean))];
+  let list = [];
+  for (const search of attempts) {
+    const result = await callNovaPoshta('Address', 'getWarehouses', {
+      CityRef: cityRef,
+      FindByString: search,
+      Limit: 50,
+      Page: 1,
+    });
+    list = result.data || [];
+    if (list.length) break;
+  }
+  if (!list.length && digits) {
+    const result = await callNovaPoshta('Address', 'getWarehouses', {
+      CityRef: cityRef,
+      Limit: 500,
+      Page: 1,
+    });
+    list = result.data || [];
+  }
   const exact = list.find(w => digits && String(w.Number) === digits);
-  const fallback = list[0] || null;
-  const warehouse = exact || fallback;
-  if (!warehouse?.Ref) throw new NovaPoshtaError('Nova Poshta warehouse was not found', { warehouse: query });
+  const byDescription = list.find(w => digits && new RegExp(`(?:№|N|номер|відділення|отделение)?\\s*${digits}\\b`, 'i').test(`${w.Description || ''} ${w.ShortAddress || ''}`));
+  const fallback = list.length === 1 ? list[0] : null;
+  const warehouse = exact || byDescription || fallback;
+  if (!warehouse?.Ref) throw new NovaPoshtaError('Nova Poshta warehouse was not found', {
+    warehouse: normalized.raw || query,
+    normalizedWarehouse: query,
+    number: digits,
+    cityRef,
+    checked: list.length,
+  });
   return cacheSet(warehouseCache, cacheKey, {
     ref: warehouse.Ref,
     number: warehouse.Number || digits || '',

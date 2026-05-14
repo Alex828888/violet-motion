@@ -457,8 +457,15 @@ function apiErrorMessage(result, fallback) {
   const retry = result?.rateLimited || result?.retryable
     ? '\n\nЗачекайте трохи і натисніть кнопку ще раз. Повторно багато разів підряд натискати не треба.'
     : '';
+  const warehouseHint = result?.details?.warehouse
+    ? `\nНе знайдено відділення: <code>${esc(result.details.warehouse)}</code>` +
+      (result.details.number ? `\nНомер: <code>${esc(result.details.number)}</code>` : '')
+    : '';
+  const cityHint = result?.details?.city || result?.details?.originalCity
+    ? `\nМісто: <code>${esc(result.details.originalCity || result.details.city)}</code>`
+    : '';
   const message = result?.userMessage || result?.error || fallback;
-  return `${fallback}${missing}\n${esc(message)}${detailsErrors}${retry}`;
+  return `${fallback}${missing}\n${esc(message)}${cityHint}${warehouseHint}${detailsErrors}${retry}`;
 }
 
 /* ═══════════════════════════════════════════════════════════
