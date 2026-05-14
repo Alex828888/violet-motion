@@ -271,6 +271,52 @@ function inPeriod(iso, period) {
   const t = new Date(iso || 0).getTime();
   return Number.isFinite(t) && t >= start.getTime();
 }
+const PRODUCT_GROUPS = [
+  { key: 'violet', label: 'Violet Motion', aliases: ['violet motion', 'violet-motion', 'violet motion sneakers', 'violet sneakers'] },
+  { key: 'black',  label: 'Black Breeze',  aliases: ['black breeze', 'black-breeze'] },
+];
+function normalizeProductName(value) {
+  return String(value || '').toLowerCase().replace(/ё/g, 'е').replace(/[\s_-]+/g, ' ').trim();
+}
+function productGroupKey(product) {
+  const value = normalizeProductName(product);
+  if (!value) return 'other';
+  const found = PRODUCT_GROUPS.find(p => p.aliases.some(alias => value.includes(alias)));
+  return found ? found.key : 'other';
+}
+function productGroupLabel(key) {
+  if (!key || key === 'all') return 'Усі товари';
+  const found = PRODUCT_GROUPS.find(p => p.key === key);
+  return found ? found.label : 'Інші / без товару';
+}
+function buildProductBreakdown(orders) {
+  const map = new Map([...PRODUCT_GROUPS.map(p => p.key), 'other'].map(key => [key, {
+    key,
+    label: productGroupLabel(key),
+    orders: 0,
+    newOrders: 0,
+    confirmedOrders: 0,
+    shippedOrders: 0,
+    paidOrders: 0,
+    returns: 0,
+    withoutTtn: 0,
+    unpaid: 0,
+    expectedIncome: 0,
+  }]));
+  orders.forEach(o => {
+    const item = map.get(productGroupKey(o.product)) || map.get('other');
+    item.orders += 1;
+    if (o.status === 'new') item.newOrders += 1;
+    if (['confirmed', 'shipped', 'paid', 'completed'].includes(o.status)) item.confirmedOrders += 1;
+    if (o.status === 'shipped') item.shippedOrders += 1;
+    if (orderPaymentStatus(o) === 'paid' || o.status === 'paid' || o.status === 'completed') item.paidOrders += 1;
+    if (orderPaymentStatus(o) === 'returned' || o.status === 'returned') item.returns += 1;
+    if (!o.ttn) item.withoutTtn += 1;
+    if (orderPaymentStatus(o) !== 'paid') item.unpaid += 1;
+    item.expectedIncome += orderPaidNet(o);
+  });
+  return [...map.values()].filter(x => x.orders > 0);
+}
 function buildCrmSummary(period = 'today') {
   const orders = read(F.orders).filter(o => inPeriod(o.createdAt, period));
   const finance = read(F.finance).filter(x => inPeriod(x.createdAt, period));
@@ -304,6 +350,7 @@ function buildCrmSummary(period = 'today') {
     leadCost: orders.length ? adsExpense / orders.length : 0,
     confirmedOrderCost: confirmedOrders.length ? adsExpense / confirmedOrders.length : 0,
     paidOrderCost: paidOrders.length ? adsExpense / paidOrders.length : 0,
+    products: buildProductBreakdown(orders),
   };
 }
 
@@ -517,7 +564,7 @@ async function updateOrderQueueNotice(latestOrder = null) {
   const latestId = latestOrder?.id || null;
   const keyboard = { reply_markup: { inline_keyboard: [
     ...(latestId ? [[{ text: `Відкрити #${latestId}`, callback_data: `od_${latestId}` }]] : []),
-    [{ text: '📦 Всі замовлення', callback_data: 'orders' }],
+    [{ text: '📦 Всі замовлення', callback_data: 'orders' }, { text: '🚚 Відстеження', callback_data: 'track_menu' }],
   ] } };
   const text = orderQueueNoticeText(latestOrder);
 
@@ -1450,6 +1497,9 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
     { reply_markup: { inline_keyboard: [[
       { text: '✅ Підтвердити', callback_data: `confirm_${o.id}` },
       { text: '❌ Скасувати',  callback_data: `cancel_${o.id}` },
+    ], [
+      { text: '📋 Відкрити', callback_data: `od_${o.id}` },
+      { text: '🚚 Відстеження', callback_data: 'track_menu' },
     ], [
       { text: '🗑 Видалити', callback_data: `del_order_${o.id}` },
     ]] } }
