@@ -2,6 +2,16 @@
 
 const NP_API_URL = process.env.NP_API_URL || 'https://api.novaposhta.ua/v2.0/json/';
 const NP_API_KEY = process.env.NOVA_POSHTA_API_KEY || process.env.NP_API_KEY || '';
+const NP_TIMEOUT_MS = Number(process.env.NP_TIMEOUT_MS || 15000);
+const NP_MIN_INTERVAL_MS = Math.max(0, Number(process.env.NP_MIN_INTERVAL_MS || 650));
+const NP_MAX_RETRIES = Math.max(0, Number(process.env.NP_MAX_RETRIES || 3));
+const NP_RETRY_BASE_MS = Math.max(250, Number(process.env.NP_RETRY_BASE_MS || 1200));
+const NP_CACHE_TTL_MS = Math.max(0, Number(process.env.NP_CACHE_TTL_MS || 6 * 60 * 60 * 1000));
+
+let novaQueue = Promise.resolve();
+let lastNovaCallAt = 0;
+const cityCache = new Map();
+const warehouseCache = new Map();
 
 class NovaPoshtaError extends Error {
   constructor(message, details = {}) {
@@ -13,6 +23,60 @@ class NovaPoshtaError extends Error {
 
 function env(name, fallback = '') {
   return String(process.env[name] || fallback || '').trim();
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function cacheGet(map, key) {
+  const item = map.get(key);
+  if (!item) return null;
+  if (NP_CACHE_TTL_MS && Date.now() - item.ts > NP_CACHE_TTL_MS) {
+    map.delete(key);
+    return null;
+  }
+  return item.value;
+}
+
+function cacheSet(map, key, value) {
+  if (value) map.set(key, { value, ts: Date.now() });
+  return value;
+}
+
+function isRateLimitPayload(payload, status = 0) {
+  const text = [
+    status,
+    ...(Array.isArray(payload?.errors) ? payload.errors : []),
+    ...(Array.isArray(payload?.warnings) ? payload.warnings : []),
+    ...(Array.isArray(payload?.info) ? payload.info : []),
+    payload?.error,
+    payload?.message,
+  ].filter(Boolean).join(' ').toLowerCase();
+  return status === 429 || /to+\s+many\s+requests|too\s+many\s+requests|rate\s*limit|ліміт|лимит/.test(text);
+}
+
+function isRetryableNovaError(error) {
+  const details = error?.details || {};
+  return !!(details.retryable || details.rateLimited || details.status === 429 || isRateLimitPayload(details.raw, details.status));
+}
+
+function retryDelayMs(attempt) {
+  const jitter = Math.floor(Math.random() * 350);
+  return NP_RETRY_BASE_MS * Math.pow(2, Math.max(0, attempt - 1)) + jitter;
+}
+
+async function reserveNovaSlot() {
+  const previous = novaQueue;
+  let release;
+  novaQueue = new Promise(resolve => { release = resolve; });
+  await previous.catch(() => {});
+  const waitMs = Math.max(0, NP_MIN_INTERVAL_MS - (Date.now() - lastNovaCallAt));
+  if (waitMs) await sleep(waitMs);
+  return () => {
+    lastNovaCallAt = Date.now();
+    release();
+  };
 }
 
 function moneyNumber(value) {
@@ -60,37 +124,70 @@ function splitFullName(value) {
 async function callNovaPoshta(modelName, calledMethod, methodProperties = {}, apiKey = NP_API_KEY) {
   if (!apiKey) throw new NovaPoshtaError('Nova Poshta API key is not configured', { missing: ['NOVA_POSHTA_API_KEY'] });
 
-  const ctrl = new AbortController();
-  const timeout = setTimeout(() => ctrl.abort(), Number(process.env.NP_TIMEOUT_MS || 15000));
-  try {
-    const response = await fetch(NP_API_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal: ctrl.signal,
-      body: JSON.stringify({ apiKey, modelName, calledMethod, methodProperties }),
-    });
-    const text = await response.text();
-    let payload = null;
-    try { payload = JSON.parse(text); } catch {}
-    if (!response.ok) {
-      throw new NovaPoshtaError(`Nova Poshta HTTP ${response.status}`, { status: response.status, body: text.slice(0, 1000) });
-    }
-    if (!payload || payload.success !== true) {
-      throw new NovaPoshtaError('Nova Poshta API returned an error', {
-        modelName, calledMethod,
-        errors: payload?.errors || [],
-        warnings: payload?.warnings || [],
-        info: payload?.info || [],
-        raw: payload,
+  let lastError = null;
+  const attempts = NP_MAX_RETRIES + 1;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const release = await reserveNovaSlot();
+    const ctrl = new AbortController();
+    const timeout = setTimeout(() => ctrl.abort(), NP_TIMEOUT_MS);
+    try {
+      const response = await fetch(NP_API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: ctrl.signal,
+        body: JSON.stringify({ apiKey, modelName, calledMethod, methodProperties }),
       });
+      const text = await response.text();
+      let payload = null;
+      try { payload = JSON.parse(text); } catch {}
+      if (!response.ok) {
+        throw new NovaPoshtaError(`Nova Poshta HTTP ${response.status}`, {
+          modelName, calledMethod,
+          status: response.status,
+          body: text.slice(0, 1000),
+          raw: payload,
+          rateLimited: isRateLimitPayload(payload, response.status),
+          retryable: response.status >= 500 || response.status === 429,
+        });
+      }
+      if (!payload || payload.success !== true) {
+        const rateLimited = isRateLimitPayload(payload, response.status);
+        throw new NovaPoshtaError('Nova Poshta API returned an error', {
+          modelName, calledMethod,
+          errors: payload?.errors || [],
+          warnings: payload?.warnings || [],
+          info: payload?.info || [],
+          raw: payload,
+          rateLimited,
+          retryable: rateLimited,
+        });
+      }
+      return payload;
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        lastError = new NovaPoshtaError('Nova Poshta request timed out', {
+          modelName, calledMethod, retryable: true,
+        });
+      } else {
+        lastError = error;
+      }
+    } finally {
+      clearTimeout(timeout);
+      release();
     }
-    return payload;
-  } catch (error) {
-    if (error.name === 'AbortError') throw new NovaPoshtaError('Nova Poshta request timed out', { modelName, calledMethod });
-    throw error;
-  } finally {
-    clearTimeout(timeout);
+
+    if (attempt < attempts && isRetryableNovaError(lastError)) {
+      const delay = retryDelayMs(attempt);
+      if (lastError?.details) {
+        lastError.details.attempt = attempt;
+        lastError.details.retryAfterMs = delay;
+      }
+      await sleep(delay);
+      continue;
+    }
+    break;
   }
+  throw lastError;
 }
 
 function requireSenderConfig() {
@@ -279,29 +376,35 @@ async function resolveSenderConfig() {
 async function resolveCity(cityName) {
   const query = String(cityName || '').trim();
   if (!query) throw new NovaPoshtaError('Recipient city is required');
+  const cacheKey = query.toLowerCase();
+  const cached = cacheGet(cityCache, cacheKey);
+  if (cached) return cached;
 
   const searched = await callNovaPoshta('Address', 'searchSettlements', { CityName: query, Limit: 10, Page: 1 });
   const addresses = searched.data?.[0]?.Addresses || [];
   const match = addresses.find(x => x.DeliveryCity || x.Ref) || null;
   if (match) {
-    return {
+    return cacheSet(cityCache, cacheKey, {
       ref: match.DeliveryCity || match.Ref,
       settlementRef: match.Ref || null,
       description: match.Present || match.MainDescription || query,
       raw: match,
-    };
+    });
   }
 
   const cities = await callNovaPoshta('Address', 'getCities', { FindByString: query, Limit: 10 });
   const city = cities.data?.[0] || null;
   if (!city?.Ref) throw new NovaPoshtaError('Nova Poshta city was not found', { city: query });
-  return { ref: city.Ref, settlementRef: city.SettlementRef || null, description: city.Description || query, raw: city };
+  return cacheSet(cityCache, cacheKey, { ref: city.Ref, settlementRef: city.SettlementRef || null, description: city.Description || query, raw: city });
 }
 
 async function resolveWarehouse(cityRef, warehouseQuery) {
   const query = String(warehouseQuery || '').trim();
   if (!cityRef) throw new NovaPoshtaError('Recipient city ref is required');
   if (!query) throw new NovaPoshtaError('Recipient warehouse is required');
+  const cacheKey = `${cityRef}:${query.toLowerCase()}`;
+  const cached = cacheGet(warehouseCache, cacheKey);
+  if (cached) return cached;
 
   const result = await callNovaPoshta('Address', 'getWarehouses', {
     CityRef: cityRef,
@@ -315,12 +418,12 @@ async function resolveWarehouse(cityRef, warehouseQuery) {
   const fallback = list[0] || null;
   const warehouse = exact || fallback;
   if (!warehouse?.Ref) throw new NovaPoshtaError('Nova Poshta warehouse was not found', { warehouse: query });
-  return {
+  return cacheSet(warehouseCache, cacheKey, {
     ref: warehouse.Ref,
     number: warehouse.Number || digits || '',
     description: warehouse.Description || warehouse.ShortAddress || query,
     raw: warehouse,
-  };
+  });
 }
 
 async function createRecipient(order) {

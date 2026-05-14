@@ -41,6 +41,7 @@ const PRODUCT_SOLE = process.env.PRODUCT_SOLE || 'light, cushioned, comfortable 
 const PRODUCT_BEST_FOR = process.env.PRODUCT_BEST_FOR || 'daily wear, city walks, travel, spring, summer, and warm autumn';
 const PRODUCT_PRICE = process.env.PRODUCT_PRICE || '895';
 const PRODUCT_OLD_PRICE = process.env.PRODUCT_OLD_PRICE || '1899';
+const npCreateLocks = new Map();
 
 app.set('trust proxy', 1);
 
@@ -377,12 +378,34 @@ function addFinanceEntryOnce(entry) {
   write(F.finance, finance);
   return item;
 }
+function npDetailsText(details = {}) {
+  return [
+    details.status,
+    ...(Array.isArray(details.errors) ? details.errors : []),
+    ...(Array.isArray(details.warnings) ? details.warnings : []),
+    ...(Array.isArray(details.info) ? details.info : []),
+    ...(Array.isArray(details.raw?.errors) ? details.raw.errors : []),
+    details.error,
+    details.message,
+  ].filter(Boolean).join(' ');
+}
+function isNpRateLimited(details = {}) {
+  return !!(details.rateLimited || details.status === 429 || /to+\s+many\s+requests|too\s+many\s+requests|rate\s*limit|ліміт|лимит/i.test(npDetailsText(details)));
+}
 function npErrorPayload(error) {
   const details = error?.details || {};
+  const rateLimited = isNpRateLimited(details);
+  const retryable = !!(rateLimited || details.retryable);
   return {
     error: error?.message || 'Nova Poshta request failed',
+    userMessage: rateLimited
+      ? 'Нова Пошта тимчасово обмежила кількість запитів. Зачекайте 30-60 секунд і натисніть створення ТТН ще раз.'
+      : 'Nova Poshta не виконала запит. Перевірте дані доставки або спробуйте ще раз.',
     details,
     missing: details.missing || [],
+    retryable,
+    rateLimited,
+    retryAfterMs: details.retryAfterMs || null,
   };
 }
 function isOrderActiveForNpSync(order) {
@@ -1188,7 +1211,22 @@ app.post('/api/admin/orders/:id/np/create', authBot, async (req, res) => {
   if (idx < 0) return res.status(404).json({ error: 'Not found' });
   const order = { ...orders[idx], ...(req.body && typeof req.body === 'object' ? req.body : {}) };
   if (orders[idx].ttn && !req.body?.force) return res.json({ success: true, duplicate: true, order: orders[idx], ttn: orders[idx].ttn });
+  const lockKey = String(id);
+  if (npCreateLocks.has(lockKey)) {
+    return res.status(409).json({
+      error: 'TTN creation is already running for this order',
+      userMessage: 'ТТН уже створюється. Зачекайте кілька секунд, не натискайте кнопку повторно.',
+      retryable: true,
+      retryAfterMs: 5000,
+    });
+  }
+  npCreateLocks.set(lockKey, Date.now());
   try {
+    const latestOrders = read(F.orders);
+    const latestIdx = latestOrders.findIndex(x => x.id === id);
+    if (latestIdx >= 0 && latestOrders[latestIdx].ttn && !req.body?.force) {
+      return res.json({ success: true, duplicate: true, order: latestOrders[latestIdx], ttn: latestOrders[latestIdx].ttn });
+    }
     const created = await novaPoshta.createInternetDocument(order);
     const now = new Date().toISOString();
     orders[idx] = {
@@ -1234,6 +1272,8 @@ app.post('/api/admin/orders/:id/np/create', authBot, async (req, res) => {
     res.json({ success: true, order: orders[idx], novaPoshta: created, ttn: created.ttn });
   } catch (error) {
     res.status(502).json(npErrorPayload(error));
+  } finally {
+    npCreateLocks.delete(lockKey);
   }
 });
 app.post('/api/admin/orders/:id/np/sync', authBot, async (req, res) => {

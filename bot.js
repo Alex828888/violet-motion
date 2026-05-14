@@ -443,6 +443,20 @@ function recentlyHandled(map, key, ttl = RECENT_TTL) {
   return now - prev < ttl;
 }
 
+function apiErrorMessage(result, fallback) {
+  const missing = Array.isArray(result?.missing) && result.missing.length
+    ? `\nНе вистачає env: <code>${esc(result.missing.join(', '))}</code>`
+    : '';
+  const detailsErrors = Array.isArray(result?.details?.errors) && result.details.errors.length
+    ? `\nВідповідь НП: <code>${esc(result.details.errors.join('; '))}</code>`
+    : '';
+  const retry = result?.rateLimited || result?.retryable
+    ? '\n\nЗачекайте трохи і натисніть кнопку ще раз. Повторно багато разів підряд натискати не треба.'
+    : '';
+  const message = result?.userMessage || result?.error || fallback;
+  return `${fallback}${missing}\n${esc(message)}${detailsErrors}${retry}`;
+}
+
 /* ═══════════════════════════════════════════════════════════
    ORDERS
 ═══════════════════════════════════════════════════════════ */
@@ -1683,7 +1697,7 @@ bot.on('callback_query', async q => {
     if (data === 'np_sync_all') {
       const result = await serverPost('/api/admin/np/sync', { limit: 100 });
       if (!result || result.error) {
-        await bot.sendMessage(chatId, `❌ Не вдалося оновити Нову Пошту.\n${esc(result?.error || '')}`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
+        await bot.sendMessage(chatId, apiErrorMessage(result, '❌ Не вдалося оновити Нову Пошту.'), { parse_mode: 'HTML', reply_markup: MAIN_KB });
         return;
       }
       await bot.sendMessage(chatId,
@@ -1844,8 +1858,10 @@ bot.on('callback_query', async q => {
       }
       const result = await serverPost(`/api/admin/orders/${id}/np/create`, {});
       if (!result || result.error) {
-        const missing = Array.isArray(result?.missing) && result.missing.length ? `\nНе вистачає env: <code>${esc(result.missing.join(', '))}</code>` : '';
-        await bot.sendMessage(chatId, `❌ Nova Poshta не створила ТТН.${missing}\n${esc(result?.error || '')}`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
+        await bot.sendMessage(chatId, apiErrorMessage(result, '❌ Nova Poshta не створила ТТН.'), {
+          parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '🔄 Спробувати ще раз', callback_data: `npcreate_${id}` }], [{ text: '📋 До замовлення', callback_data: `od_${id}` }]] },
+        });
         return;
       }
       await bot.sendMessage(chatId, `✅ ТТН створено: <code>${esc(result.ttn)}</code>`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
@@ -1857,7 +1873,9 @@ bot.on('callback_query', async q => {
       const id = Number(data.slice(7));
       const result = await serverPost(`/api/admin/orders/${id}/np/link-manual`, {});
       if (!result || result.error) {
-        await bot.sendMessage(chatId, `🔎 ТТН по телефону поки не знайдена.\n${esc(result?.error || '')}`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
+        await bot.sendMessage(chatId,
+          `🔎 ТТН по телефону поки не знайдена.\nЦя кнопка шукає накладну, яку вже створили вручну в кабінеті НП. Якщо її ще немає — натисніть створення ТТН.`,
+          { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🚚 Створити ТТН НП', callback_data: `npcreate_${id}` }], [{ text: '📋 До замовлення', callback_data: `od_${id}` }]] } });
         return;
       }
       await bot.sendMessage(chatId, `✅ Знайшов і привʼязав ТТН: <code>${esc(result.ttn)}</code>`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
@@ -1869,7 +1887,7 @@ bot.on('callback_query', async q => {
       const id = Number(data.slice(7));
       const result = await serverPost(`/api/admin/orders/${id}/np/sync`, {});
       if (!result || result.error) {
-        await bot.sendMessage(chatId, `❌ Не вдалося оновити статус НП.\n${esc(result?.error || '')}`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
+        await bot.sendMessage(chatId, apiErrorMessage(result, '❌ Не вдалося оновити статус НП.'), { parse_mode: 'HTML', reply_markup: MAIN_KB });
         return;
       }
       await bot.sendMessage(chatId, `🔄 НП оновлено: <b>${esc(result.track?.status || result.order?.npStatus || 'ok')}</b>`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
