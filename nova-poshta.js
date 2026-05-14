@@ -238,12 +238,16 @@ async function resolveSenderConfig() {
     ? addresses.find(x => x.Ref === explicit.SenderAddress) || { Ref: explicit.SenderAddress }
     : addresses[0] || null;
 
-  const autoCityRef = explicit.CitySender || pickCityRef(address, chosenSender) || await resolveSenderCityFromText(address, chosenSender);
-  const fallbackWarehouse = explicit.SenderAddress || pickWarehouseRef(address) ? null : await pickFirstWarehouseInCity(autoCityRef);
+  const senderCityName = env('NP_SENDER_CITY_NAME') || env('NP_SENDER_CITY');
+  const senderWarehouseQuery = env('NP_SENDER_WAREHOUSE') || env('NP_SENDER_WAREHOUSE_NUMBER') || env('NP_SENDER_POSTOMAT') || env('NP_SENDER_POSTOMAT_NUMBER');
+  const namedCity = senderCityName ? await resolveCity(senderCityName) : null;
+  const autoCityRef = explicit.CitySender || namedCity?.ref || pickCityRef(address, chosenSender) || await resolveSenderCityFromText(address, chosenSender);
+  const namedWarehouse = senderWarehouseQuery ? await resolveWarehouse(autoCityRef, senderWarehouseQuery) : null;
+  const fallbackWarehouse = explicit.SenderAddress || namedWarehouse?.ref || pickWarehouseRef(address) ? null : await pickFirstWarehouseInCity(autoCityRef);
   const cfg = {
     CitySender: autoCityRef,
     Sender: explicit.Sender || chosenSender.Ref || '',
-    SenderAddress: explicit.SenderAddress || pickWarehouseRef(address) || pickWarehouseRef(fallbackWarehouse),
+    SenderAddress: explicit.SenderAddress || namedWarehouse?.ref || pickWarehouseRef(address) || pickWarehouseRef(fallbackWarehouse),
     ContactSender: explicit.ContactSender || contact?.Ref || '',
     SendersPhone: explicit.SendersPhone || normalizePhone(contact?.Phones || contact?.Phone || chosenSender.Phone || chosenSender.Phones),
   };
