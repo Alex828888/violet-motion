@@ -1134,6 +1134,60 @@ app.get('/api/analytics', authBot, (_req, res) => res.json(read(F.analytics)));
 /* ═══════════════════════════════════════════════════════════
    ADMIN API (BOT)
 ═══════════════════════════════════════════════════════════ */
+app.get('/api/admin/np/find-by-phone', authBot, async (req, res) => {
+  const phone = sanitizeStr(req.query.phone || req.query.q, 40);
+  const normalizedPhone = novaPoshta.normalizePhone(phone);
+  if (!normalizedPhone || normalizedPhone.length < 7) return res.status(400).json({ error: 'Invalid phone' });
+
+  const orders = read(F.orders);
+  const localOrders = orders
+    .filter(o => samePhone(o.phone, phone))
+    .map(o => ({
+      id: o.id,
+      name: o.name || '',
+      phone: o.phone || '',
+      status: o.status || 'new',
+      paymentStatus: orderPaymentStatus(o),
+      ttn: o.ttn || '',
+      createdAt: o.createdAt || null,
+      paidAt: o.paidAt || o.basePaidAt || null,
+      returnedAt: o.returnedAt || o.npReturnCreatedAt || null,
+    }))
+    .reverse();
+
+  const daysBack = Math.max(1, Math.min(90, Number(req.query.daysBack || process.env.NP_PHONE_LOOKUP_DAYS || 60)));
+  if (!novaPoshta.configStatus().apiConfigured) {
+    return res.json({
+      success: true,
+      apiConfigured: false,
+      phone: normalizedPhone,
+      daysBack,
+      documents: [],
+      orders: localOrders,
+    });
+  }
+
+  try {
+    const docs = await novaPoshta.findDocumentsByRecipientPhone(phone, { daysBack });
+    const documents = docs.map(doc => {
+      const linkedOrder = orders.find(o => String(o.ttn || '').trim() === String(doc.ttn || '').trim());
+      return {
+        ttn: doc.ttn,
+        ref: doc.ref || '',
+        dateTime: doc.dateTime || '',
+        recipientName: doc.recipientName || '',
+        recipientPhone: doc.recipientPhone || '',
+        senderPhone: doc.senderPhone || '',
+        status: doc.status || '',
+        cost: doc.cost || 0,
+        linkedOrderId: linkedOrder?.id || null,
+      };
+    });
+    res.json({ success: true, apiConfigured: true, phone: normalizedPhone, daysBack, documents, orders: localOrders });
+  } catch (error) {
+    res.status(502).json(npErrorPayload(error));
+  }
+});
 app.get('/api/admin/orders',       authBot, (_req, res) => res.json(read(F.orders)));
 app.get('/api/admin/orders/:id',   authBot, (req, res) => {
   const order = read(F.orders).find(x => x.id === Number(req.params.id));
@@ -1162,6 +1216,14 @@ if (npConfig.autoSync && npConfig.apiConfigured) {
 } else if (!npConfig.apiConfigured) {
   console.warn('[NovaPoshta] NOVA_POSHTA_API_KEY is not set; tracking and TTN creation are disabled.');
 }
+app.delete('/api/admin/orders/cancelled', authBot, (_req, res) => {
+  const arr = read(F.orders);
+  const kept = arr.filter(x => (x.status || 'new') !== 'cancelled');
+  const deleted = arr.length - kept.length;
+  if (deleted) write(F.orders, kept);
+  updateOrderQueueNotice().catch(e => console.error('[order notice]', e.message));
+  res.json({ success: true, deleted, remaining: kept.length });
+});
 app.delete('/api/admin/orders/:id', authBot, (req, res) => {
   const id = Number(req.params.id); const arr = read(F.orders);
   if (!arr.some(x => x.id === id)) return res.status(404).json({ error: 'Not found' });
@@ -1213,6 +1275,17 @@ app.post('/api/admin/finance', authBot, (req, res) => {
     createdAt: req.body?.createdAt || new Date().toISOString(),
   };
   arr.push(item); write(F.finance, arr); res.json(item);
+});
+app.delete('/api/admin/finance/expenses/today', authBot, (_req, res) => {
+  const arr = read(F.finance);
+  const removed = arr.filter(x => x.type === 'expense' && inPeriod(x.createdAt, 'today'));
+  const kept = arr.filter(x => !(x.type === 'expense' && inPeriod(x.createdAt, 'today')));
+  if (removed.length) write(F.finance, kept);
+  res.json({
+    success: true,
+    deleted: removed.length,
+    totalAmount: removed.reduce((sum, x) => sum + asMoneyNumber(x.amount), 0),
+  });
 });
 app.get('/api/admin/finance/summary', authBot, (req, res) => {
   res.json(buildCrmSummary(sanitizeStr(req.query.period || 'today', 20)));
@@ -1694,6 +1767,8 @@ app.all('/api/zvonok/ivr', async (req, res) => {
     updatedAt: new Date().toISOString(),
     zvonokStatus: status || null,
     zvonokButton: digit || null,
+    ...(digit === '1' ? { confirmationSource: 'zvonok', zvonokConfirmedAt: new Date().toISOString() } : {}),
+    ...(digit === '2' ? { cancelledAt: new Date().toISOString() } : {}),
   };
   write(F.orders, orders);
 

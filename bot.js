@@ -152,6 +152,36 @@ function paymentLabel(o) {
 function deliveryLabel(o) {
   return o?.deliveryStatus || (o?.status === 'shipped' ? 'shipped' : o?.ttn ? 'ttn_added' : '—');
 }
+function orderPaidAt(o) {
+  return o?.paidAt || o?.basePaidAt || o?.upsell?.paidAt || null;
+}
+function orderReturnedAt(o) {
+  return o?.returnedAt || o?.npReturnCreatedAt || o?.npReturnSyncedAt || null;
+}
+function isZvonokConfirmedOrder(o) {
+  return o?.confirmationSource === 'zvonok' || String(o?.zvonokButton || '') === '1';
+}
+function isManagerConfirmedOrder(o) {
+  if ((o?.status || 'new') !== 'confirmed') return false;
+  if (isZvonokConfirmedOrder(o)) return false;
+  return o?.confirmationSource === 'manager' || o?.managerConfirmedAt || o?.managerConfirmedBy || (o?.orderMode || 'manual') === 'manual';
+}
+function isRefusedOrder(o) {
+  const text = [
+    o?.status,
+    o?.paymentStatus,
+    o?.deliveryStatus,
+    o?.npStatus,
+    o?.npReturnStatus,
+    o?.npReturnExpressWaybillStatus,
+  ].filter(Boolean).join(' ').toLowerCase();
+  return o?.status === 'returned' || paymentLabel(o) === 'returned' || /(відмов|отказ|поверн|returned|return)/i.test(text);
+}
+function eventDate(o, kind) {
+  if (kind === 'paid') return orderPaidAt(o) || o?.updatedAt || o?.createdAt;
+  if (kind === 'returned') return orderReturnedAt(o) || o?.updatedAt || o?.createdAt;
+  return o?.updatedAt || o?.createdAt;
+}
 const ORDER_STATUS_LABELS = {
   new: 'нові',
   confirmed: 'підтверджені',
@@ -348,10 +378,20 @@ function novaPoshtaBlock(o) {
     (o.npSyncedAt ? `Synced: <b>${fmtDate(o.npSyncedAt)}</b>\n` : '')
   );
 }
+function paymentTimelineBlock(o) {
+  const paidAt = orderPaidAt(o);
+  const returnedAt = orderReturnedAt(o);
+  if (!paidAt && !returnedAt) return '';
+  return (
+    `\n<b>Оплата / повернення:</b>\n` +
+    (paidAt ? `💸 Оплачено: <b>${fmtDate(paidAt)}</b>\n` : '') +
+    (returnedAt ? `↩️ Відмова/повернення: <b>${fmtDate(returnedAt)}</b>\n` : '')
+  );
+}
 const MANAGER_DELIVERY_STEPS = [
-  { key: 'fullName', label: 'імʼя та прізвище', orderKey: 'fullName' },
+  { key: 'fullName', label: "ПІБ отримувача (ім'я та прізвище)", orderKey: 'fullName' },
   { key: 'city', label: 'місто або село', orderKey: 'city' },
-  { key: 'postOffice', label: 'відділення Нової Пошти', orderKey: 'postOffice' },
+  { key: 'postOffice', label: 'відділення або поштомат Нової Пошти', orderKey: 'postOffice' },
   { key: 'size', label: 'розмір', orderKey: 'size' },
 ];
 function deliveryStepPrompt(step, order) {
@@ -509,6 +549,7 @@ function ordersKeyboard(items, page, total, filter) {
   nav.push({ text: `${page}/${total}`, callback_data: 'noop' });
   if (page < total) nav.push({ text: 'Далі →', callback_data: `op_${page + 1}${suffix}` });
   if (nav.length) rows.push(nav);
+  rows.push([{ text: '🧹 Видалити всі скасовані', callback_data: 'del_cancelled_ask' }]);
   return { inline_keyboard: rows };
 }
 
@@ -591,8 +632,10 @@ function orderDetailKeyboard(o) {
     returned: [],
   };
   const rows = rowsByStatus[o.status || 'new'] || [];
+  if (isManagerConfirmedOrder(o)) {
+    rows.push([{ text: hasDeliveryInfo(o) ? '✏️ Змінити дані НП' : '✍️ Вписати дані НП', callback_data: `fill_${id}` }]);
+  }
   if ((o.status === 'confirmed' || o.status === 'shipped') && !o.ttn) {
-    rows.push([{ text: '🔎 Знайти ТТН по телефону', callback_data: `nplink_${id}` }]);
     rows.push([{ text: '🚚 Створити ТТН НП', callback_data: `npcreate_${id}` }]);
   }
   if (o.ttn) {
@@ -632,6 +675,7 @@ async function showOrderDetail(chatId, id, msgId = null) {
     `📅 Дата: <b>${fmtDate(o.createdAt)}</b>\n` +
     deliveryBlock(o) +
     novaPoshtaBlock(o) +
+    paymentTimelineBlock(o) +
     upsellBlock(o) +
     `━━━━━━━━━━━━━━━`;
   reply(chatId, text, orderDetailKeyboard(o), msgId);
@@ -641,6 +685,7 @@ function trackingMenuKb() {
   return { inline_keyboard: [
     [{ text: '🚚 Активні ТТН', callback_data: 'trk_active' }, { text: '🔄 Оновити всі НП', callback_data: 'np_sync_all' }],
     [{ text: '🧾 Без ТТН', callback_data: 'ofv_no_ttn' }, { text: '💳 Не оплачені', callback_data: 'ofv_unpaid' }],
+    [{ text: '🔎 ТТН по телефону', callback_data: 'np_phone_lookup' }, { text: '📌 Оплати / відмови', callback_data: 'crm_outcomes' }],
     [{ text: '🛍 Violet Motion', callback_data: 'prod_violet' }, { text: '🛍 Black Breeze', callback_data: 'prod_black' }],
     [{ text: '🧾 Проблемні', callback_data: 'crm_prob' }, { text: '← Меню', callback_data: 'main' }],
   ] };
@@ -702,6 +747,120 @@ async function showTrackingList(chatId, mode = 'active', productKey = null, msgI
   });
   if (orders.length > 10) text += `…і ще ${orders.length - 10} замовлень\n`;
   return reply(chatId, text, trackingListKb(orders), msgId);
+}
+
+async function askNpPhoneLookup(chatId) {
+  setCrmPending(chatId, 'np_phone_lookup');
+  await bot.sendMessage(chatId, '🔎 Впишіть номер телефону для пошуку ТТН Нової Пошти.\nНаприклад: <code>0961234567</code>', {
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: [[{ text: '← Відстеження', callback_data: 'track_menu' }]] },
+  });
+}
+
+function npPhoneLookupKeyboard(result = {}) {
+  const rows = [];
+  const ids = new Set();
+  (result.documents || []).forEach(doc => {
+    if (doc.linkedOrderId && !ids.has(doc.linkedOrderId)) {
+      ids.add(doc.linkedOrderId);
+      rows.push([{ text: `📋 Замовлення #${doc.linkedOrderId}`, callback_data: `od_${doc.linkedOrderId}` }]);
+    }
+  });
+  (result.orders || []).forEach(order => {
+    if (!ids.has(order.id)) {
+      ids.add(order.id);
+      rows.push([{ text: `📋 Замовлення #${order.id}`, callback_data: `od_${order.id}` }]);
+    }
+  });
+  return {
+    inline_keyboard: [
+      ...rows.slice(0, 10),
+      [{ text: '🔎 Інший номер', callback_data: 'np_phone_lookup' }, { text: '← Відстеження', callback_data: 'track_menu' }],
+    ],
+  };
+}
+
+async function showNpPhoneLookupResult(chatId, phone) {
+  const result = await serverGet(`/api/admin/np/find-by-phone?phone=${encodeURIComponent(phone)}`);
+  if (!result || result.error) {
+    await bot.sendMessage(chatId, apiErrorMessage(result, '❌ Не вдалося знайти ТТН по телефону.'), {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '🔎 Спробувати ще раз', callback_data: 'np_phone_lookup' }, { text: '← Відстеження', callback_data: 'track_menu' }]] },
+    });
+    return;
+  }
+
+  const docs = Array.isArray(result.documents) ? result.documents : [];
+  const localOrders = Array.isArray(result.orders) ? result.orders : [];
+  let text =
+    `🔎 <b>Пошук ТТН по телефону</b>\n━━━━━━━━━━━━━━━\n` +
+    `Телефон: <code>${esc(result.phone || phone)}</code>\n` +
+    `Період НП: <b>${esc(result.daysBack || 0)} днів</b>\n` +
+    `Знайдено ТТН: <b>${esc(docs.length)}</b>\n` +
+    `Замовлень у боті з цим телефоном: <b>${esc(localOrders.length)}</b>\n`;
+
+  if (result.apiConfigured === false) {
+    text += '\n⚠️ API Нової Пошти не підключено, показую тільки локальні замовлення з бота.\n';
+  }
+
+  if (docs.length) {
+    text += '\n<b>ТТН Нової Пошти:</b>\n';
+    docs.slice(0, 10).forEach(doc => {
+      text +=
+        `• <code>${esc(doc.ttn)}</code>` +
+        (doc.linkedOrderId ? ` → #${esc(doc.linkedOrderId)}` : '') + '\n' +
+        (doc.dateTime ? `  📅 ${esc(doc.dateTime)}\n` : '') +
+        (doc.status ? `  📦 ${esc(doc.status)}\n` : '') +
+        (doc.cost ? `  💵 ${money(doc.cost)}\n` : '');
+    });
+    if (docs.length > 10) text += `…і ще ${docs.length - 10}\n`;
+  }
+
+  const localWithTtn = localOrders.filter(o => o.ttn);
+  if (localWithTtn.length) {
+    text += '\n<b>ТТН у замовленнях бота:</b>\n';
+    localWithTtn.slice(0, 8).forEach(o => {
+      text += `• #${esc(o.id)} <code>${esc(o.ttn)}</code> · ${esc(o.status || 'new')} · ${fmtDate(o.createdAt)}\n`;
+    });
+  }
+
+  if (!docs.length && !localWithTtn.length) {
+    text += '\nТТН по цьому телефону поки не знайшов.';
+  }
+
+  await bot.sendMessage(chatId, text, {
+    parse_mode: 'HTML',
+    reply_markup: npPhoneLookupKeyboard(result),
+  });
+}
+
+async function showDeleteCancelledConfirm(chatId, msgId = null) {
+  const orders = await serverGet('/api/admin/orders');
+  if (!Array.isArray(orders)) return reply(chatId, '❌ Не вдалося завантажити замовлення.', MAIN_KB, msgId);
+  const count = orders.filter(o => (o.status || 'new') === 'cancelled').length;
+  if (!count) return reply(chatId, '🧹 Скасованих замовлень для видалення немає.', crmMenuKb(), msgId);
+  return reply(chatId,
+    `🧹 <b>Видалити всі скасовані замовлення?</b>\n\nБуде видалено: <b>${count}</b>\nЦю дію краще робити тільки коли точно не потрібна історія скасованих заявок.`,
+    { inline_keyboard: [
+      [{ text: `✅ Так, видалити ${count}`, callback_data: 'del_cancelled_yes' }],
+      [{ text: '← Скасувати', callback_data: 'orders' }],
+    ] },
+    msgId
+  );
+}
+
+async function showClearTodayExpensesConfirm(chatId, msgId = null) {
+  const summary = await serverGet('/api/admin/finance/summary?period=today');
+  if (!summary || summary.error) return reply(chatId, '❌ Не вдалося порахувати витрати за сьогодні.', financeMenuKb(), msgId);
+  if (asNumber(summary.expense) <= 0) return reply(chatId, '🧹 За сьогодні витрат у фінансах немає.', financeMenuKb(), msgId);
+  return reply(chatId,
+    `🧹 <b>Очистити витрати за сьогодні?</b>\n\nСума витрат сьогодні: <b>${money(summary.expense)}</b>\nБудуть видалені фінансові записи типу "витрата" за сьогодні. Замовлення не видаляються.`,
+    { inline_keyboard: [
+      [{ text: '✅ Так, очистити', callback_data: 'fi_clear_today_yes' }],
+      [{ text: '← Скасувати', callback_data: 'fi_menu' }],
+    ] },
+    msgId
+  );
 }
 
 async function showProductReport(chatId, productKey, msgId = null) {
@@ -830,6 +989,7 @@ function financeMenuKb() {
     [{ text: '➕ Додати дохід', callback_data: 'fi_add_i' }, { text: '➖ Додати витрату', callback_data: 'fi_add_e' }],
     [{ text: '📅 Сьогодні', callback_data: 'fi_today' }, { text: '📆 Тиждень', callback_data: 'fi_week' }, { text: '🗓 Місяць', callback_data: 'fi_month' }],
     [{ text: '📊 Баланс', callback_data: 'fi_balance' }, { text: '🧾 Звірка каси', callback_data: 'fi_cash' }],
+    [{ text: '🧹 Очистити витрати сьогодні', callback_data: 'fi_clear_today_ask' }],
     [{ text: '← Назад', callback_data: 'main' }],
   ] };
 }
@@ -841,6 +1001,7 @@ function crmMenuKb() {
     [{ text: '📣 Реклама', callback_data: 'crm_ads' }, { text: '🚚 Доставка', callback_data: 'crm_ship' }],
     [{ text: '🛍 Violet Motion', callback_data: 'prod_violet' }, { text: '🛍 Black Breeze', callback_data: 'prod_black' }],
     [{ text: '↩️ Повернення', callback_data: 'crm_ret' }, { text: '🧾 Проблемні замовлення', callback_data: 'crm_prob' }],
+    [{ text: '📌 Оплати / відмови', callback_data: 'crm_outcomes' }, { text: '🧹 Видалити скасовані', callback_data: 'del_cancelled_ask' }],
     [{ text: '🚚 Відстеження', callback_data: 'track_menu' }],
   ] };
 }
@@ -952,6 +1113,57 @@ async function showProblems(chatId, msgId = null) {
       [{ text: '← CRM', callback_data: 'crm_menu' }],
     ],
   }, msgId);
+}
+
+async function showOutcomeReport(chatId, msgId = null) {
+  const orders = await serverGet('/api/admin/orders');
+  if (!Array.isArray(orders)) return reply(chatId, '❌ Не вдалося завантажити оплати та відмови.', crmMenuKb(), msgId);
+
+  const refused = orders
+    .filter(isRefusedOrder)
+    .sort((a, b) => new Date(eventDate(b, 'returned')).getTime() - new Date(eventDate(a, 'returned')).getTime());
+  const paid = orders
+    .filter(o => paymentLabel(o) === 'paid' || o.status === 'paid' || o.status === 'completed')
+    .sort((a, b) => new Date(eventDate(b, 'paid')).getTime() - new Date(eventDate(a, 'paid')).getTime());
+
+  let text =
+    `📌 <b>Оплати / відмови</b>\n━━━━━━━━━━━━━━━\n` +
+    `💸 Оплачені: <b>${paid.length}</b>\n` +
+    `↩️ Відмови / повернення: <b>${refused.length}</b>\n`;
+
+  text += '\n<b>Відмови / повернення:</b>\n';
+  if (!refused.length) {
+    text += 'Немає.\n';
+  } else {
+    refused.slice(0, 10).forEach(o => {
+      text +=
+        `• #${esc(o.id)} ${esc(o.name || '—')}\n` +
+        `  📱 ${esc(o.phone || '—')}` +
+        (o.ttn ? ` · ТТН <code>${esc(o.ttn)}</code>` : '') + '\n' +
+        `  ↩️ ${fmtDate(eventDate(o, 'returned'))}` +
+        (o.npStatus ? ` · ${esc(o.npStatus)}` : '') + '\n';
+    });
+    if (refused.length > 10) text += `…і ще ${refused.length - 10}\n`;
+  }
+
+  text += '\n<b>Оплачені:</b>\n';
+  if (!paid.length) {
+    text += 'Немає.\n';
+  } else {
+    paid.slice(0, 10).forEach(o => {
+      text +=
+        `• #${esc(o.id)} ${esc(o.name || '—')} · ${money(o.price)}\n` +
+        `  💸 ${fmtDate(eventDate(o, 'paid'))}` +
+        (o.ttn ? ` · ТТН <code>${esc(o.ttn)}</code>` : '') + '\n';
+    });
+    if (paid.length > 10) text += `…і ще ${paid.length - 10}\n`;
+  }
+
+  const rows = [
+    [{ text: '↩️ Відкрити повернення', callback_data: orderFilterCallback('st:returned') }, { text: '💸 Відкрити оплачені', callback_data: orderFilterCallback('st:paid') }],
+    [{ text: '← CRM', callback_data: 'crm_menu' }],
+  ];
+  return reply(chatId, text, { inline_keyboard: rows }, msgId);
 }
 
 async function showAdsReport(chatId, period = 'today', msgId = null) {
@@ -1365,6 +1577,17 @@ async function handleCrmPendingMessage(chatId, text) {
   const askAmountAgain = '❌ Сума некоректна. Введіть додатне число без мінуса.';
   const askTitleAmountAgain = '❌ Формат некоректний. Введіть суму числом або так: Назва | Сума';
 
+  if (pending.action === 'np_phone_lookup') {
+    const phone = text.trim();
+    if (phone.replace(/\D/g, '').length < 7) {
+      await bot.sendMessage(chatId, '❌ Номер виглядає закоротким. Впишіть телефон повністю, наприклад 0961234567.');
+      return true;
+    }
+    clearCrmPending(chatId);
+    await showNpPhoneLookupResult(chatId, phone);
+    return true;
+  }
+
   if (pending.action === 'delivery_collect') {
     const order = await serverGet(`/api/admin/orders/${id}`);
     if (!order || order.error) {
@@ -1628,7 +1851,7 @@ bot.on('message', async msg => {
         `💰 <b>Фінанси:</b> доходи, витрати, баланс, звірка каси.\n` +
         `📊 <b>CRM:</b> статуси, доставка, повернення, проблемні замовлення.\n` +
         `🛍 <b>Товари:</b> у замовленнях і CRM є окремі кнопки для Violet Motion, Black Breeze та інших товарів.\n` +
-        `🚚 <b>Відстеження:</b> активні ТТН, без ТТН, неоплачені та масове оновлення Нової Пошти.\n` +
+        `🚚 <b>Відстеження:</b> активні ТТН, пошук ТТН по телефону, без ТТН, неоплачені та масове оновлення Нової Пошти.\n` +
         `📣 <b>Реклама:</b> витрати та ціна заявки/замовлення.\n\n` +
         `📈 <b>Аналітика:</b> кнопка в меню або /analytics\nПоказує: сесії, скрол, кліки, воронку, останні дії.\n\n` +
         `💬 <b>Підтримка:</b> коли приймаєте діалог — всі ваші повідомлення йдуть клієнту у реальному часі. Для завершення — 🔚 Завершити діалог`,
@@ -1712,12 +1935,24 @@ bot.on('callback_query', async q => {
     }
 
     if (data === 'fi_cash') { await showCashReconciliation(chatId, msgId); return; }
+    if (data === 'fi_clear_today_ask') { await showClearTodayExpensesConfirm(chatId, msgId); return; }
+    if (data === 'fi_clear_today_yes') {
+      const result = await serverDelete('/api/admin/finance/expenses/today');
+      if (!result || result.error) {
+        await bot.sendMessage(chatId, '❌ Не вдалося очистити витрати за сьогодні.', { reply_markup: MAIN_KB });
+        return;
+      }
+      await bot.sendMessage(chatId, `🧹 Витрати за сьогодні очищено.\nВидалено записів: <b>${esc(result.deleted || 0)}</b>\nСума: <b>${money(result.totalAmount || 0)}</b>`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
+      await showFinanceMenu(chatId, msgId);
+      return;
+    }
 
     if (data === 'crm_today' || data === 'crm_week' || data === 'crm_month') {
       await showCrmSummary(chatId, data.replace('crm_', ''), 'overview', msgId);
       return;
     }
     if (data === 'crm_prob') { await showProblems(chatId, msgId); return; }
+    if (data === 'crm_outcomes') { await showOutcomeReport(chatId, msgId); return; }
     if (data === 'crm_orders') { await showOrders(chatId, 1, null, msgId); return; }
     if (data === 'crm_fin') { await showFinanceSummary(chatId, 'month', msgId); return; }
     if (data === 'crm_ads') { await showAdsReport(chatId, 'month', msgId); return; }
@@ -1740,6 +1975,7 @@ bot.on('callback_query', async q => {
     /* ─ Tracking / product views ─────────────────────────── */
     if (data === 'track_menu') { await showTrackingMenu(chatId, msgId); return; }
     if (data === 'trk_active') { await showTrackingList(chatId, 'active', null, msgId); return; }
+    if (data === 'np_phone_lookup') { await askNpPhoneLookup(chatId); return; }
     if (data.startsWith('trk_active_')) {
       await showTrackingList(chatId, 'active', data.slice(11), msgId);
       return;
@@ -1764,6 +2000,17 @@ bot.on('callback_query', async q => {
 
     /* ─ Orders ──────────────────────────────────────────── */
     if (data === 'orders') { await showOrders(chatId, 1, null, msgId); return; }
+    if (data === 'del_cancelled_ask') { await showDeleteCancelledConfirm(chatId, msgId); return; }
+    if (data === 'del_cancelled_yes') {
+      const result = await serverDelete('/api/admin/orders/cancelled');
+      if (!result || result.error) {
+        await bot.sendMessage(chatId, '❌ Не вдалося видалити скасовані замовлення.', { reply_markup: MAIN_KB });
+        return;
+      }
+      await bot.sendMessage(chatId, `🧹 Скасовані замовлення видалено: <b>${esc(result.deleted || 0)}</b>`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
+      await showOrders(chatId, 1, null, msgId);
+      return;
+    }
 
     if (data.startsWith('ofv_')) {
       await showOrders(chatId, 1, data.slice(4) || null, msgId);
@@ -1832,6 +2079,18 @@ bot.on('callback_query', async q => {
         await showOrderDetail(chatId, id, msgId);
         return;
       }
+    }
+
+    if (data.startsWith('fill_')) {
+      const id = Number(data.slice(5));
+      const order = await serverGet(`/api/admin/orders/${id}`);
+      if (!order || order.error) { await bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB }); return; }
+      if (!isManagerConfirmedOrder(order)) {
+        await bot.sendMessage(chatId, 'ℹ️ Кнопка заповнення даних доступна тільки для замовлень, які підтвердив менеджер.', { reply_markup: MAIN_KB });
+        return;
+      }
+      await askManagerDeliveryStep(chatId, id, 0);
+      return;
     }
 
     if (data.startsWith('oi_')) {
