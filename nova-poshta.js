@@ -459,12 +459,13 @@ async function createRecipient(order) {
 }
 
 function buildSeatsOptions() {
-  const width = moneyNumber(env('NP_SEAT_WIDTH_CM'));
-  const length = moneyNumber(env('NP_SEAT_LENGTH_CM'));
-  const height = moneyNumber(env('NP_SEAT_HEIGHT_CM'));
+  const width = moneyNumber(env('NP_SEAT_WIDTH_CM', '35'));
+  const length = moneyNumber(env('NP_SEAT_LENGTH_CM', '25'));
+  const height = moneyNumber(env('NP_SEAT_HEIGHT_CM', '12'));
   const weight = moneyNumber(env('NP_WEIGHT_KG', '1'));
-  if (!width || !length || !height) return null;
+  const volume = moneyNumber(env('NP_VOLUME_GENERAL', '0.002')) || Math.max(0.001, (width * length * height) / 1000000);
   return [{
+    volumetricVolume: volume,
     volumetricWidth: width,
     volumetricLength: length,
     volumetricHeight: height,
@@ -506,8 +507,7 @@ async function createInternetDocument(order) {
     RecipientsPhone: recipient.phone,
   };
 
-  const optionsSeat = buildSeatsOptions();
-  if (optionsSeat) properties.OptionsSeat = optionsSeat;
+  properties.OptionsSeat = buildSeatsOptions();
   if (env('NP_COD_ENABLED', 'true') !== 'false' && price > 0) {
     properties.BackwardDeliveryData = [{
       PayerType: env('NP_COD_PAYER_TYPE', 'Recipient'),
@@ -616,6 +616,121 @@ async function findDocumentsByRecipientPhone(phone, { daysBack = 14 } = {}) {
   });
 }
 
+async function checkPossibilityCreateReturn(number) {
+  const result = await callNovaPoshta('AdditionalService', 'CheckPossibilityCreateReturn', {
+    Number: String(number || '').trim(),
+  });
+  return result.data?.[0] || null;
+}
+
+async function getReturnReasons() {
+  const result = await callNovaPoshta('AdditionalService', 'getReturnReasons', {});
+  return result.data || [];
+}
+
+async function getReturnReasonSubtypes(reasonRef) {
+  const props = reasonRef ? { ReasonRef: reasonRef } : {};
+  const result = await callNovaPoshta('AdditionalService', 'getReturnReasonsSubtypes', props);
+  return result.data || [];
+}
+
+async function getDefaultReturnReason() {
+  const reasonRef = env('NP_RETURN_REASON_REF');
+  const subtypeRef = env('NP_RETURN_SUBTYPE_REF');
+  if (reasonRef && subtypeRef) return { reasonRef, subtypeRef };
+
+  const reasons = await getReturnReasons();
+  const reason = reasonRef
+    ? reasons.find(x => x.Ref === reasonRef) || { Ref: reasonRef }
+    : reasons[0];
+  if (!reason?.Ref) throw new NovaPoshtaError('Nova Poshta return reason was not found', { method: 'getReturnReasons' });
+
+  const subtypes = await getReturnReasonSubtypes(reason.Ref);
+  const subtype = subtypeRef
+    ? subtypes.find(x => x.Ref === subtypeRef) || { Ref: subtypeRef }
+    : subtypes[0];
+  if (!subtype?.Ref) throw new NovaPoshtaError('Nova Poshta return reason subtype was not found', { method: 'getReturnReasonsSubtypes', reason: reason.Ref });
+
+  return { reasonRef: reason.Ref, subtypeRef: subtype.Ref, reason, subtype };
+}
+
+function normalizeReturnOrder(item = {}) {
+  return {
+    ref: item.Ref || item.OrderRef || '',
+    number: item.Number || item.OrderNumber || '',
+    status: item.OrderStatus || item.Status || '',
+    documentNumber: item.DocumentNumber || item.IntDocNumber || '',
+    deliveryCost: moneyNumber(item.DeliveryCost || item.Cost || 0),
+    estimatedDeliveryDate: item.EstimatedDeliveryDate || '',
+    expressWaybillNumber: item.ExpressWaybillNumber || '',
+    expressWaybillStatus: item.ExpressWaybillStatus || '',
+    raw: item,
+  };
+}
+
+async function getReturnOrdersList({ number, ref, dateFrom, dateTo, page = 1, limit = 50 } = {}) {
+  const props = {
+    BeginDate: dateFrom || formatNpDate(dateDaysAgo(30)),
+    EndDate: dateTo || todayNpDate(),
+    Page: String(page),
+    Limit: String(limit),
+  };
+  if (number) props.Number = String(number).trim();
+  if (ref) props.Ref = String(ref).trim();
+  const result = await callNovaPoshta('AdditionalService', 'getReturnOrdersList', props);
+  return (result.data || []).map(normalizeReturnOrder);
+}
+
+async function syncReturnOrderCost(order) {
+  const query = order?.npReturnOrderNumber || order?.npReturnOrderRef || order?.ttn;
+  if (!query) return null;
+  const returns = await getReturnOrdersList({
+    number: order.npReturnOrderNumber || order.ttn,
+    ref: order.npReturnOrderRef,
+  });
+  const found = returns.find(x => (
+    (order.npReturnOrderRef && x.ref === order.npReturnOrderRef) ||
+    (order.npReturnOrderNumber && x.number === order.npReturnOrderNumber) ||
+    (order.ttn && x.documentNumber === order.ttn)
+  )) || returns[0] || null;
+  return found;
+}
+
+async function createReturnOrder(order) {
+  const ttn = String(order?.ttn || '').trim();
+  if (!ttn) throw new NovaPoshtaError('Order has no TTN');
+  if (order?.npReturnOrderRef || order?.npReturnOrderNumber) {
+    return { duplicate: true, returnOrder: await syncReturnOrderCost(order) };
+  }
+
+  const possibility = await checkPossibilityCreateReturn(ttn);
+  if (!possibility) throw new NovaPoshtaError('Nova Poshta did not return return possibility', { ttn });
+  const { reasonRef, subtypeRef, reason, subtype } = await getDefaultReturnReason();
+  const paymentMethod = env('NP_RETURN_PAYMENT_METHOD', env('NP_PAYMENT_METHOD', 'Cash'));
+  const properties = {
+    IntDocNumber: ttn,
+    PaymentMethod: paymentMethod,
+    Reason: reasonRef,
+    SubtypeReason: subtypeRef,
+    Note: env('NP_RETURN_NOTE', `Return order #${order.id || ttn}`),
+    OrderType: 'orderCargoReturn',
+    ReturnAddressRef: env('NP_RETURN_ADDRESS_REF', possibility.Address || possibility.Ref || env('NP_SENDER_ADDRESS_REF') || env('NP_SENDER_WAREHOUSE_REF')),
+  };
+  if (env('NP_RETURN_ONLY_GET_PRICING', 'false') === 'true') properties.OnlyGetPricing = '1';
+
+  const result = await callNovaPoshta('AdditionalService', 'save', properties);
+  const raw = result.data?.[0] || null;
+  if (!raw) throw new NovaPoshtaError('Nova Poshta did not return return order data', { raw: result.data });
+  return {
+    duplicate: false,
+    possibility,
+    reason,
+    subtype,
+    returnOrder: normalizeReturnOrder(raw),
+    raw,
+  };
+}
+
 function configStatus() {
   const senderVars = ['NP_SENDER_CITY_REF', 'NP_SENDER_REF', 'NP_SENDER_ADDRESS_REF', 'NP_CONTACT_SENDER_REF', 'NP_SENDER_PHONE'];
   const missingSender = senderVars.filter(name => !env(name));
@@ -636,6 +751,9 @@ module.exports = {
   NovaPoshtaError,
   callNovaPoshta,
   createInternetDocument,
+  createReturnOrder,
+  syncReturnOrderCost,
+  getReturnOrdersList,
   trackDocuments,
   getDocumentList,
   findDocumentsByRecipientPhone,

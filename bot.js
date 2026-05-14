@@ -333,7 +333,7 @@ function deliveryBlock(o) {
   );
 }
 function novaPoshtaBlock(o) {
-  if (!o?.ttn && !o?.npStatus && !o?.npEstimatedDeliveryDate) return '';
+  if (!o?.ttn && !o?.npStatus && !o?.npEstimatedDeliveryDate && !o?.npReturnOrderNumber && !o?.npReturnExpressWaybillNumber) return '';
   return (
     `\n<b>Nova Poshta:</b>\n` +
     (o.ttn ? `TTN: <code>${esc(o.ttn)}</code>\n` : '') +
@@ -341,6 +341,10 @@ function novaPoshtaBlock(o) {
     (o.npStatusCode ? `Code: <b>${esc(o.npStatusCode)}</b>\n` : '') +
     (o.npEstimatedDeliveryDate ? `ETA: <b>${esc(o.npEstimatedDeliveryDate)}</b>\n` : '') +
     (o.npDeliveryCost ? `Delivery cost: <b>${money(o.npDeliveryCost)}</b>\n` : '') +
+    (o.npReturnOrderNumber ? `Return order: <code>${esc(o.npReturnOrderNumber)}</code>\n` : '') +
+    (o.npReturnExpressWaybillNumber ? `Return TTN: <code>${esc(o.npReturnExpressWaybillNumber)}</code>\n` : '') +
+    (o.npReturnStatus ? `Return status: <b>${esc(o.npReturnStatus)}</b>\n` : '') +
+    (o.npReturnDeliveryCost ? `Return cost: <b>${money(o.npReturnDeliveryCost)}</b>\n` : '') +
     (o.npSyncedAt ? `Synced: <b>${fmtDate(o.npSyncedAt)}</b>\n` : '')
   );
 }
@@ -1258,6 +1262,49 @@ async function settleOrderPayment(chatId, orderId, scope, baseCost = null, msgId
   await showOrderDetail(chatId, orderId, msgId);
 }
 
+async function markOrderReturned(chatId, orderId, scope = 'base', msgId = null, existingPatch = {}) {
+  const patch = {
+    ...existingPatch,
+    returnScope: scope,
+    returnedAt: new Date().toISOString(),
+    paymentStatus: scope === 'both' || scope === 'base' ? 'returned' : 'partially_returned',
+    status: scope === 'both' || scope === 'base' ? 'returned' : (existingPatch.status || 'shipped'),
+  };
+  if (scope === 'base' || scope === 'both') patch.baseReturnStatus = 'returned';
+
+  let updated = null;
+  const shouldCreateNpReturn = scope === 'base' || scope === 'both';
+  if (shouldCreateNpReturn) {
+    const result = await serverPost(`/api/admin/orders/${orderId}/np/return`, { scope, paymentStatus: patch.paymentStatus });
+    if (result && !result.error) {
+      updated = result.order;
+      const costLine = asNumber(result.returnOrder?.deliveryCost || updated?.npReturnDeliveryCost) > 0
+        ? `\nВартість повернення НП: <b>${money(result.returnOrder?.deliveryCost || updated.npReturnDeliveryCost)}</b>`
+        : '\nВартість повернення підтягнеться автоматично після списання/оновлення НП.';
+      await bot.sendMessage(chatId,
+        `↩️ Повернення оформлено.` +
+        (result.returnOrder?.number ? `\nЗаявка НП: <code>${esc(result.returnOrder.number)}</code>` : '') +
+        (result.returnOrder?.expressWaybillNumber ? `\nТТН повернення: <code>${esc(result.returnOrder.expressWaybillNumber)}</code>` : '') +
+        costLine,
+        { parse_mode: 'HTML', reply_markup: MAIN_KB });
+      await showOrderDetail(chatId, orderId, msgId);
+      return updated;
+    }
+    await bot.sendMessage(chatId,
+      apiErrorMessage(result, '⚠️ В Telegram повернення відмічу, але Нова Пошта не створила заявку на повернення.'),
+      { parse_mode: 'HTML', reply_markup: MAIN_KB });
+  }
+
+  updated = await serverPatch(`/api/admin/orders/${orderId}`, patch);
+  if (!updated || updated.error) {
+    await bot.sendMessage(chatId, '❌ Не вдалося оформити повернення.', { reply_markup: MAIN_KB });
+    return null;
+  }
+  await bot.sendMessage(chatId, '↩️ Повернення відмічено. Витрату вручну вводити не потрібно: якщо є ТТН повернення, бот підтягне суму після оновлення НП.', { parse_mode: 'HTML', reply_markup: MAIN_KB });
+  await showOrderDetail(chatId, orderId, msgId);
+  return updated;
+}
+
 async function askManagerDeliveryStep(chatId, orderId, stepIndex = 0) {
   const order = await serverGet(`/api/admin/orders/${orderId}`);
   if (!order || order.error) {
@@ -1762,12 +1809,7 @@ bot.on('callback_query', async q => {
           });
           return;
         }
-        const updated = await serverPatch(`/api/admin/orders/${id}`, {
-          paymentStatus: 'returned', status: 'returned', returnedAt: new Date().toISOString(), returnScope: 'base',
-        });
-        if (!updated || updated.error) { await bot.sendMessage(chatId, '❌ Не вдалося оформити повернення.', { reply_markup: MAIN_KB }); return; }
-        setCrmPending(chatId, 'return_expense', id, { scope: 'base' });
-        await bot.sendMessage(chatId, '↩️ Введіть суму втрат на доставці/поверненні:', { parse_mode: 'HTML' });
+        await markOrderReturned(chatId, id, 'base', msgId);
         return;
       }
 
@@ -1831,18 +1873,9 @@ bot.on('callback_query', async q => {
         upsell.returnStatus = 'returned';
         upsell.returnedAt = new Date().toISOString();
       }
-      const patch = {
-        returnScope: scope,
-        returnedAt: new Date().toISOString(),
-        paymentStatus: scope === 'both' ? 'returned' : 'partially_returned',
-        status: scope === 'both' ? 'returned' : (order.status || 'shipped'),
-      };
+      const patch = { status: order.status || 'shipped' };
       if (upsell) patch.upsell = upsell;
-      if (scope === 'base' || scope === 'both') patch.baseReturnStatus = 'returned';
-      const updated = await serverPatch(`/api/admin/orders/${id}`, patch);
-      if (!updated || updated.error) { await bot.sendMessage(chatId, '❌ Не вдалося оформити повернення.', { reply_markup: MAIN_KB }); return; }
-      setCrmPending(chatId, 'return_expense', id, { scope });
-      await bot.sendMessage(chatId, `↩️ Введіть суму втрат на поверненні (${esc(paymentScopeLabel(scope))}):`, { parse_mode: 'HTML' });
+      await markOrderReturned(chatId, id, scope, msgId, patch);
       return;
     }
 

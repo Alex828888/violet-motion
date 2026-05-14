@@ -410,7 +410,9 @@ function npErrorPayload(error) {
 }
 function isOrderActiveForNpSync(order) {
   const status = order?.status || 'new';
-  return !!order?.ttn && !['cancelled', 'returned', 'completed'].includes(status);
+  if (!order?.ttn || ['cancelled', 'completed'].includes(status)) return false;
+  if (status === 'returned') return !!(order.npReturnOrderRef || order.npReturnOrderNumber || !order.npReturnDeliveryCost);
+  return true;
 }
 function canAutoLinkManualNpOrder(order) {
   const status = order?.status || 'new';
@@ -480,12 +482,52 @@ function applyNovaTrackingToOrder(order, track) {
 
   return { ...order, ...patch, updatedAt: now };
 }
+function applyNovaReturnOrderToOrder(order, returnOrder) {
+  if (!returnOrder) return order;
+  const now = new Date().toISOString();
+  const patch = {
+    npReturnSyncedAt: now,
+    npReturnOrderRef: returnOrder.ref || order.npReturnOrderRef || null,
+    npReturnOrderNumber: returnOrder.number || order.npReturnOrderNumber || null,
+    npReturnStatus: returnOrder.status || order.npReturnStatus || null,
+    npReturnExpressWaybillNumber: returnOrder.expressWaybillNumber || order.npReturnExpressWaybillNumber || null,
+    npReturnExpressWaybillStatus: returnOrder.expressWaybillStatus || order.npReturnExpressWaybillStatus || null,
+    novaPoshta: {
+      ...(order.novaPoshta && typeof order.novaPoshta === 'object' ? order.novaPoshta : {}),
+      returnOrder,
+      returnSyncedAt: now,
+    },
+    updatedAt: now,
+  };
+  if (returnOrder.deliveryCost > 0) {
+    patch.npReturnDeliveryCost = returnOrder.deliveryCost;
+    patch.returnExpense = order.returnExpense || returnOrder.deliveryCost;
+    addFinanceEntryOnce({
+      type: 'expense',
+      title: `Nova Poshta return #${order.id}`,
+      amount: returnOrder.deliveryCost,
+      category: 'return',
+      source: 'nova-poshta',
+      orderId: order.id,
+      externalId: financeExternalId('nova-poshta', 'return', order.id, returnOrder.number || returnOrder.ref || order.ttn),
+    });
+  }
+  return { ...order, ...patch };
+}
 async function syncOrderWithNovaPoshta(order) {
   if (!order?.ttn) throw new Error('Order has no TTN');
   const docs = [{ DocumentNumber: String(order.ttn), Phone: novaPoshta.normalizePhone(order.phone) }];
   const [track] = await novaPoshta.trackDocuments(docs);
   if (!track) throw new Error('Nova Poshta returned no tracking data');
-  const updated = applyNovaTrackingToOrder(order, track);
+  let updated = applyNovaTrackingToOrder(order, track);
+  if (updated.npReturnOrderRef || updated.npReturnOrderNumber || updated.status === 'returned') {
+    try {
+      const returnOrder = await novaPoshta.syncReturnOrderCost(updated);
+      if (returnOrder) updated = applyNovaReturnOrderToOrder(updated, returnOrder);
+    } catch (error) {
+      updated.npReturnSyncError = error.message;
+    }
+  }
   return { updated, track };
 }
 async function linkManualNovaPoshtaTtn(order, orders = read(F.orders)) {
@@ -1288,6 +1330,34 @@ app.post('/api/admin/orders/:id/np/sync', authBot, async (req, res) => {
     write(F.orders, orders);
     updateOrderQueueNotice(orders[idx]).catch(e => console.error('[order notice]', e.message));
     res.json({ success: true, order: orders[idx], track });
+  } catch (error) {
+    res.status(502).json(npErrorPayload(error));
+  }
+});
+app.post('/api/admin/orders/:id/np/return', authBot, async (req, res) => {
+  const id = Number(req.params.id);
+  const orders = read(F.orders);
+  const idx = orders.findIndex(x => x.id === id);
+  if (idx < 0) return res.status(404).json({ error: 'Not found' });
+  if (!orders[idx].ttn) return res.status(400).json({ error: 'Order has no TTN', userMessage: 'У замовленні немає ТТН, тому повернення в Новій Пошті створити неможливо.' });
+  try {
+    const result = await novaPoshta.createReturnOrder(orders[idx]);
+    const now = new Date().toISOString();
+    let updated = applyNovaReturnOrderToOrder(orders[idx], result.returnOrder);
+    updated = {
+      ...updated,
+      status: 'returned',
+      paymentStatus: req.body?.paymentStatus || 'returned',
+      returnScope: req.body?.scope || orders[idx].returnScope || 'base',
+      returnedAt: orders[idx].returnedAt || now,
+      npReturnCreatedAt: orders[idx].npReturnCreatedAt || now,
+      npReturnDuplicate: !!result.duplicate,
+      updatedAt: now,
+    };
+    orders[idx] = updated;
+    write(F.orders, orders);
+    updateOrderQueueNotice(orders[idx]).catch(e => console.error('[order notice]', e.message));
+    res.json({ success: true, order: orders[idx], returnOrder: result.returnOrder || null, duplicate: !!result.duplicate });
   } catch (error) {
     res.status(502).json(npErrorPayload(error));
   }
