@@ -149,6 +149,55 @@ async function getSenderAddresses(senderRef) {
   return response.data || [];
 }
 
+function pickCityRef(...items) {
+  for (const item of items) {
+    if (!item) continue;
+    const ref = item.CityRef || item.CitySender || item.City || item.SettlementRef || item.DeliveryCity || item.RefCity;
+    if (ref) return ref;
+  }
+  return '';
+}
+
+function pickWarehouseRef(item) {
+  if (!item) return '';
+  return item.Ref || item.WarehouseRef || item.AddressRef || item.SenderAddress || '';
+}
+
+async function resolveSenderCityFromText(...items) {
+  const text = items
+    .flatMap(item => item ? [
+      item.CityDescription,
+      item.CityDescriptionRu,
+      item.CityDescriptionUa,
+      item.CityName,
+      item.City,
+      item.Description,
+    ] : [])
+    .map(v => String(v || '').trim())
+    .find(Boolean);
+  if (!text) return '';
+  try {
+    const city = await resolveCity(text);
+    return city.ref || '';
+  } catch {
+    return '';
+  }
+}
+
+async function pickFirstWarehouseInCity(cityRef) {
+  if (!cityRef) return null;
+  try {
+    const response = await callNovaPoshta('Address', 'getWarehouses', {
+      CityRef: cityRef,
+      Limit: 1,
+      Page: 1,
+    });
+    return response.data?.[0] || null;
+  } catch {
+    return null;
+  }
+}
+
 let senderConfigCache = null;
 async function resolveSenderConfig() {
   const explicit = {
@@ -189,10 +238,12 @@ async function resolveSenderConfig() {
     ? addresses.find(x => x.Ref === explicit.SenderAddress) || { Ref: explicit.SenderAddress }
     : addresses[0] || null;
 
+  const autoCityRef = explicit.CitySender || pickCityRef(address, chosenSender) || await resolveSenderCityFromText(address, chosenSender);
+  const fallbackWarehouse = explicit.SenderAddress || pickWarehouseRef(address) ? null : await pickFirstWarehouseInCity(autoCityRef);
   const cfg = {
-    CitySender: explicit.CitySender || address?.CityRef || address?.CitySender || chosenSender.CityRef || chosenSender.CitySender || '',
+    CitySender: autoCityRef,
     Sender: explicit.Sender || chosenSender.Ref || '',
-    SenderAddress: explicit.SenderAddress || address?.Ref || '',
+    SenderAddress: explicit.SenderAddress || pickWarehouseRef(address) || pickWarehouseRef(fallbackWarehouse),
     ContactSender: explicit.ContactSender || contact?.Ref || '',
     SendersPhone: explicit.SendersPhone || normalizePhone(contact?.Phones || contact?.Phone || chosenSender.Phone || chosenSender.Phones),
   };
@@ -200,8 +251,10 @@ async function resolveSenderConfig() {
   if (missing.length) {
     throw new NovaPoshtaError('Nova Poshta sender config could not be auto-detected', {
       missing,
-      hint: 'Check that the Nova Poshta account has a sender, contact person, and sender warehouse/address.',
+      hint: 'In Nova Poshta cabinet add a sender warehouse/address, or set NP_SENDER_CITY_REF and NP_SENDER_ADDRESS_REF manually.',
       sender: chosenSender?.Description || chosenSender?.Ref || null,
+      addressesFound: addresses.length,
+      contactsFound: contacts.length,
     });
   }
   senderConfigCache = cfg;
