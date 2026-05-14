@@ -106,6 +106,108 @@ function requireSenderConfig() {
   return cfg;
 }
 
+function pickByPhone(items, phone) {
+  const target = normalizePhone(phone);
+  if (!target) return null;
+  return items.find(item => {
+    const phones = [
+      item.Phone,
+      item.Phones,
+      item.ContactPersonPhones,
+      item.CounterpartyPhone,
+      item.SendersPhone,
+    ].filter(Boolean).join(' ');
+    const digits = normalizePhone(phones);
+    return digits && (digits === target || digits.endsWith(target) || target.endsWith(digits));
+  }) || null;
+}
+
+async function getSenderCounterparties() {
+  const response = await callNovaPoshta('Counterparty', 'getCounterparties', {
+    CounterpartyProperty: 'Sender',
+    Page: '1',
+  });
+  return response.data || [];
+}
+
+async function getSenderContacts(senderRef) {
+  const props = { Ref: senderRef, CounterpartyProperty: 'Sender' };
+  try {
+    const response = await callNovaPoshta('Counterparty', 'getCounterpartyContactPersons', props);
+    return response.data || [];
+  } catch (firstError) {
+    const response = await callNovaPoshta('Counterparty', 'getCounterpartyContactPerson', props);
+    return response.data || [];
+  }
+}
+
+async function getSenderAddresses(senderRef) {
+  const response = await callNovaPoshta('Counterparty', 'getCounterpartyAddresses', {
+    Ref: senderRef,
+    CounterpartyProperty: 'Sender',
+  });
+  return response.data || [];
+}
+
+let senderConfigCache = null;
+async function resolveSenderConfig() {
+  const explicit = {
+    CitySender: env('NP_SENDER_CITY_REF'),
+    Sender: env('NP_SENDER_REF') || env('NP_SENDER_COUNTERPARTY_REF'),
+    SenderAddress: env('NP_SENDER_ADDRESS_REF') || env('NP_SENDER_WAREHOUSE_REF'),
+    ContactSender: env('NP_CONTACT_SENDER_REF'),
+    SendersPhone: normalizePhone(env('NP_SENDER_PHONE')),
+  };
+  if (Object.values(explicit).every(Boolean)) return explicit;
+  if (senderConfigCache) return senderConfigCache;
+
+  const counterparties = await getSenderCounterparties();
+  if (!counterparties.length) throw new NovaPoshtaError('Nova Poshta sender was not found in account', { method: 'Counterparty/getCounterparties' });
+
+  let chosenSender = explicit.Sender
+    ? counterparties.find(x => x.Ref === explicit.Sender) || { Ref: explicit.Sender }
+    : null;
+
+  const contactMap = new Map();
+  for (const sender of counterparties) {
+    if (!sender?.Ref) continue;
+    const contacts = await getSenderContacts(sender.Ref);
+    contactMap.set(sender.Ref, contacts);
+    if (!chosenSender && explicit.SendersPhone && pickByPhone(contacts, explicit.SendersPhone)) {
+      chosenSender = sender;
+      break;
+    }
+  }
+  if (!chosenSender) chosenSender = counterparties[0];
+
+  const contacts = contactMap.get(chosenSender.Ref) || await getSenderContacts(chosenSender.Ref);
+  const addresses = await getSenderAddresses(chosenSender.Ref);
+  const contact = explicit.ContactSender
+    ? contacts.find(x => x.Ref === explicit.ContactSender) || { Ref: explicit.ContactSender }
+    : pickByPhone(contacts, explicit.SendersPhone) || contacts[0] || null;
+  const address = explicit.SenderAddress
+    ? addresses.find(x => x.Ref === explicit.SenderAddress) || { Ref: explicit.SenderAddress }
+    : addresses[0] || null;
+
+  const cfg = {
+    CitySender: explicit.CitySender || address?.CityRef || address?.CitySender || chosenSender.CityRef || chosenSender.CitySender || '',
+    Sender: explicit.Sender || chosenSender.Ref || '',
+    SenderAddress: explicit.SenderAddress || address?.Ref || '',
+    ContactSender: explicit.ContactSender || contact?.Ref || '',
+    SendersPhone: explicit.SendersPhone || normalizePhone(contact?.Phones || contact?.Phone || chosenSender.Phone || chosenSender.Phones),
+  };
+  const missing = Object.entries(cfg).filter(([, value]) => !value).map(([key]) => key);
+  if (missing.length) {
+    throw new NovaPoshtaError('Nova Poshta sender config could not be auto-detected', {
+      missing,
+      hint: 'Check that the Nova Poshta account has a sender, contact person, and sender warehouse/address.',
+      sender: chosenSender?.Description || chosenSender?.Ref || null,
+    });
+  }
+  senderConfigCache = cfg;
+  return cfg;
+}
+
 async function resolveCity(cityName) {
   const query = String(cityName || '').trim();
   if (!query) throw new NovaPoshtaError('Recipient city is required');
@@ -200,7 +302,7 @@ function buildSeatsOptions() {
 }
 
 async function createInternetDocument(order) {
-  const sender = requireSenderConfig();
+  const sender = await resolveSenderConfig();
   const city = await resolveCity(order.city || order.delivery?.city);
   const warehouse = await resolveWarehouse(city.ref, order.postOffice || order.delivery?.postOffice);
   const recipient = await createRecipient(order);
@@ -296,10 +398,11 @@ function configStatus() {
   return {
     apiConfigured: !!NP_API_KEY,
     senderConfigured: missingSender.length === 0,
+    senderAutoDetect: !!NP_API_KEY,
     missing: [
       ...(!NP_API_KEY ? ['NOVA_POSHTA_API_KEY'] : []),
-      ...missingSender,
     ],
+    optionalSenderMissing: missingSender,
     apiUrl: NP_API_URL,
     autoSync: env('NP_AUTO_SYNC', 'true') !== 'false',
   };
