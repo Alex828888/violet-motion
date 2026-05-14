@@ -30,9 +30,20 @@ function normalizePhone(phone) {
 
 function todayNpDate() {
   const now = new Date();
+  return formatNpDate(now);
+}
+
+function formatNpDate(date) {
+  const now = new Date(date);
   const dd = String(now.getDate()).padStart(2, '0');
   const mm = String(now.getMonth() + 1).padStart(2, '0');
   return `${dd}.${mm}.${now.getFullYear()}`;
+}
+
+function dateDaysAgo(days) {
+  const d = new Date();
+  d.setDate(d.getDate() - Math.max(0, Number(days || 0)));
+  return d;
 }
 
 function splitFullName(value) {
@@ -449,6 +460,59 @@ async function trackDocuments(documents) {
   }));
 }
 
+function documentPhoneText(doc = {}) {
+  return [
+    doc.RecipientContactPhone,
+    doc.RecipientPhone,
+    doc.RecipientsPhone,
+    doc.PhoneRecipient,
+    doc.CounterpartyRecipientPhone,
+    doc.SendersPhone,
+    doc.SenderContactPhone,
+    doc.PhoneSender,
+  ].filter(Boolean).join(' ');
+}
+
+function normalizeDocumentListItem(doc = {}) {
+  const ttn = doc.IntDocNumber || doc.Number || doc.DocumentNumber || '';
+  return {
+    ttn,
+    ref: doc.Ref || '',
+    dateTime: doc.DateTime || doc.CreateTime || doc.CreationDate || doc.DateCreated || '',
+    recipientName: doc.RecipientContactPerson || doc.Recipient || doc.CounterpartyRecipientDescription || '',
+    recipientPhone: normalizePhone(documentPhoneText(doc)),
+    senderPhone: normalizePhone(doc.SendersPhone || doc.SenderContactPhone || ''),
+    status: doc.StateName || doc.Status || '',
+    cost: moneyNumber(doc.Cost || doc.AnnouncedPrice || 0),
+    raw: doc,
+  };
+}
+
+async function getDocumentList({ dateFrom, dateTo, page = 1, getFullList = true } = {}) {
+  const response = await callNovaPoshta('InternetDocument', 'getDocumentList', {
+    DateTimeFrom: dateFrom || formatNpDate(dateDaysAgo(14)),
+    DateTimeTo: dateTo || todayNpDate(),
+    Page: String(page || 1),
+    GetFullList: getFullList ? '1' : '0',
+  });
+  return (response.data || []).map(normalizeDocumentListItem).filter(x => x.ttn);
+}
+
+async function findDocumentsByRecipientPhone(phone, { daysBack = 14 } = {}) {
+  const target = normalizePhone(phone);
+  if (!target) return [];
+  const docs = await getDocumentList({
+    dateFrom: formatNpDate(dateDaysAgo(daysBack)),
+    dateTo: todayNpDate(),
+    page: 1,
+    getFullList: true,
+  });
+  return docs.filter(doc => {
+    const p = doc.recipientPhone || normalizePhone(documentPhoneText(doc.raw));
+    return p && (p === target || p.endsWith(target) || target.endsWith(p));
+  });
+}
+
 function configStatus() {
   const senderVars = ['NP_SENDER_CITY_REF', 'NP_SENDER_REF', 'NP_SENDER_ADDRESS_REF', 'NP_CONTACT_SENDER_REF', 'NP_SENDER_PHONE'];
   const missingSender = senderVars.filter(name => !env(name));
@@ -470,6 +534,8 @@ module.exports = {
   callNovaPoshta,
   createInternetDocument,
   trackDocuments,
+  getDocumentList,
+  findDocumentsByRecipientPhone,
   configStatus,
   normalizePhone,
 };

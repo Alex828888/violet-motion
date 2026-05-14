@@ -342,6 +342,14 @@ function isOrderActiveForNpSync(order) {
   const status = order?.status || 'new';
   return !!order?.ttn && !['cancelled', 'returned', 'completed'].includes(status);
 }
+function canAutoLinkManualNpOrder(order) {
+  const status = order?.status || 'new';
+  return !order?.ttn && !!order?.phone && ['confirmed', 'shipped', 'paid'].includes(status);
+}
+function ttnAlreadyUsed(orders, ttn, exceptOrderId = null) {
+  const value = String(ttn || '').trim();
+  return !!value && orders.some(o => String(o.ttn || '').trim() === value && Number(o.id) !== Number(exceptOrderId));
+}
 function novaIncomeAmount(order) {
   return Math.max(0, asMoneyNumber(order?.price) - asMoneyNumber(order?.cost || order?.costPrice || order?.purchasePrice));
 }
@@ -410,10 +418,53 @@ async function syncOrderWithNovaPoshta(order) {
   const updated = applyNovaTrackingToOrder(order, track);
   return { updated, track };
 }
+async function linkManualNovaPoshtaTtn(order, orders = read(F.orders)) {
+  if (!canAutoLinkManualNpOrder(order)) return { linked: false, reason: 'not_eligible' };
+  const daysBack = Math.max(1, Math.min(90, Number(process.env.NP_MANUAL_LOOKBACK_DAYS || 21)));
+  const docs = await novaPoshta.findDocumentsByRecipientPhone(order.phone, { daysBack });
+  const available = docs.filter(doc => doc.ttn && !ttnAlreadyUsed(orders, doc.ttn, order.id));
+  if (!available.length) return { linked: false, reason: 'not_found', checked: docs.length };
+  const picked = available[0];
+  const now = new Date().toISOString();
+  return {
+    linked: true,
+    ttn: picked.ttn,
+    order: {
+      ...order,
+      ttn: picked.ttn,
+      npRef: picked.ref || order.npRef || null,
+      npStatus: picked.status || order.npStatus || null,
+      deliveryStatus: order.deliveryStatus || 'ttn_added',
+      manualTtnAutoLinked: true,
+      manualTtnAutoLinkedAt: now,
+      novaPoshta: {
+        ...(order.novaPoshta && typeof order.novaPoshta === 'object' ? order.novaPoshta : {}),
+        manualDocument: picked,
+        linkedAt: now,
+      },
+      updatedAt: now,
+    },
+    document: picked,
+  };
+}
 async function syncOpenNovaPoshtaOrders(limit = 100) {
   const orders = read(F.orders);
   let changed = 0;
   const errors = [];
+  const linkCandidates = orders.filter(canAutoLinkManualNpOrder).slice(0, limit);
+  for (const order of linkCandidates) {
+    const idx = orders.findIndex(x => x.id === order.id);
+    if (idx < 0 || orders[idx].ttn) continue;
+    try {
+      const linked = await linkManualNovaPoshtaTtn(orders[idx], orders);
+      if (linked.linked) {
+        orders[idx] = linked.order;
+        changed++;
+      }
+    } catch (error) {
+      errors.push({ orderId: order.id, phone: order.phone, error: error.message, step: 'manual-link' });
+    }
+  }
   const candidates = orders.filter(isOrderActiveForNpSync).slice(0, limit);
   for (const order of candidates) {
     const idx = orders.findIndex(x => x.id === order.id);
@@ -427,7 +478,7 @@ async function syncOpenNovaPoshtaOrders(limit = 100) {
     }
   }
   if (changed) write(F.orders, orders);
-  return { checked: candidates.length, changed, errors };
+  return { checked: candidates.length, linkChecked: linkCandidates.length, changed, errors };
 }
 
 function escapeHtml(val) {
@@ -1150,6 +1201,29 @@ app.post('/api/admin/orders/:id/np/sync', authBot, async (req, res) => {
     write(F.orders, orders);
     updateOrderQueueNotice(orders[idx]).catch(e => console.error('[order notice]', e.message));
     res.json({ success: true, order: orders[idx], track });
+  } catch (error) {
+    res.status(502).json(npErrorPayload(error));
+  }
+});
+app.post('/api/admin/orders/:id/np/link-manual', authBot, async (req, res) => {
+  const id = Number(req.params.id);
+  const orders = read(F.orders);
+  const idx = orders.findIndex(x => x.id === id);
+  if (idx < 0) return res.status(404).json({ error: 'Not found' });
+  try {
+    const linked = await linkManualNovaPoshtaTtn(orders[idx], orders);
+    if (!linked.linked) return res.status(404).json({ error: 'Manual TTN was not found by recipient phone', reason: linked.reason, checked: linked.checked || 0 });
+    orders[idx] = linked.order;
+    try {
+      const synced = await syncOrderWithNovaPoshta(orders[idx]);
+      orders[idx] = synced.updated;
+      linked.track = synced.track;
+    } catch (error) {
+      linked.syncError = error.message;
+    }
+    write(F.orders, orders);
+    updateOrderQueueNotice(orders[idx]).catch(e => console.error('[order notice]', e.message));
+    res.json({ success: true, order: orders[idx], ttn: linked.ttn, document: linked.document, track: linked.track || null, syncError: linked.syncError || null });
   } catch (error) {
     res.status(502).json(npErrorPayload(error));
   }

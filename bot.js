@@ -207,6 +207,14 @@ function deliveryStepPrompt(step, order) {
   const current = order?.[step.orderKey] ? ` Поточне: ${order[step.orderKey]}.` : '';
   return `✍️ Введіть ${step.label}.${current}\nМожна написати "-" щоб залишити поточне значення.`;
 }
+function missingRecipientDeliveryFields(order) {
+  const missing = [];
+  if (!String(order?.fullName || order?.name || '').trim()) missing.push('ПІБ');
+  if (!String(order?.city || '').trim()) missing.push('місто/село');
+  if (!String(order?.postOffice || '').trim()) missing.push('відділення/поштомат НП');
+  if (!String(order?.size || '').trim()) missing.push('розмір');
+  return missing;
+}
 function hasUpsell(o) {
   return !!(o?.upsell && (o.upsell.name || asNumber(o.upsell.price) > 0));
 }
@@ -387,6 +395,7 @@ function orderDetailKeyboard(o) {
   };
   const rows = rowsByStatus[o.status || 'new'] || [];
   if ((o.status === 'confirmed' || o.status === 'shipped') && !o.ttn) {
+    rows.push([{ text: '🔎 Знайти ТТН по телефону', callback_data: `nplink_${id}` }]);
     rows.push([{ text: '🚚 Створити ТТН НП', callback_data: `npcreate_${id}` }]);
   }
   if (o.ttn) {
@@ -1502,6 +1511,14 @@ bot.on('callback_query', async q => {
 
     if (data.startsWith('npcreate_')) {
       const id = Number(data.slice(9));
+      const order = await serverGet(`/api/admin/orders/${id}`);
+      if (!order || order.error) { await bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB }); return; }
+      const missing = missingRecipientDeliveryFields(order).filter(x => x !== 'ПІБ' || !order.name);
+      if (missing.length) {
+        await bot.sendMessage(chatId, `ℹ️ Для створення ТТН не вистачає: <b>${esc(missing.join(', '))}</b>. Заповнимо зараз.`, { parse_mode: 'HTML' });
+        await askManagerDeliveryStep(chatId, id, 0);
+        return;
+      }
       const result = await serverPost(`/api/admin/orders/${id}/np/create`, {});
       if (!result || result.error) {
         const missing = Array.isArray(result?.missing) && result.missing.length ? `\nНе вистачає env: <code>${esc(result.missing.join(', '))}</code>` : '';
@@ -1509,6 +1526,18 @@ bot.on('callback_query', async q => {
         return;
       }
       await bot.sendMessage(chatId, `✅ ТТН створено: <code>${esc(result.ttn)}</code>`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
+      await showOrderDetail(chatId, id, msgId);
+      return;
+    }
+
+    if (data.startsWith('nplink_')) {
+      const id = Number(data.slice(7));
+      const result = await serverPost(`/api/admin/orders/${id}/np/link-manual`, {});
+      if (!result || result.error) {
+        await bot.sendMessage(chatId, `🔎 ТТН по телефону поки не знайдена.\n${esc(result?.error || '')}`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
+        return;
+      }
+      await bot.sendMessage(chatId, `✅ Знайшов і привʼязав ТТН: <code>${esc(result.ttn)}</code>`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
       await showOrderDetail(chatId, id, msgId);
       return;
     }
