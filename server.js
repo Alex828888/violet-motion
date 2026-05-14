@@ -16,6 +16,7 @@ const express = require('express');
 const fs      = require('fs');
 const path    = require('path');
 const cors    = require('cors');
+const novaPoshta = require('./nova-poshta');
 
 const app        = express();
 const PORT       = process.env.PORT       || 3000;
@@ -81,6 +82,16 @@ function write(file, data) {
 function nextId(arr) {
   return arr.length ? Math.max(...arr.map(x => x.id || 0)) + 1 : 1;
 }
+function mergeLegacyFileIfDataEmpty(key) {
+  const current = read(F[key]);
+  const legacyFile = path.join(ROOT, `${key}.json`);
+  if (current.length || !fs.existsSync(legacyFile)) return;
+  const legacy = read(legacyFile);
+  if (!Array.isArray(legacy) || !legacy.length) return;
+  write(F[key], legacy);
+  console.log(`[data] migrated ${legacy.length} legacy ${key} records into ${F[key]}`);
+}
+['orders', 'reviews', 'support'].forEach(mergeLegacyFileIfDataEmpty);
 
 /* ── Rate limiter ──────────────────────────────────────────── */
 const rateLimits = new Map();
@@ -294,6 +305,129 @@ function buildCrmSummary(period = 'today') {
     confirmedOrderCost: confirmedOrders.length ? adsExpense / confirmedOrders.length : 0,
     paidOrderCost: paidOrders.length ? adsExpense / paidOrders.length : 0,
   };
+}
+
+function financeExternalId(source, category, orderId, extra = '') {
+  return [source, category, orderId || 'none', extra || 'once'].join(':');
+}
+function addFinanceEntryOnce(entry) {
+  const finance = read(F.finance);
+  const externalId = entry.externalId || financeExternalId(entry.source || 'system', entry.category || 'manual', entry.orderId, entry.kind);
+  const existing = finance.find(x => x.externalId === externalId);
+  if (existing) return existing;
+  const item = {
+    id: nextId(finance),
+    type: entry.type,
+    title: sanitizeStr(entry.title || (entry.type === 'income' ? 'Income' : 'Expense'), 180),
+    amount: asMoneyNumber(entry.amount),
+    category: sanitizeStr(entry.category || 'manual', 60),
+    source: sanitizeStr(entry.source || 'system', 60),
+    orderId: entry.orderId ? Number(entry.orderId) : null,
+    externalId,
+    createdAt: entry.createdAt || new Date().toISOString(),
+  };
+  finance.push(item);
+  write(F.finance, finance);
+  return item;
+}
+function npErrorPayload(error) {
+  const details = error?.details || {};
+  return {
+    error: error?.message || 'Nova Poshta request failed',
+    details,
+    missing: details.missing || [],
+  };
+}
+function isOrderActiveForNpSync(order) {
+  const status = order?.status || 'new';
+  return !!order?.ttn && !['cancelled', 'returned', 'completed'].includes(status);
+}
+function novaIncomeAmount(order) {
+  return Math.max(0, asMoneyNumber(order?.price) - asMoneyNumber(order?.cost || order?.costPrice || order?.purchasePrice));
+}
+function applyNovaTrackingToOrder(order, track) {
+  const now = new Date().toISOString();
+  const patch = {
+    deliveryStatus: track.normalizedStatus,
+    npStatus: track.status || null,
+    npStatusCode: track.statusCode || null,
+    npSyncedAt: now,
+    novaPoshta: {
+      ...(order.novaPoshta && typeof order.novaPoshta === 'object' ? order.novaPoshta : {}),
+      tracking: track,
+      syncedAt: now,
+    },
+  };
+
+  if (track.normalizedStatus === 'delivered') {
+    patch.paymentStatus = 'paid';
+    patch.status = ['completed', 'paid'].includes(order.status) ? order.status : 'paid';
+    patch.paidAt = order.paidAt || now;
+    if (!order.baseIncomePosted) {
+      const amount = novaIncomeAmount(order);
+      if (amount > 0) {
+        addFinanceEntryOnce({
+          type: 'income',
+          title: `Nova Poshta payment #${order.id}`,
+          amount,
+          category: 'net_order',
+          source: 'nova-poshta',
+          orderId: order.id,
+          externalId: financeExternalId('nova-poshta', 'payment', order.id, track.number || order.ttn),
+        });
+      }
+      patch.baseIncomePosted = true;
+      patch.basePaidAt = now;
+    }
+  }
+
+  if (track.documentCost > 0) {
+    addFinanceEntryOnce({
+      type: 'expense',
+      title: `Nova Poshta delivery #${order.id}`,
+      amount: track.documentCost,
+      category: 'shipping',
+      source: 'nova-poshta',
+      orderId: order.id,
+      externalId: financeExternalId('nova-poshta', 'shipping', order.id, track.number || order.ttn),
+    });
+    patch.npDeliveryCost = order.npDeliveryCost || track.documentCost;
+  }
+
+  if (track.normalizedStatus === 'returned') {
+    patch.paymentStatus = 'returned';
+    patch.status = 'returned';
+    patch.returnedAt = order.returnedAt || now;
+  }
+
+  return { ...order, ...patch, updatedAt: now };
+}
+async function syncOrderWithNovaPoshta(order) {
+  if (!order?.ttn) throw new Error('Order has no TTN');
+  const docs = [{ DocumentNumber: String(order.ttn), Phone: novaPoshta.normalizePhone(order.phone) }];
+  const [track] = await novaPoshta.trackDocuments(docs);
+  if (!track) throw new Error('Nova Poshta returned no tracking data');
+  const updated = applyNovaTrackingToOrder(order, track);
+  return { updated, track };
+}
+async function syncOpenNovaPoshtaOrders(limit = 100) {
+  const orders = read(F.orders);
+  let changed = 0;
+  const errors = [];
+  const candidates = orders.filter(isOrderActiveForNpSync).slice(0, limit);
+  for (const order of candidates) {
+    const idx = orders.findIndex(x => x.id === order.id);
+    if (idx < 0) continue;
+    try {
+      const { updated } = await syncOrderWithNovaPoshta(orders[idx]);
+      orders[idx] = updated;
+      changed++;
+    } catch (error) {
+      errors.push({ orderId: order.id, ttn: order.ttn, error: error.message });
+    }
+  }
+  if (changed) write(F.orders, orders);
+  return { checked: candidates.length, changed, errors };
 }
 
 function escapeHtml(val) {
@@ -851,6 +985,20 @@ app.patch('/api/admin/orders/:id', authBot, (req, res) => {
   if (Object.prototype.hasOwnProperty.call(req.body || {}, 'status')) updateOrderQueueNotice(arr[idx]).catch(e => console.error('[order notice]', e.message));
   res.json(arr[idx]);
 });
+
+const npConfig = novaPoshta.configStatus();
+if (npConfig.autoSync && npConfig.apiConfigured) {
+  const intervalMs = Math.max(5, Number(process.env.NP_SYNC_INTERVAL_MINUTES || 30)) * 60 * 1000;
+  setInterval(() => {
+    syncOpenNovaPoshtaOrders(100)
+      .then(result => {
+        if (result.checked || result.errors.length) console.log('[NovaPoshta sync]', result);
+      })
+      .catch(error => console.error('[NovaPoshta sync]', error.message));
+  }, intervalMs).unref();
+} else if (!npConfig.apiConfigured) {
+  console.warn('[NovaPoshta] NOVA_POSHTA_API_KEY is not set; tracking and TTN creation are disabled.');
+}
 app.delete('/api/admin/orders/:id', authBot, (req, res) => {
   const id = Number(req.params.id); const arr = read(F.orders);
   if (!arr.some(x => x.id === id)) return res.status(404).json({ error: 'Not found' });
@@ -923,8 +1071,96 @@ app.get('/api/admin/crm/problems', authBot, (_req, res) => {
   }).filter(o => o.problems.length);
   res.json({ orders });
 });
-app.get('/api/admin/np/track/:ttn', authBot, (_req, res) => {
-  res.status(501).json({ error: 'Nova Poshta tracking is not configured' });
+app.get('/api/admin/np/config', authBot, (_req, res) => {
+  res.json(novaPoshta.configStatus());
+});
+app.get('/api/admin/np/track/:ttn', authBot, async (req, res) => {
+  try {
+    const [track] = await novaPoshta.trackDocuments([{ DocumentNumber: sanitizeStr(req.params.ttn, 40) }]);
+    if (!track) return res.status(404).json({ error: 'TTN not found' });
+    res.json(track);
+  } catch (error) {
+    res.status(502).json(npErrorPayload(error));
+  }
+});
+app.post('/api/admin/orders/:id/np/create', authBot, async (req, res) => {
+  const id = Number(req.params.id);
+  const orders = read(F.orders);
+  const idx = orders.findIndex(x => x.id === id);
+  if (idx < 0) return res.status(404).json({ error: 'Not found' });
+  const order = { ...orders[idx], ...(req.body && typeof req.body === 'object' ? req.body : {}) };
+  if (orders[idx].ttn && !req.body?.force) return res.json({ success: true, duplicate: true, order: orders[idx], ttn: orders[idx].ttn });
+  try {
+    const created = await novaPoshta.createInternetDocument(order);
+    const now = new Date().toISOString();
+    orders[idx] = {
+      ...orders[idx],
+      ...order,
+      ttn: created.ttn,
+      npRef: created.ref,
+      npEstimatedDeliveryDate: created.estimatedDeliveryDate,
+      npDeliveryCost: created.cost || orders[idx].npDeliveryCost || null,
+      deliveryStatus: 'shipped',
+      status: ['paid', 'completed'].includes(orders[idx].status) ? orders[idx].status : 'shipped',
+      novaPoshta: {
+        ...(orders[idx].novaPoshta && typeof orders[idx].novaPoshta === 'object' ? orders[idx].novaPoshta : {}),
+        ref: created.ref,
+        ttn: created.ttn,
+        city: created.city,
+        warehouse: created.warehouse,
+        recipient: {
+          ref: created.recipient.ref,
+          contactRef: created.recipient.contactRef,
+          description: created.recipient.description,
+          phone: created.recipient.phone,
+        },
+        estimatedDeliveryDate: created.estimatedDeliveryDate,
+        raw: created.raw,
+      },
+      ttnCreatedAt: now,
+      updatedAt: now,
+    };
+    write(F.orders, orders);
+    if (created.cost > 0) {
+      addFinanceEntryOnce({
+        type: 'expense',
+        title: `Nova Poshta delivery #${id}`,
+        amount: created.cost,
+        category: 'shipping',
+        source: 'nova-poshta',
+        orderId: id,
+        externalId: financeExternalId('nova-poshta', 'shipping', id, created.ttn),
+      });
+    }
+    updateOrderQueueNotice(orders[idx]).catch(e => console.error('[order notice]', e.message));
+    res.json({ success: true, order: orders[idx], novaPoshta: created, ttn: created.ttn });
+  } catch (error) {
+    res.status(502).json(npErrorPayload(error));
+  }
+});
+app.post('/api/admin/orders/:id/np/sync', authBot, async (req, res) => {
+  const id = Number(req.params.id);
+  const orders = read(F.orders);
+  const idx = orders.findIndex(x => x.id === id);
+  if (idx < 0) return res.status(404).json({ error: 'Not found' });
+  if (!orders[idx].ttn) return res.status(400).json({ error: 'Order has no TTN' });
+  try {
+    const { updated, track } = await syncOrderWithNovaPoshta(orders[idx]);
+    orders[idx] = updated;
+    write(F.orders, orders);
+    updateOrderQueueNotice(orders[idx]).catch(e => console.error('[order notice]', e.message));
+    res.json({ success: true, order: orders[idx], track });
+  } catch (error) {
+    res.status(502).json(npErrorPayload(error));
+  }
+});
+app.post('/api/admin/np/sync', authBot, async (req, res) => {
+  try {
+    const limit = Math.max(1, Math.min(100, Number(req.body?.limit || 100)));
+    res.json({ success: true, ...(await syncOpenNovaPoshtaOrders(limit)) });
+  } catch (error) {
+    res.status(502).json(npErrorPayload(error));
+  }
 });
 app.get('/api/admin/reviews',       authBot, (_req, res) => res.json(read(F.reviews)));
 app.delete('/api/admin/reviews/:id', authBot, (req, res) => {

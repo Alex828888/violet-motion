@@ -1,0 +1,315 @@
+'use strict';
+
+const NP_API_URL = process.env.NP_API_URL || 'https://api.novaposhta.ua/v2.0/json/';
+const NP_API_KEY = process.env.NOVA_POSHTA_API_KEY || process.env.NP_API_KEY || '';
+
+class NovaPoshtaError extends Error {
+  constructor(message, details = {}) {
+    super(message);
+    this.name = 'NovaPoshtaError';
+    this.details = details;
+  }
+}
+
+function env(name, fallback = '') {
+  return String(process.env[name] || fallback || '').trim();
+}
+
+function moneyNumber(value) {
+  if (value === null || value === undefined || value === '') return 0;
+  const n = Number(String(value).replace(',', '.').replace(/[^\d.-]/g, ''));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function normalizePhone(phone) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  if (digits.length === 10 && digits.startsWith('0')) return `38${digits}`;
+  if (digits.length === 12 && digits.startsWith('380')) return digits;
+  return digits;
+}
+
+function todayNpDate() {
+  const now = new Date();
+  const dd = String(now.getDate()).padStart(2, '0');
+  const mm = String(now.getMonth() + 1).padStart(2, '0');
+  return `${dd}.${mm}.${now.getFullYear()}`;
+}
+
+function splitFullName(value) {
+  const parts = String(value || '').trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return { firstName: '', lastName: '', middleName: '' };
+  if (parts.length === 1) return { firstName: parts[0], lastName: parts[0], middleName: '' };
+  return {
+    lastName: parts[0],
+    firstName: parts[1],
+    middleName: parts.slice(2).join(' '),
+  };
+}
+
+async function callNovaPoshta(modelName, calledMethod, methodProperties = {}, apiKey = NP_API_KEY) {
+  if (!apiKey) throw new NovaPoshtaError('Nova Poshta API key is not configured', { missing: ['NOVA_POSHTA_API_KEY'] });
+
+  const ctrl = new AbortController();
+  const timeout = setTimeout(() => ctrl.abort(), Number(process.env.NP_TIMEOUT_MS || 15000));
+  try {
+    const response = await fetch(NP_API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: ctrl.signal,
+      body: JSON.stringify({ apiKey, modelName, calledMethod, methodProperties }),
+    });
+    const text = await response.text();
+    let payload = null;
+    try { payload = JSON.parse(text); } catch {}
+    if (!response.ok) {
+      throw new NovaPoshtaError(`Nova Poshta HTTP ${response.status}`, { status: response.status, body: text.slice(0, 1000) });
+    }
+    if (!payload || payload.success !== true) {
+      throw new NovaPoshtaError('Nova Poshta API returned an error', {
+        modelName, calledMethod,
+        errors: payload?.errors || [],
+        warnings: payload?.warnings || [],
+        info: payload?.info || [],
+        raw: payload,
+      });
+    }
+    return payload;
+  } catch (error) {
+    if (error.name === 'AbortError') throw new NovaPoshtaError('Nova Poshta request timed out', { modelName, calledMethod });
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function requireSenderConfig() {
+  const cfg = {
+    CitySender: env('NP_SENDER_CITY_REF'),
+    Sender: env('NP_SENDER_REF') || env('NP_SENDER_COUNTERPARTY_REF'),
+    SenderAddress: env('NP_SENDER_ADDRESS_REF') || env('NP_SENDER_WAREHOUSE_REF'),
+    ContactSender: env('NP_CONTACT_SENDER_REF'),
+    SendersPhone: normalizePhone(env('NP_SENDER_PHONE')),
+  };
+  const missing = Object.entries(cfg).filter(([, value]) => !value).map(([key]) => key);
+  if (missing.length) {
+    throw new NovaPoshtaError('Nova Poshta sender config is incomplete', {
+      missing,
+      env: [
+        'NP_SENDER_CITY_REF',
+        'NP_SENDER_REF',
+        'NP_SENDER_ADDRESS_REF',
+        'NP_CONTACT_SENDER_REF',
+        'NP_SENDER_PHONE',
+      ],
+    });
+  }
+  return cfg;
+}
+
+async function resolveCity(cityName) {
+  const query = String(cityName || '').trim();
+  if (!query) throw new NovaPoshtaError('Recipient city is required');
+
+  const searched = await callNovaPoshta('Address', 'searchSettlements', { CityName: query, Limit: 10, Page: 1 });
+  const addresses = searched.data?.[0]?.Addresses || [];
+  const match = addresses.find(x => x.DeliveryCity || x.Ref) || null;
+  if (match) {
+    return {
+      ref: match.DeliveryCity || match.Ref,
+      settlementRef: match.Ref || null,
+      description: match.Present || match.MainDescription || query,
+      raw: match,
+    };
+  }
+
+  const cities = await callNovaPoshta('Address', 'getCities', { FindByString: query, Limit: 10 });
+  const city = cities.data?.[0] || null;
+  if (!city?.Ref) throw new NovaPoshtaError('Nova Poshta city was not found', { city: query });
+  return { ref: city.Ref, settlementRef: city.SettlementRef || null, description: city.Description || query, raw: city };
+}
+
+async function resolveWarehouse(cityRef, warehouseQuery) {
+  const query = String(warehouseQuery || '').trim();
+  if (!cityRef) throw new NovaPoshtaError('Recipient city ref is required');
+  if (!query) throw new NovaPoshtaError('Recipient warehouse is required');
+
+  const result = await callNovaPoshta('Address', 'getWarehouses', {
+    CityRef: cityRef,
+    FindByString: query,
+    Limit: 50,
+    Page: 1,
+  });
+  const digits = query.match(/\d+/)?.[0] || '';
+  const list = result.data || [];
+  const exact = list.find(w => digits && String(w.Number) === digits);
+  const fallback = list[0] || null;
+  const warehouse = exact || fallback;
+  if (!warehouse?.Ref) throw new NovaPoshtaError('Nova Poshta warehouse was not found', { warehouse: query });
+  return {
+    ref: warehouse.Ref,
+    number: warehouse.Number || digits || '',
+    description: warehouse.Description || warehouse.ShortAddress || query,
+    raw: warehouse,
+  };
+}
+
+async function createRecipient(order) {
+  const phone = normalizePhone(order.phone);
+  const fullName = order.fullName || order.name;
+  const { firstName, lastName, middleName } = splitFullName(fullName);
+  if (!phone || !firstName || !lastName) throw new NovaPoshtaError('Recipient name or phone is incomplete');
+
+  const result = await callNovaPoshta('Counterparty', 'save', {
+    FirstName: firstName,
+    MiddleName: middleName || '',
+    LastName: lastName,
+    Phone: phone,
+    Email: env('NP_RECIPIENT_FALLBACK_EMAIL', ''),
+    CounterpartyType: 'PrivatePerson',
+    CounterpartyProperty: 'Recipient',
+  });
+  const recipient = result.data?.[0] || null;
+  const contact = recipient?.ContactPerson?.data?.[0] || recipient?.ContactPerson?.[0] || null;
+  if (!recipient?.Ref || !contact?.Ref) {
+    throw new NovaPoshtaError('Nova Poshta did not return recipient refs', { raw: result.data });
+  }
+  return {
+    ref: recipient.Ref,
+    contactRef: contact.Ref,
+    description: recipient.Description || fullName,
+    firstName,
+    lastName,
+    middleName,
+    phone,
+    raw: recipient,
+  };
+}
+
+function buildSeatsOptions() {
+  const width = moneyNumber(env('NP_SEAT_WIDTH_CM'));
+  const length = moneyNumber(env('NP_SEAT_LENGTH_CM'));
+  const height = moneyNumber(env('NP_SEAT_HEIGHT_CM'));
+  const weight = moneyNumber(env('NP_WEIGHT_KG', '1'));
+  if (!width || !length || !height) return null;
+  return [{
+    volumetricWidth: width,
+    volumetricLength: length,
+    volumetricHeight: height,
+    weight,
+  }];
+}
+
+async function createInternetDocument(order) {
+  const sender = requireSenderConfig();
+  const city = await resolveCity(order.city || order.delivery?.city);
+  const warehouse = await resolveWarehouse(city.ref, order.postOffice || order.delivery?.postOffice);
+  const recipient = await createRecipient(order);
+  const price = Math.max(1, moneyNumber(order.price || process.env.PRODUCT_PRICE || 0));
+  const description = env('NP_DESCRIPTION', order.product || process.env.PRODUCT_NAME || 'Order');
+  const weight = moneyNumber(env('NP_WEIGHT_KG', '1')) || 1;
+  const volume = moneyNumber(env('NP_VOLUME_GENERAL', '0.002')) || 0.002;
+  const seats = Math.max(1, Math.round(moneyNumber(env('NP_SEATS_AMOUNT', '1')) || 1));
+
+  const properties = {
+    PayerType: env('NP_PAYER_TYPE', 'Recipient'),
+    PaymentMethod: env('NP_PAYMENT_METHOD', 'Cash'),
+    DateTime: todayNpDate(),
+    CargoType: env('NP_CARGO_TYPE', 'Parcel'),
+    VolumeGeneral: String(volume),
+    Weight: String(weight),
+    ServiceType: env('NP_SERVICE_TYPE', 'WarehouseWarehouse'),
+    SeatsAmount: String(seats),
+    Description: description,
+    Cost: String(price),
+    CitySender: sender.CitySender,
+    Sender: sender.Sender,
+    SenderAddress: sender.SenderAddress,
+    ContactSender: sender.ContactSender,
+    SendersPhone: sender.SendersPhone,
+    CityRecipient: city.ref,
+    Recipient: recipient.ref,
+    RecipientAddress: warehouse.ref,
+    ContactRecipient: recipient.contactRef,
+    RecipientsPhone: recipient.phone,
+  };
+
+  const optionsSeat = buildSeatsOptions();
+  if (optionsSeat) properties.OptionsSeat = optionsSeat;
+  if (env('NP_COD_ENABLED', 'true') !== 'false' && price > 0) {
+    properties.BackwardDeliveryData = [{
+      PayerType: env('NP_COD_PAYER_TYPE', 'Recipient'),
+      CargoType: 'Money',
+      RedeliveryString: String(price),
+    }];
+  }
+
+  const result = await callNovaPoshta('InternetDocument', 'save', properties);
+  const doc = result.data?.[0] || null;
+  if (!doc?.IntDocNumber) throw new NovaPoshtaError('Nova Poshta did not return TTN number', { raw: result.data });
+
+  return {
+    ttn: doc.IntDocNumber,
+    ref: doc.Ref || null,
+    cost: moneyNumber(doc.CostOnSite || doc.Cost),
+    estimatedDeliveryDate: doc.EstimatedDeliveryDate || null,
+    city,
+    warehouse,
+    recipient,
+    raw: doc,
+  };
+}
+
+function normalizeTrackingStatus(item = {}) {
+  const statusText = String(item.Status || item.StatusDescription || '').toLowerCase();
+  const code = String(item.StatusCode || item.StatusCodeDescription || '').trim();
+  const returned = ['102', '103', '106'].includes(code) || /(повер|возврат|відмов|отказ)/i.test(statusText);
+  const delivered = ['9', '10', '11'].includes(code) || /(отриман|получен|доставлен)/i.test(statusText);
+  const inTransit = !returned && !delivered && /(дороз|пути|відділен|відправ|прибул|прямує|ожида)/i.test(statusText);
+  return returned ? 'returned' : delivered ? 'delivered' : inTransit ? 'in_transit' : 'unknown';
+}
+
+async function trackDocuments(documents) {
+  const docs = documents
+    .map(item => typeof item === 'string' ? { DocumentNumber: item } : item)
+    .filter(item => item?.DocumentNumber);
+  if (!docs.length) return [];
+  const result = await callNovaPoshta('TrackingDocument', 'getStatusDocuments', { Documents: docs.slice(0, 100) });
+  return (result.data || []).map(item => ({
+    number: item.Number || item.DocumentNumber || '',
+    status: item.Status || '',
+    statusCode: String(item.StatusCode || ''),
+    normalizedStatus: normalizeTrackingStatus(item),
+    city: item.CityRecipient || item.CityRecipientDescription || '',
+    warehouse: item.WarehouseRecipient || item.WarehouseRecipientDescription || '',
+    sentAt: item.DateCreated || '',
+    receivedAt: item.ActualDeliveryDate || item.RecipientDateTime || '',
+    documentCost: moneyNumber(item.DocumentCost || item.CheckWeight || 0),
+    announcedPrice: moneyNumber(item.AnnouncedPrice || item.Cost || 0),
+    redeliverySum: moneyNumber(item.RedeliverySum || item.AfterpaymentOnGoodsCost || 0),
+    raw: item,
+  }));
+}
+
+function configStatus() {
+  const senderVars = ['NP_SENDER_CITY_REF', 'NP_SENDER_REF', 'NP_SENDER_ADDRESS_REF', 'NP_CONTACT_SENDER_REF', 'NP_SENDER_PHONE'];
+  const missingSender = senderVars.filter(name => !env(name));
+  return {
+    apiConfigured: !!NP_API_KEY,
+    senderConfigured: missingSender.length === 0,
+    missing: [
+      ...(!NP_API_KEY ? ['NOVA_POSHTA_API_KEY'] : []),
+      ...missingSender,
+    ],
+    apiUrl: NP_API_URL,
+    autoSync: env('NP_AUTO_SYNC', 'true') !== 'false',
+  };
+}
+
+module.exports = {
+  NovaPoshtaError,
+  callNovaPoshta,
+  createInternetDocument,
+  trackDocuments,
+  configStatus,
+  normalizePhone,
+};
