@@ -7,8 +7,78 @@
 const API = '';
 
 /* ── Facebook Pixel ─────────────────────────────────────────── */
-function fbTrack(event, params = {}) {
-  if (typeof fbq === 'function') fbq('track', event, params);
+const META_MATCH_STORAGE_KEY = 'vm_meta_match';
+const META_PIXEL_ID = window.VM_PIXEL_ID || '2110562173060470';
+
+function cleanMetaText(value) {
+  return String(value || '').trim().toLowerCase();
+}
+function splitMetaName(value) {
+  const parts = cleanMetaText(value).split(/\s+/).filter(Boolean);
+  return { fn: parts[0] || '', ln: parts.length > 1 ? parts.slice(1).join(' ') : '' };
+}
+function normalizePhoneForMeta(phone) {
+  let digits = String(phone || '').replace(/\D/g, '');
+  if (digits.startsWith('00')) digits = digits.slice(2);
+  if (digits.startsWith('380')) return digits;
+  if (digits.startsWith('38')) return digits;
+  if (digits.startsWith('0')) return `38${digits}`;
+  return digits;
+}
+function readMetaMatch() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(META_MATCH_STORAGE_KEY) || '{}');
+    return stored && typeof stored === 'object' ? stored : {};
+  } catch {
+    return {};
+  }
+}
+function writeMetaMatch(match) {
+  const clean = Object.fromEntries(Object.entries(match).filter(([, value]) => value));
+  try { localStorage.setItem(META_MATCH_STORAGE_KEY, JSON.stringify(clean)); } catch {}
+  window.VM_META_MATCH = clean;
+  if (typeof fbq === 'function') fbq('init', META_PIXEL_ID, clean);
+  return clean;
+}
+function updateMetaAdvancedMatching(data = {}) {
+  const existing = readMetaMatch();
+  const nameParts = splitMetaName(data.fullName || data.name || `${existing.fn || ''} ${existing.ln || ''}`);
+  const phone = normalizePhoneForMeta(data.phone || existing.ph);
+  const email = cleanMetaText(data.email || existing.em);
+  const city = cleanMetaText(data.city || existing.ct);
+  const externalId = phone || email || existing.external_id || '';
+  return writeMetaMatch({
+    ...existing,
+    em: email || existing.em || '',
+    ph: phone || existing.ph || '',
+    fn: nameParts.fn || existing.fn || '',
+    ln: nameParts.ln || existing.ln || '',
+    ct: city || existing.ct || '',
+    country: 'ua',
+    external_id: externalId,
+  });
+}
+function metaEventId(event) {
+  return `${event}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+function getCookie(name) {
+  const value = document.cookie.split('; ').find(row => row.startsWith(`${name}=`));
+  return value ? decodeURIComponent(value.split('=').slice(1).join('=')) : '';
+}
+function metaBrowserData(eventId) {
+  return {
+    eventId,
+    eventSourceUrl: location.href,
+    fbp: getCookie('_fbp'),
+    fbc: getCookie('_fbc'),
+    metaMatch: readMetaMatch(),
+  };
+}
+function fbTrack(event, params = {}, options = {}) {
+  if (typeof fbq !== 'function') return '';
+  const eventId = options.eventId || metaEventId(event);
+  fbq('track', event, params, { eventID: eventId });
+  return eventId;
 }
 function ttTrack(event, params = {}) {
   if (window.ttq && typeof window.ttq.track === 'function') window.ttq.track(event, params);
@@ -510,6 +580,8 @@ async function sendPendingOrder(mode, extra = {}) {
   const city = String(extra.city || '').trim();
   const district = String(extra.district || '').trim();
   const postOffice = String(extra.postOffice || '').trim();
+  updateMetaAdvancedMatching({ ...pendingOrder, fullName, city });
+  const leadEventId = metaEventId('Lead');
   const payload = {
     ...pendingOrder,
     orderMode: mode,
@@ -520,6 +592,7 @@ async function sendPendingOrder(mode, extra = {}) {
     delivery: { fullName, city, district, postOffice },
     replaceOrderId: mode === 'instant' ? pendingManualOrderId : null,
     clientOrderKey: pendingOrderKey,
+    meta: metaBrowserData(leadEventId),
     product: 'Violet Motion Sneakers',
     price: '895',
   };
@@ -551,7 +624,7 @@ async function sendPendingOrder(mode, extra = {}) {
       successCloseBtn.textContent = 'ЗАКРИТИ';
     }
     if (instantOrderBtn) instantOrderBtn.disabled = false;
-    fbTrack('Lead', { content_name: 'Violet Motion Order', value: 895, currency: 'UAH' });
+    fbTrack('Lead', { content_name: 'Violet Motion Order', value: 895, currency: 'UAH' }, { eventId: leadEventId });
     Analytics.track('order_success', { size: pendingOrder.size, mode });
     return { success: true, id: result.id, payload };
   }
@@ -560,7 +633,7 @@ async function sendPendingOrder(mode, extra = {}) {
   instantOrderSent = true;
   pendingManualOrderId = null;
   pendingOrderKey = '';
-  fbTrack('Lead', { content_name: 'Violet Motion Order', value: 895, currency: 'UAH' });
+  fbTrack('Lead', { content_name: 'Violet Motion Order', value: 895, currency: 'UAH' }, { eventId: leadEventId });
   ttTrack('Purchase', { content_type: 'product', content_ids: ['violet-motion-001'], content_name: 'Violet Motion Sneakers', value: 895, currency: 'UAH', quantity: 1 });
   Analytics.track('order_success', { size: pendingOrder.size, mode });
   resetOrderForm();
@@ -735,7 +808,8 @@ document.getElementById('orderForm').addEventListener('submit', async e => {
   showMsg(msgEl, '', '');
 
   await ttIdentifyPhone(phone);
-  fbTrack('InitiateCheckout', { content_name: 'Violet Motion Sneakers', content_ids: ['violet-motion-001'], value: 895, currency: 'UAH', num_items: 1 });
+  updateMetaAdvancedMatching({ name, phone });
+  const checkoutEventId = fbTrack('InitiateCheckout', { content_name: 'Violet Motion Sneakers', content_ids: ['violet-motion-001'], value: 895, currency: 'UAH', num_items: 1 });
   ttTrack('InitiateCheckout', { content_type: 'product', content_ids: ['violet-motion-001'], content_name: 'Violet Motion Sneakers', value: 895, currency: 'UAH', quantity: 1 });
   Analytics.track('form_submit', { size, viaTelegram: viaTg });
 
@@ -749,16 +823,19 @@ document.getElementById('orderForm').addEventListener('submit', async e => {
   pendingManualOrderId = null;
   instantOrderSent = false;
   pendingOrderKey = `order_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  pendingOrder.meta = metaBrowserData(checkoutEventId);
   showSuccessOverlay(pendingOrder);
   sendPendingOrder('manual');
 });
 
 window.addEventListener('beforeunload', () => {
   if (!pendingOrder || pendingManualOrderId || instantOrderSent || !pendingOrderKey || !navigator.sendBeacon) return;
+  const leadEventId = metaEventId('Lead');
   const payload = {
     ...pendingOrder,
     orderMode: 'manual',
     clientOrderKey: pendingOrderKey,
+    meta: metaBrowserData(leadEventId),
     product: 'Violet Motion Sneakers',
     price: '895',
   };
