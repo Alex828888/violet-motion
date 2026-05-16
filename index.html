@@ -11,12 +11,18 @@
   <link rel="stylesheet" href="style.css" />
 
   <script>
+  window.VM_PIXEL_ID = '2110562173060470';
+  window.VM_META_MATCH = {};
+  try {
+    var storedMetaMatch = JSON.parse(localStorage.getItem('vm_meta_match') || '{}');
+    if (storedMetaMatch && typeof storedMetaMatch === 'object') window.VM_META_MATCH = storedMetaMatch;
+  } catch (e) {}
   !function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?
   n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;
   n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;
   t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}(window,
   document,'script','https://connect.facebook.net/en_US/fbevents.js');
-  fbq('init', '2110562173060470');
+  fbq('init', window.VM_PIXEL_ID, window.VM_META_MATCH);
   fbq('track', 'PageView');
   fbq('track', 'ViewContent', {content_name:'Violet Motion Sneakers',value:895,currency:'UAH'});
   </script>

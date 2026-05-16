@@ -16,6 +16,7 @@ const express = require('express');
 const fs      = require('fs');
 const path    = require('path');
 const cors    = require('cors');
+const crypto  = require('crypto');
 const novaPoshta = require('./nova-poshta');
 
 const app        = express();
@@ -41,6 +42,9 @@ const PRODUCT_SOLE = process.env.PRODUCT_SOLE || 'light, cushioned, comfortable 
 const PRODUCT_BEST_FOR = process.env.PRODUCT_BEST_FOR || 'daily wear, city walks, travel, spring, summer, and warm autumn';
 const PRODUCT_PRICE = process.env.PRODUCT_PRICE || '895';
 const PRODUCT_OLD_PRICE = process.env.PRODUCT_OLD_PRICE || '1899';
+const META_PIXEL_ID = process.env.META_PIXEL_ID || '2110562173060470';
+const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN || '';
+const META_TEST_EVENT_CODE = process.env.META_TEST_EVENT_CODE || '';
 const npCreateLocks = new Map();
 
 app.set('trust proxy', 1);
@@ -221,6 +225,86 @@ function authBot(req, res, next) {
 }
 
 function sanitizeStr(val, max = 200) { return String(val || '').trim().slice(0, max); }
+function sha256Meta(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  return raw ? crypto.createHash('sha256').update(raw).digest('hex') : '';
+}
+function normalizeMetaPhone(phone) {
+  let digits = String(phone || '').replace(/\D/g, '');
+  if (digits.startsWith('00')) digits = digits.slice(2);
+  if (digits.startsWith('380')) return digits;
+  if (digits.startsWith('38')) return digits;
+  if (digits.startsWith('0')) return `38${digits}`;
+  return digits;
+}
+function splitMetaName(value) {
+  const parts = String(value || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
+  return { fn: parts[0] || '', ln: parts.length > 1 ? parts.slice(1).join(' ') : '' };
+}
+function clientIp(req) {
+  const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return forwarded || req.ip || req.socket?.remoteAddress || '';
+}
+function buildMetaUserData(order, req, meta = {}) {
+  const match = meta && typeof meta.metaMatch === 'object' ? meta.metaMatch : {};
+  const nameParts = splitMetaName(order.fullName || order.name || `${match.fn || ''} ${match.ln || ''}`);
+  const phone = normalizeMetaPhone(order.phone || match.ph);
+  const email = String(order.email || match.em || '').trim().toLowerCase();
+  const city = String(order.city || match.ct || '').trim().toLowerCase();
+  const userData = {
+    client_ip_address: clientIp(req),
+    client_user_agent: String(req.headers['user-agent'] || ''),
+    country: [sha256Meta('ua')],
+  };
+  if (phone) userData.ph = [sha256Meta(phone)];
+  if (email) userData.em = [sha256Meta(email)];
+  if (nameParts.fn) userData.fn = [sha256Meta(nameParts.fn)];
+  if (nameParts.ln) userData.ln = [sha256Meta(nameParts.ln)];
+  if (city) userData.ct = [sha256Meta(city)];
+  if (phone || email || match.external_id) userData.external_id = [sha256Meta(phone || email || match.external_id)];
+  if (meta.fbp) userData.fbp = String(meta.fbp);
+  if (meta.fbc) userData.fbc = String(meta.fbc);
+  return Object.fromEntries(Object.entries(userData).filter(([, value]) => {
+    if (Array.isArray(value)) return value.some(Boolean);
+    return !!value;
+  }));
+}
+async function sendMetaConversionEvent(eventName, order, req, meta = {}, customData = {}) {
+  if (!META_ACCESS_TOKEN || !META_PIXEL_ID) return null;
+  const eventId = sanitizeStr(meta.eventId || `${eventName}_${order.id}_${Date.now()}`, 120);
+  const payload = {
+    data: [{
+      event_name: eventName,
+      event_time: Math.floor(Date.now() / 1000),
+      event_id: eventId,
+      action_source: 'website',
+      event_source_url: sanitizeStr(meta.eventSourceUrl || req.headers.referer || '', 500),
+      user_data: buildMetaUserData(order, req, meta),
+      custom_data: {
+        currency: 'UAH',
+        value: asMoneyNumber(order.price || PRODUCT_PRICE),
+        content_name: order.product || PRODUCT_NAME,
+        content_ids: ['violet-motion-001'],
+        content_type: 'product',
+        ...customData,
+      },
+    }],
+  };
+  if (META_TEST_EVENT_CODE) payload.test_event_code = META_TEST_EVENT_CODE;
+  try {
+    const response = await fetch(`https://graph.facebook.com/v19.0/${encodeURIComponent(META_PIXEL_ID)}/events?access_token=${encodeURIComponent(META_ACCESS_TOKEN)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) console.error('[Meta CAPI]', response.status, data?.error?.message || 'request failed');
+    return data;
+  } catch (error) {
+    console.error('[Meta CAPI]', error.message);
+    return null;
+  }
+}
 function asMoneyNumber(val) {
   if (val === null || val === undefined || val === '') return 0;
   const n = Number(String(val).replace(',', '.').replace(/[^\d.-]/g, ''));
@@ -1641,7 +1725,7 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
   const {
     name, phone, size, color, product, price, contactViaTelegram,
     orderMode, fullName, city, district, postOffice, delivery,
-    replaceOrderId, clientOrderKey,
+    replaceOrderId, clientOrderKey, meta,
   } = req.body;
   if (!name || !phone || !size) return res.status(400).json({ error: 'Missing fields' });
 
@@ -1697,6 +1781,7 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
   };
   activeOrders.push(o); write(F.orders, activeOrders);
   await updateOrderQueueNotice(o);
+  sendMetaConversionEvent('Lead', o, req, meta, { order_id: String(o.id) }).catch(e => console.error('[Meta CAPI]', e.message));
 
   const ts = new Date(o.createdAt).toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' });
   const isInstant = o.orderMode === 'instant';
