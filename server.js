@@ -241,6 +241,11 @@ function splitMetaName(value) {
   const parts = String(value || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
   return { fn: parts[0] || '', ln: parts.length > 1 ? parts.slice(1).join(' ') : '' };
 }
+function metaContentId(order) {
+  const product = String(order?.product || PRODUCT_NAME || '').toLowerCase();
+  if (product.includes('black breeze') || product.includes('sandal')) return 'black-breeze-sandals-001';
+  return 'violet-motion-001';
+}
 function clientIp(req) {
   const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
   return forwarded || req.ip || req.socket?.remoteAddress || '';
@@ -284,7 +289,7 @@ async function sendMetaConversionEvent(eventName, order, req, meta = {}, customD
         currency: 'UAH',
         value: asMoneyNumber(order.price || PRODUCT_PRICE),
         content_name: order.product || PRODUCT_NAME,
-        content_ids: ['violet-motion-001'],
+        content_ids: [metaContentId(order)],
         content_type: 'product',
         ...customData,
       },
