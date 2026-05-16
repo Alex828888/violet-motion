@@ -229,6 +229,23 @@ function asMoneyNumber(val) {
 function orderPaymentStatus(o) {
   return o?.paymentStatus || (o?.status === 'paid' || o?.status === 'completed' ? 'paid' : o?.status === 'returned' ? 'returned' : 'unpaid');
 }
+function deliveryStatusValue(o) {
+  const value = o?.deliveryStatus || '';
+  if (value === 'shipped' && o?.ttnCreatedAt && !o?.npStatus && !['paid', 'completed', 'returned'].includes(o?.status || 'new')) {
+    return 'ttn_created';
+  }
+  return value || (o?.ttn ? 'ttn_added' : '');
+}
+function isOrderActuallyShipped(o) {
+  const deliveryStatus = deliveryStatusValue(o);
+  if (['in_transit', 'delivered'].includes(deliveryStatus)) return true;
+  if (['paid', 'completed'].includes(o?.status || 'new')) return true;
+  if ((o?.status || 'new') === 'shipped' && !['ttn_created', 'ttn_added', 'ready_for_np', 'ready_for_dispatch', 'unknown'].includes(deliveryStatus)) return true;
+  return false;
+}
+function orderStatusForDisplay(o) {
+  return (o?.status === 'shipped' && !isOrderActuallyShipped(o)) ? 'confirmed' : (o?.status || 'new');
+}
 function orderExpensesTotal(o) {
   const list = Array.isArray(o?.expenses) ? o.expenses : [];
   return list.reduce((sum, e) => sum + asMoneyNumber(e.amount), 0) + asMoneyNumber(o?.extraExpenses || o?.expense || o?.returnExpense);
@@ -309,7 +326,7 @@ function buildProductBreakdown(orders) {
     item.orders += 1;
     if (o.status === 'new') item.newOrders += 1;
     if (['confirmed', 'shipped', 'paid', 'completed'].includes(o.status)) item.confirmedOrders += 1;
-    if (o.status === 'shipped') item.shippedOrders += 1;
+    if (isOrderActuallyShipped(o)) item.shippedOrders += 1;
     if (orderPaymentStatus(o) === 'paid' || o.status === 'paid' || o.status === 'completed') item.paidOrders += 1;
     if (orderPaymentStatus(o) === 'returned' || o.status === 'returned') item.returns += 1;
     if (!o.ttn) item.withoutTtn += 1;
@@ -326,7 +343,7 @@ function buildCrmSummary(period = 'today') {
   const adsExpense = finance.filter(x => x.type === 'expense' && x.category === 'ads').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
   const paidOrders = orders.filter(o => orderPaymentStatus(o) === 'paid' || o.status === 'paid' || o.status === 'completed');
   const returns = orders.filter(o => orderPaymentStatus(o) === 'returned' || o.status === 'returned');
-  const confirmedOrders = orders.filter(o => o.status === 'confirmed' || o.status === 'shipped' || o.status === 'paid' || o.status === 'completed');
+  const confirmedOrders = orders.filter(o => orderStatusForDisplay(o) === 'confirmed' || isOrderActuallyShipped(o) || o.status === 'paid' || o.status === 'completed');
   const expectedIncome = orders.reduce((s, o) => s + orderPaidNet(o), 0);
   const returnsExpense = finance.filter(x => x.type === 'expense' && x.category === 'return').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
   return {
@@ -334,7 +351,7 @@ function buildCrmSummary(period = 'today') {
     orders: orders.length,
     newOrders: orders.filter(o => o.status === 'new').length,
     confirmedOrders: confirmedOrders.length,
-    shippedOrders: orders.filter(o => o.status === 'shipped').length,
+    shippedOrders: orders.filter(isOrderActuallyShipped).length,
     paidOrders: paidOrders.length,
     returns: returns.length,
     withoutTtn: orders.filter(o => !o.ttn).length,
@@ -438,6 +455,16 @@ function applyNovaTrackingToOrder(order, track) {
       syncedAt: now,
     },
   };
+
+  if (track.normalizedStatus === 'in_transit') {
+    patch.status = ['paid', 'completed', 'returned'].includes(order.status) ? order.status : 'shipped';
+    patch.shippedAt = order.shippedAt || now;
+  }
+
+  if (track.normalizedStatus === 'unknown' && order.status === 'shipped' && order.ttnCreatedAt && order.deliveryStatus === 'shipped') {
+    patch.status = 'confirmed';
+    patch.deliveryStatus = 'ttn_created';
+  }
 
   if (track.normalizedStatus === 'delivered') {
     patch.paymentStatus = 'paid';
@@ -1297,9 +1324,9 @@ app.get('/api/admin/crm/problems', authBot, (_req, res) => {
   const orders = read(F.orders).map(o => {
     const problems = [];
     const hasReturnExpense = Object.prototype.hasOwnProperty.call(o, 'returnExpense') || (Array.isArray(o.expenses) && o.expenses.some(e => e.category === 'return'));
-    if (o.status === 'confirmed') problems.push('Підтверджено, але не відправлено');
-    if (o.status === 'shipped' && !o.ttn) problems.push('Відправлено, але немає ТТН');
-    if (o.status === 'shipped' && orderPaymentStatus(o) !== 'paid') problems.push('Відправлено, але не оплачено');
+    if (orderStatusForDisplay(o) === 'confirmed') problems.push('Підтверджено, але не відправлено');
+    if (isOrderActuallyShipped(o) && !o.ttn) problems.push('Відправлено, але немає ТТН');
+    if (isOrderActuallyShipped(o) && orderPaymentStatus(o) !== 'paid') problems.push('Відправлено, але не оплачено');
     if ((o.status === 'paid' || orderPaymentStatus(o) === 'paid') && !asMoneyNumber(o.price)) problems.push('Оплачено, але немає ціни');
     if ((o.status === 'returned' || orderPaymentStatus(o) === 'returned') && !hasReturnExpense) problems.push('Повернення без витрати');
     if (o.status === 'completed' && orderProfit(o) <= 0) problems.push('Завершено, але прибуток <= 0');
@@ -1324,7 +1351,9 @@ app.post('/api/admin/orders/:id/np/create', authBot, async (req, res) => {
   const orders = read(F.orders);
   const idx = orders.findIndex(x => x.id === id);
   if (idx < 0) return res.status(404).json({ error: 'Not found' });
-  const order = { ...orders[idx], ...(req.body && typeof req.body === 'object' ? req.body : {}) };
+  const bodyPatch = req.body && typeof req.body === 'object' ? { ...req.body } : {};
+  delete bodyPatch.force;
+  const order = { ...orders[idx], ...bodyPatch };
   if (orders[idx].ttn && !req.body?.force) return res.json({ success: true, duplicate: true, order: orders[idx], ttn: orders[idx].ttn });
   const lockKey = String(id);
   if (npCreateLocks.has(lockKey)) {
@@ -1344,6 +1373,16 @@ app.post('/api/admin/orders/:id/np/create', authBot, async (req, res) => {
     }
     const created = await novaPoshta.createInternetDocument(order);
     const now = new Date().toISOString();
+    const previousTtn = String(orders[idx].ttn || '').trim();
+    const ttnHistory = Array.isArray(orders[idx].ttnHistory) ? [...orders[idx].ttnHistory] : [];
+    if (previousTtn && previousTtn !== String(created.ttn || '').trim()) {
+      ttnHistory.push({
+        ttn: previousTtn,
+        npRef: orders[idx].npRef || null,
+        replacedAt: now,
+        reason: req.body?.force ? 'recreated_before_dispatch' : 'replaced',
+      });
+    }
     orders[idx] = {
       ...orders[idx],
       ...order,
@@ -1351,8 +1390,9 @@ app.post('/api/admin/orders/:id/np/create', authBot, async (req, res) => {
       npRef: created.ref,
       npEstimatedDeliveryDate: created.estimatedDeliveryDate,
       npDeliveryCost: created.cost || orders[idx].npDeliveryCost || null,
-      deliveryStatus: 'shipped',
-      status: ['paid', 'completed'].includes(orders[idx].status) ? orders[idx].status : 'shipped',
+      deliveryStatus: 'ttn_created',
+      status: ['paid', 'completed'].includes(orders[idx].status) ? orders[idx].status : 'confirmed',
+      ttnHistory,
       novaPoshta: {
         ...(orders[idx].novaPoshta && typeof orders[idx].novaPoshta === 'object' ? orders[idx].novaPoshta : {}),
         ref: created.ref,

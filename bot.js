@@ -149,8 +149,39 @@ function orderProfit(o) {
 function paymentLabel(o) {
   return o?.paymentStatus || (o?.status === 'paid' || o?.status === 'completed' ? 'paid' : o?.status === 'returned' ? 'returned' : 'unpaid');
 }
+const DELIVERY_STATUS_LABELS = {
+  ready_for_np: 'очікує ТТН',
+  ready_for_dispatch: 'в обробці',
+  ttn_added: 'ТТН внесено, очікує відправки',
+  ttn_created: 'ТТН створено, очікує відправки',
+  in_transit: 'відправлено',
+  delivered: 'отримано',
+  returned: 'повернення',
+  unknown: 'невідомо по НП',
+};
+function deliveryStatusValue(o) {
+  const value = o?.deliveryStatus || '';
+  if (value === 'shipped' && o?.ttnCreatedAt && !o?.npStatus && !['paid', 'completed', 'returned'].includes(o?.status || 'new')) {
+    return 'ttn_created';
+  }
+  return value || (o?.ttn ? 'ttn_added' : '—');
+}
 function deliveryLabel(o) {
-  return o?.deliveryStatus || (o?.status === 'shipped' ? 'shipped' : o?.ttn ? 'ttn_added' : '—');
+  const value = deliveryStatusValue(o);
+  return DELIVERY_STATUS_LABELS[value] || value;
+}
+function isOrderActuallyShipped(o) {
+  const deliveryStatus = deliveryStatusValue(o);
+  if (['in_transit', 'delivered'].includes(deliveryStatus)) return true;
+  if (['paid', 'completed'].includes(o?.status || 'new')) return true;
+  if ((o?.status || 'new') === 'shipped' && !['ttn_created', 'ttn_added', 'ready_for_np', 'ready_for_dispatch', 'unknown'].includes(deliveryStatus)) return true;
+  return false;
+}
+function orderStatusForDisplay(o) {
+  return (o?.status === 'shipped' && !isOrderActuallyShipped(o)) ? 'confirmed' : (o?.status || 'new');
+}
+function canRecreateNovaTtn(o) {
+  return !!o?.ttn && !isOrderActuallyShipped(o) && !['cancelled', 'paid', 'completed', 'returned'].includes(o?.status || 'new');
 }
 function orderPaidAt(o) {
   return o?.paidAt || o?.basePaidAt || o?.upsell?.paidAt || null;
@@ -162,7 +193,7 @@ function isZvonokConfirmedOrder(o) {
   return o?.confirmationSource === 'zvonok' || String(o?.zvonokButton || '') === '1';
 }
 function isManagerConfirmedOrder(o) {
-  if ((o?.status || 'new') !== 'confirmed') return false;
+  if (orderStatusForDisplay(o) !== 'confirmed') return false;
   if (isZvonokConfirmedOrder(o)) return false;
   return o?.confirmationSource === 'manager' || o?.managerConfirmedAt || o?.managerConfirmedBy || (o?.orderMode || 'manual') === 'manual';
 }
@@ -284,8 +315,8 @@ function orderFilterLabel(filter) {
 function orderStatusCounters(orders) {
   return [
     `🆕 ${orders.filter(o => o.status === 'new').length}`,
-    `✅ ${orders.filter(o => o.status === 'confirmed').length}`,
-    `📦 ${orders.filter(o => o.status === 'shipped').length}`,
+    `✅ ${orders.filter(o => orderStatusForDisplay(o) === 'confirmed').length}`,
+    `📦 ${orders.filter(isOrderActuallyShipped).length}`,
     `💸 ${orders.filter(o => paymentLabel(o) === 'paid').length}`,
     `⚠️ ${orders.filter(o => !o.ttn || paymentLabel(o) !== 'paid').length}`,
   ].join('  ');
@@ -309,7 +340,7 @@ function productBreakdown(orders) {
     const item = map.get(key) || map.get('other');
     item.total += 1;
     if (o.status === 'new') item.newOrders += 1;
-    if (o.status === 'shipped') item.shippedOrders += 1;
+    if (isOrderActuallyShipped(o)) item.shippedOrders += 1;
     if (paymentLabel(o) === 'paid' || o.status === 'paid' || o.status === 'completed') item.paidOrders += 1;
     if (paymentLabel(o) === 'returned' || o.status === 'returned') item.returns += 1;
     if (!o.ttn) item.withoutTtn += 1;
@@ -324,6 +355,35 @@ function productSummaryLine(orders) {
 }
 function isOrderActiveForTracking(o) {
   return !!o?.ttn && !['cancelled', 'returned', 'completed'].includes(o.status || 'new');
+}
+function parseNovaDate(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  const direct = Date.parse(raw);
+  if (Number.isFinite(direct)) return new Date(direct);
+  const match = raw.match(/^(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})(?:\s+(\d{1,2}):(\d{2}))?/);
+  if (!match) return null;
+  const [, d, m, y, hh = '0', mm = '0'] = match;
+  const year = Number(y.length === 2 ? `20${y}` : y);
+  const date = new Date(year, Number(m) - 1, Number(d), Number(hh), Number(mm));
+  return Number.isFinite(date.getTime()) ? date : null;
+}
+function daysSince(value) {
+  const date = parseNovaDate(value);
+  if (!date) return null;
+  return Math.max(0, Math.floor((Date.now() - date.getTime()) / (24 * 60 * 60 * 1000)));
+}
+function novaWaitAnchor(o) {
+  const tracking = o?.novaPoshta?.tracking && typeof o.novaPoshta.tracking === 'object' ? o.novaPoshta.tracking : {};
+  return o?.npEstimatedDeliveryDate || tracking.sentAt || o?.shippedAt || o?.ttnCreatedAt || o?.updatedAt || o?.createdAt;
+}
+function novaCallbackCandidates(orders) {
+  const minDays = Math.max(1, Number(process.env.NP_CALLBACK_MIN_DAYS || 3));
+  return orders
+    .filter(o => isOrderActiveForTracking(o) && isOrderActuallyShipped(o) && paymentLabel(o) !== 'paid')
+    .map(o => ({ order: o, days: daysSince(novaWaitAnchor(o)) }))
+    .filter(x => x.days !== null && x.days >= minDays)
+    .sort((a, b) => b.days - a.days || Number(b.order.id) - Number(a.order.id));
 }
 function setCrmPending(chatId, action, orderId = null, extra = {}) {
   crmPendingInput[chatId] = { chatId, action, orderId, createdAt: new Date().toISOString(), ...extra };
@@ -541,7 +601,7 @@ function ordersKeyboard(items, page, total, filter) {
   ];
   const rows = [
     ...filterRows,
-    ...items.map(o => [{ text: `${statusEmoji(o.status)} #${o.id} ${o.name || '—'}${o.product ? ' · ' + o.product : ''} (р.${o.size || '—'})`, callback_data: `od_${o.id}` }]),
+    ...items.map(o => [{ text: `${statusEmoji(orderStatusForDisplay(o))} #${o.id} ${o.name || '—'}${o.product ? ' · ' + o.product : ''} (р.${o.size || '—'})`, callback_data: `od_${o.id}` }]),
   ];
   const nav = [];
   const suffix = orderFilterCallbackSuffix(filter);
@@ -562,7 +622,11 @@ async function showOrders(chatId, page = 1, filter = null, msgId = null) {
 
   if (parsed.product) orders = orders.filter(o => orderMatchesProduct(o, parsed.product));
   if (parsed.status) {
-    orders = orders.filter(o => o.status === parsed.status);
+    orders = orders.filter(o => {
+      if (parsed.status === 'shipped') return isOrderActuallyShipped(o);
+      if (parsed.status === 'confirmed') return orderStatusForDisplay(o) === 'confirmed';
+      return o.status === parsed.status;
+    });
   } else if (parsed.special === 'no_ttn') {
     orders = orders.filter(o => !o.ttn);
   } else if (parsed.special === 'unpaid') {
@@ -593,12 +657,12 @@ async function showOrders(chatId, page = 1, filter = null, msgId = null) {
   text += '\n';
 
   items.forEach(o => {
-    text += `${statusEmoji(o.status)} <b>#${o.id}</b> ${esc(o.name || '—')}${o.orderMode === 'instant' ? ' ⚡' : ''}\n`;
+    text += `${statusEmoji(orderStatusForDisplay(o))} <b>#${o.id}</b> ${esc(o.name || '—')}${o.orderMode === 'instant' ? ' ⚡' : ''}\n`;
     if (o.product) text += `   🛍 ${esc(o.product)}\n`;
     text += `   📱 ${esc(o.phone)}  👟 р.${esc(o.size)}`;
     if (o.color) text += `  🎨 ${esc(o.color)}`;
     if (o.contactViaTelegram) text += '  💬 TG';
-    text += `\n   🏷 ${esc(o.status || 'new')} · 💳 ${esc(paymentLabel(o))}`;
+    text += `\n   🏷 ${esc(orderStatusForDisplay(o))} · 💳 ${esc(paymentLabel(o))}`;
     if (o.ttn) text += ` · ТТН ${esc(o.ttn)}`;
     if (hasDeliveryInfo(o)) {
       const cityLine = [o.city, o.postOffice ? `НП ${o.postOffice}` : ''].filter(Boolean).join(' · ');
@@ -617,7 +681,7 @@ function orderDetailKeyboard(o) {
       [{ text: '✅ Підтвердити', callback_data: `os_${id}_c` }, { text: '❌ Скасувати', callback_data: `os_${id}_x` }],
     ],
     confirmed: [
-      [{ text: '📦 Відправлено', callback_data: `oi_${id}_tt` }, { text: '❌ Скасувати', callback_data: `os_${id}_x` }],
+      [{ text: '🧾 Внести ТТН', callback_data: `oi_${id}_tt` }, { text: '❌ Скасувати', callback_data: `os_${id}_x` }],
       [{ text: hasUpsell(o) ? '✏️ Апселл' : '➕ Апселл', callback_data: `oi_${id}_up` }],
     ],
     shipped: [
@@ -631,12 +695,15 @@ function orderDetailKeyboard(o) {
     completed: [],
     returned: [],
   };
-  const rows = rowsByStatus[o.status || 'new'] || [];
+  const rows = rowsByStatus[orderStatusForDisplay(o)] || [];
   if (isManagerConfirmedOrder(o)) {
     rows.push([{ text: hasDeliveryInfo(o) ? '✏️ Змінити дані НП' : '✍️ Вписати дані НП', callback_data: `fill_${id}` }]);
   }
   if ((o.status === 'confirmed' || o.status === 'shipped') && !o.ttn) {
     rows.push([{ text: '🚚 Створити ТТН НП', callback_data: `npcreate_${id}` }]);
+  }
+  if (canRecreateNovaTtn(o)) {
+    rows.push([{ text: '🔁 Створити ТТН заново', callback_data: `npcreate_force_${id}` }]);
   }
   if (o.ttn) {
     rows.push([
@@ -667,7 +734,7 @@ async function showOrderDetail(chatId, id, msgId = null) {
     `🎨 Колір: <b>${esc(o.color || '—')}</b>\n` +
     `💵 Ціна: <b>${money(price)}</b>\n` +
     `🏷 Собівартість: <b>${o.cost ? money(o.cost) : '—'}</b>\n` +
-    `🏷 Статус замовлення: ${statusEmoji(o.status)} <b>${esc(o.status || 'new')}</b>\n` +
+    `🏷 Статус замовлення: ${statusEmoji(orderStatusForDisplay(o))} <b>${esc(orderStatusForDisplay(o))}</b>\n` +
     `💳 Статус оплати: <b>${esc(paymentLabel(o))}</b>\n` +
     (o.returnScope ? `↩️ Повернення: <b>${esc(paymentScopeLabel(o.returnScope))}</b>\n` : '') +
     `🚚 ТТН: <code>${esc(o.ttn || '—')}</code>\n` +
@@ -685,7 +752,8 @@ function trackingMenuKb() {
   return { inline_keyboard: [
     [{ text: '🚚 Активні ТТН', callback_data: 'trk_active' }, { text: '🔄 Оновити всі НП', callback_data: 'np_sync_all' }],
     [{ text: '🧾 Без ТТН', callback_data: 'ofv_no_ttn' }, { text: '💳 Не оплачені', callback_data: 'ofv_unpaid' }],
-    [{ text: '🔎 ТТН по телефону', callback_data: 'np_phone_lookup' }, { text: '📌 Оплати / відмови', callback_data: 'crm_outcomes' }],
+    [{ text: '📞 Прозвон НП', callback_data: 'trk_calls' }, { text: '🔎 ТТН по телефону', callback_data: 'np_phone_lookup' }],
+    [{ text: '📌 Оплати / відмови', callback_data: 'crm_outcomes' }],
     [{ text: '🛍 Violet Motion', callback_data: 'prod_violet' }, { text: '🛍 Black Breeze', callback_data: 'prod_black' }],
     [{ text: '🧾 Проблемні', callback_data: 'crm_prob' }, { text: '← Меню', callback_data: 'main' }],
   ] };
@@ -705,6 +773,7 @@ async function showTrackingMenu(chatId, msgId = null) {
   const orders = await serverGet('/api/admin/orders');
   if (!Array.isArray(orders)) return reply(chatId, '❌ Не вдалося завантажити відстеження.', MAIN_KB, msgId);
   const activeTtn = orders.filter(isOrderActiveForTracking);
+  const callbackList = novaCallbackCandidates(orders);
   const noTtn = orders.filter(o => !o.ttn && ['confirmed', 'shipped', 'paid'].includes(o.status || 'new'));
   const unpaid = orders.filter(o => paymentLabel(o) !== 'paid' && !['cancelled', 'returned'].includes(o.status || 'new'));
   const newOrders = orders.filter(o => o.status === 'new');
@@ -716,6 +785,7 @@ async function showTrackingMenu(chatId, msgId = null) {
     `🚚 <b>Відстеження</b>\n━━━━━━━━━━━━━━━\n` +
     `🆕 Нові заявки: <b>${newOrders.length}</b>\n` +
     `🚚 Активні ТТН: <b>${activeTtn.length}</b>\n` +
+    `📞 На прозвон НП: <b>${callbackList.length}</b>\n` +
     `🧾 Підтверджені без ТТН: <b>${noTtn.length}</b>\n` +
     `💳 Не оплачені: <b>${unpaid.length}</b>\n` +
     `↩️ Повернення: <b>${returns.length}</b>\n\n` +
@@ -738,7 +808,7 @@ async function showTrackingList(chatId, mode = 'active', productKey = null, msgI
 
   let text = `🚚 <b>Активні ТТН${esc(titleProduct)}</b> (${orders.length})\n━━━━━━━━━━━━━━━\n\n`;
   orders.slice(0, 10).forEach(o => {
-    text += `${statusEmoji(o.status)} <b>#${esc(o.id)}</b> ${esc(o.name || '—')}\n`;
+    text += `${statusEmoji(orderStatusForDisplay(o))} <b>#${esc(o.id)}</b> ${esc(o.name || '—')}\n`;
     if (o.product) text += `   🛍 ${esc(o.product)}\n`;
     text += `   🚚 <code>${esc(o.ttn || '—')}</code>\n`;
     text += `   📦 ${esc(o.npStatus || deliveryLabel(o))}`;
@@ -747,6 +817,31 @@ async function showTrackingList(chatId, mode = 'active', productKey = null, msgI
   });
   if (orders.length > 10) text += `…і ще ${orders.length - 10} замовлень\n`;
   return reply(chatId, text, trackingListKb(orders), msgId);
+}
+
+async function showNovaCallbackList(chatId, msgId = null) {
+  const orders = await serverGet('/api/admin/orders');
+  if (!Array.isArray(orders)) return reply(chatId, '❌ Не вдалося завантажити список для прозвону.', trackingMenuKb(), msgId);
+  const items = novaCallbackCandidates(orders);
+  const minDays = Math.max(1, Number(process.env.NP_CALLBACK_MIN_DAYS || 3));
+  if (!items.length) {
+    return reply(chatId, `📞 <b>Прозвон НП</b>\n━━━━━━━━━━━━━━━\nНемає посилок, які лежать ${minDays}+ дн. без оплати.`, trackingMenuKb(), msgId);
+  }
+
+  let text = `📞 <b>Прозвон НП</b> (${items.length})\n━━━━━━━━━━━━━━━\n\n`;
+  items.slice(0, 12).forEach(({ order: o, days }) => {
+    text += `<b>#${esc(o.id)}</b> ${esc(o.name || o.fullName || '—')}\n`;
+    text += `   📱 <code>${esc(o.phone || '—')}</code>\n`;
+    text += `   🚚 <code>${esc(o.ttn || '—')}</code> · лежить ${esc(days)} дн.\n`;
+    text += `   📦 ${esc(o.npStatus || deliveryLabel(o))}\n\n`;
+  });
+  if (items.length > 12) text += `…і ще ${items.length - 12} клієнтів\n`;
+  const rows = items.slice(0, 10).map(({ order: o }) => [
+    { text: `📋 #${o.id} ${o.name || '—'}`, callback_data: `od_${o.id}` },
+    { text: '🔄 НП', callback_data: `npsync_${o.id}` },
+  ]);
+  rows.push([{ text: '← Відстеження', callback_data: 'track_menu' }]);
+  return reply(chatId, text, { inline_keyboard: rows }, msgId);
 }
 
 async function askNpPhoneLookup(chatId) {
@@ -820,7 +915,7 @@ async function showNpPhoneLookupResult(chatId, phone) {
   if (localWithTtn.length) {
     text += '\n<b>ТТН у замовленнях бота:</b>\n';
     localWithTtn.slice(0, 8).forEach(o => {
-      text += `• #${esc(o.id)} <code>${esc(o.ttn)}</code> · ${esc(o.status || 'new')} · ${fmtDate(o.createdAt)}\n`;
+      text += `• #${esc(o.id)} <code>${esc(o.ttn)}</code> · ${esc(orderStatusForDisplay(o))} · ${fmtDate(o.createdAt)}\n`;
     });
   }
 
@@ -1103,7 +1198,7 @@ async function showProblems(chatId, msgId = null) {
   if (!data.orders.length) return reply(chatId, '🧾 <b>Проблемних замовлень немає.</b>', crmMenuKb(), msgId);
   let text = `🧾 <b>Проблемні замовлення</b> (${data.orders.length})\n━━━━━━━━━━━━━━━\n\n`;
   data.orders.slice(0, 20).forEach(o => {
-    text += `${statusEmoji(o.status)} <b>#${esc(o.id)}</b> ${esc(o.name || '—')}\n`;
+    text += `${statusEmoji(orderStatusForDisplay(o))} <b>#${esc(o.id)}</b> ${esc(o.name || '—')}\n`;
     if (o.product) text += `🛍 ${esc(o.product)}\n`;
     text += `<i>${esc((o.problems || []).join('; '))}</i>\n\n`;
   });
@@ -1647,7 +1742,18 @@ async function handleCrmPendingMessage(chatId, text) {
       await bot.sendMessage(chatId, '❌ Введіть ТТН текстом.');
       return true;
     }
-    const updated = await serverPatch(`/api/admin/orders/${id}`, { ttn, status: 'shipped', deliveryStatus: 'shipped' });
+    const order = await serverGet(`/api/admin/orders/${id}`);
+    if (!order || order.error) {
+      clearCrmPending(chatId);
+      await bot.sendMessage(chatId, '❌ Замовлення не знайдено.', { reply_markup: MAIN_KB });
+      return true;
+    }
+    const updated = await serverPatch(`/api/admin/orders/${id}`, {
+      ttn,
+      status: ['paid', 'completed'].includes(order.status) ? order.status : 'confirmed',
+      deliveryStatus: 'ttn_added',
+      ttnCreatedAt: order.ttnCreatedAt || new Date().toISOString(),
+    });
     clearCrmPending(chatId);
     if (!updated || updated.error) await bot.sendMessage(chatId, '❌ Не вдалося зберегти ТТН.', { reply_markup: MAIN_KB });
     else await showOrderDetail(chatId, id);
@@ -1975,6 +2081,7 @@ bot.on('callback_query', async q => {
     /* ─ Tracking / product views ─────────────────────────── */
     if (data === 'track_menu') { await showTrackingMenu(chatId, msgId); return; }
     if (data === 'trk_active') { await showTrackingList(chatId, 'active', null, msgId); return; }
+    if (data === 'trk_calls') { await showNovaCallbackList(chatId, msgId); return; }
     if (data === 'np_phone_lookup') { await askNpPhoneLookup(chatId); return; }
     if (data.startsWith('trk_active_')) {
       await showTrackingList(chatId, 'active', data.slice(11), msgId);
@@ -2146,16 +2253,22 @@ bot.on('callback_query', async q => {
     }
 
     if (data.startsWith('npcreate_')) {
-      const id = Number(data.slice(9));
+      const forceRecreate = data.startsWith('npcreate_force_');
+      const id = Number(data.slice(forceRecreate ? 15 : 9));
       const order = await serverGet(`/api/admin/orders/${id}`);
       if (!order || order.error) { await bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB }); return; }
+      if (forceRecreate && !canRecreateNovaTtn(order)) {
+        await bot.sendMessage(chatId, 'ℹ️ Повторно створити ТТН можна тільки поки посилка ще не відправлена, не оплачена і не повернена.', { reply_markup: MAIN_KB });
+        await showOrderDetail(chatId, id, msgId);
+        return;
+      }
       const missing = missingRecipientDeliveryFields(order).filter(x => x !== 'ПІБ' || !order.name);
       if (missing.length) {
         await bot.sendMessage(chatId, `ℹ️ Для створення ТТН не вистачає: <b>${esc(missing.join(', '))}</b>. Заповнимо зараз.`, { parse_mode: 'HTML' });
         await askManagerDeliveryStep(chatId, id, 0);
         return;
       }
-      const result = await serverPost(`/api/admin/orders/${id}/np/create`, {});
+      const result = await serverPost(`/api/admin/orders/${id}/np/create`, forceRecreate ? { force: true } : {});
       if (!result || result.error) {
         await bot.sendMessage(chatId, apiErrorMessage(result, '❌ Nova Poshta не створила ТТН.'), {
           parse_mode: 'HTML',
@@ -2163,7 +2276,7 @@ bot.on('callback_query', async q => {
         });
         return;
       }
-      await bot.sendMessage(chatId, `✅ ТТН створено: <code>${esc(result.ttn)}</code>`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
+      await bot.sendMessage(chatId, `${forceRecreate ? '✅ Нову ТТН створено' : '✅ ТТН створено'}: <code>${esc(result.ttn)}</code>`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
       await showOrderDetail(chatId, id, msgId);
       return;
     }
