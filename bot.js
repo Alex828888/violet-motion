@@ -34,6 +34,7 @@ function isAdmin(id) { return ADMIN_IDS.length === 0 || ADMIN_IDS.includes(id) |
 /* ── State ────────────────────────────────────────────────── */
 const managerDialogs = {};
 const pendingSearch  = {};
+const pendingTtn     = {};
 const pendingCb      = new Set();
 
 /* ── HTTP helpers ─────────────────────────────────────────── */
@@ -65,9 +66,10 @@ const serverDelete = p    => apiFetch('DELETE', p);
 /* ── Keyboards ────────────────────────────────────────────── */
 const MAIN_KB = {
   keyboard: [
-    ['📦 Замовлення', '💬 Відгуки'],
-    ['🎧 Підтримка',  '📊 Статистика'],
-    ['📈 Аналітика',  '🔍 Пошук'],
+    ['📦 Замовлення', '🚚 Відстеження'],
+    ['💬 Відгуки',    '🎧 Підтримка'],
+    ['📊 Статистика', '📈 Аналітика'],
+    ['🔍 Пошук'],
     ['❓ Допомога'],
   ],
   resize_keyboard: true,
@@ -82,7 +84,82 @@ const DIALOG_KB = {
 
 /* ── Formatting helpers ───────────────────────────────────── */
 function stars(n)     { return '★'.repeat(n) + '☆'.repeat(5 - n); }
-function statusEmoji(s) { return { new: '🆕', confirmed: '✅', cancelled: '❌' }[s] || '❔'; }
+function statusEmoji(s) {
+  return {
+    new: '🆕',
+    confirmed: '✅',
+    cancelled: '❌',
+    shipped: '📦',
+    paid: '💸',
+    returned: '↩️',
+    completed: '🏁',
+  }[s] || '❔';
+}
+
+function paymentLabel(o) {
+  return o?.paymentStatus || (o?.status === 'paid' || o?.status === 'completed' ? 'paid' : o?.status === 'returned' ? 'returned' : 'unpaid');
+}
+
+const DELIVERY_STATUS_LABELS = {
+  ready_for_np: 'очікує ТТН',
+  ready_for_dispatch: 'в обробці',
+  ttn_added: 'ТТН внесено, очікує відправки',
+  ttn_created: 'ТТН створено, очікує відправки',
+  in_transit: 'відправлено',
+  delivered: 'отримано',
+  returned: 'повернення',
+  unknown: 'невідомо по НП',
+};
+
+function deliveryStatusValue(o) {
+  const value = o?.deliveryStatus || '';
+  if (value === 'shipped' && o?.ttnCreatedAt && !o?.npStatus && !['paid', 'completed', 'returned'].includes(o?.status || 'new')) {
+    return 'ttn_created';
+  }
+  return value || (o?.ttn ? 'ttn_added' : '');
+}
+
+function deliveryLabel(o) {
+  const value = deliveryStatusValue(o);
+  return DELIVERY_STATUS_LABELS[value] || value || '—';
+}
+
+function hasDeliveryInfo(o) {
+  return !!(o?.fullName || o?.city || o?.district || o?.postOffice);
+}
+
+function deliveryBlock(o) {
+  if (!hasDeliveryInfo(o)) return '';
+  return (
+    '\n<b>Дані доставки:</b>\n' +
+    (o.fullName ? `🧾 ПІБ: <b>${esc(o.fullName)}</b>\n` : '') +
+    (o.city ? `🏙 Місто: <b>${esc(o.city)}</b>\n` : '') +
+    (o.district ? `📍 Район: <b>${esc(o.district)}</b>\n` : '') +
+    (o.postOffice ? `📦 Відділення НП: <b>${esc(o.postOffice)}</b>\n` : '')
+  );
+}
+
+function novaPoshtaBlock(o) {
+  if (!o?.ttn && !o?.npStatus && !o?.npEstimatedDeliveryDate && !o?.npReturnOrderNumber && !o?.npReturnExpressWaybillNumber) return '';
+  return (
+    '\n<b>Нова Пошта:</b>\n' +
+    (o.ttn ? `ТТН: <code>${esc(o.ttn)}</code>\n` : '') +
+    (o.npStatus ? `Статус НП: <b>${esc(o.npStatus)}</b>\n` : '') +
+    (o.npStatusCode ? `Код НП: <b>${esc(o.npStatusCode)}</b>\n` : '') +
+    (o.npEstimatedDeliveryDate ? `Орієнтовна доставка: <b>${esc(o.npEstimatedDeliveryDate)}</b>\n` : '') +
+    (o.npReturnOrderNumber ? `Заявка повернення: <code>${esc(o.npReturnOrderNumber)}</code>\n` : '') +
+    (o.npReturnExpressWaybillNumber ? `ТТН повернення: <code>${esc(o.npReturnExpressWaybillNumber)}</code>\n` : '') +
+    (o.npReturnStatus ? `Статус повернення: <b>${esc(o.npReturnStatus)}</b>\n` : '') +
+    (o.npSyncedAt ? `Оновлено: <b>${fmtDate(o.npSyncedAt)}</b>\n` : '')
+  );
+}
+
+function esc(val) {
+  return String(val ?? '').replace(/[&<>"']/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[ch]));
+}
+
 function fmtDate(iso) {
   try { return new Date(iso).toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' }); }
   catch { return iso || '—'; }
@@ -133,7 +210,7 @@ async function ack(id, text = '') {
    ORDERS
 ═══════════════════════════════════════════════════════════ */
 function ordersKeyboard(items, page, total, filter) {
-  const rows = items.map(o => [{ text: `${statusEmoji(o.status)} #${o.id} ${o.name}${o.product ? ' · ' + o.product : ''} (р.${o.size})`, callback_data: `od_${o.id}` }]);
+  const rows = items.map(o => [{ text: `${statusEmoji(o.status)} #${o.id} ${o.name || '—'}${o.product ? ' · ' + o.product : ''} (р.${o.size || '—'})`, callback_data: `od_${o.id}` }]);
   const nav = [];
   if (page > 1)     nav.push({ text: '← Назад', callback_data: `op_${page - 1}${filter ? '_f_' + filter : ''}` });
   nav.push({ text: `${page}/${total}`, callback_data: 'noop' });
@@ -146,47 +223,135 @@ async function showOrders(chatId, page = 1, filter = null, msgId = null) {
   let orders = await serverGet('/api/admin/orders');
   if (!Array.isArray(orders)) return reply(chatId, '❌ Не вдалося завантажити замовлення.', MAIN_KB, msgId);
   orders = orders.reverse();
-  if (filter) orders = orders.filter(o => o.name?.toLowerCase().includes(filter) || o.phone?.includes(filter) || String(o.size) === filter);
-  if (!orders.length) return reply(chatId, filter ? `🔍 Нічого по "<b>${filter}</b>"` : '📦 Замовлень поки немає.', MAIN_KB, msgId);
+  const q = filter ? String(filter).trim().toLowerCase() : '';
+  if (q) {
+    orders = orders.filter(o => [
+      o.name, o.fullName, o.phone, o.size, o.id, o.ttn, o.status, o.paymentStatus,
+      o.product, o.color, o.city, o.postOffice, o.npStatus,
+    ].some(v => String(v || '').toLowerCase().includes(q)));
+  }
+  if (!orders.length) return reply(chatId, q ? `🔍 Нічого по "<b>${esc(q)}</b>"` : '📦 Замовлень поки немає.', MAIN_KB, msgId);
 
   const { items, page: p, total } = paginate(orders, page);
-  let text = filter
-    ? `🔍 Пошук "<b>${filter}</b>" — знайдено ${orders.length}:\n\n`
+  let text = q
+    ? `🔍 Пошук "<b>${esc(q)}</b>" — знайдено ${orders.length}:\n\n`
     : `📦 <b>Замовлення</b> (${orders.length}):\n\n`;
 
   items.forEach(o => {
-    text += `${statusEmoji(o.status)} <b>#${o.id}</b> ${o.name}\n`;
-    if (o.product) text += `   🛍 ${o.product}\n`;
-    text += `   📱 ${o.phone}  👟 р.${o.size}`;
-    if (o.color) text += `  🎨 ${o.color}`;
+    text += `${statusEmoji(o.status)} <b>#${esc(o.id)}</b> ${esc(o.name || '—')}\n`;
+    if (o.product) text += `   🛍 ${esc(o.product)}\n`;
+    text += `   📱 ${esc(o.phone || '—')}  👟 р.${esc(o.size || '—')}`;
+    if (o.color) text += `  🎨 ${esc(o.color)}`;
     if (o.contactViaTelegram) text += '  💬 TG';
+    text += `\n   🏷 ${esc(o.status || 'new')} · 💳 ${esc(paymentLabel(o))}`;
+    if (o.ttn) text += ` · ТТН ${esc(o.ttn)}`;
+    if (deliveryStatusValue(o) || o.npStatus) text += `\n   🚚 ${esc(o.npStatus || deliveryLabel(o))}`;
+    if (hasDeliveryInfo(o)) {
+      const cityLine = [o.city, o.postOffice ? `НП ${o.postOffice}` : ''].filter(Boolean).join(' · ');
+      if (cityLine) text += `\n   📦 ${esc(cityLine)}`;
+    }
     text += `\n   ${fmtDate(o.createdAt)}\n\n`;
   });
-  reply(chatId, text, ordersKeyboard(items, p, total, filter), msgId);
+  reply(chatId, text, ordersKeyboard(items, p, total, q), msgId);
+}
+
+function orderDetailKeyboard(o) {
+  const id = o.id;
+  const rows = [];
+  if ((o.status || 'new') === 'new') {
+    rows.push([{ text: '✅ Підтвердити', callback_data: `confirm_${id}` }, { text: '❌ Скасувати', callback_data: `cancel_${id}` }]);
+  }
+  if (['confirmed', 'shipped'].includes(o.status || 'new')) {
+    rows.push([{ text: '🧾 Внести ТТН', callback_data: `ttn_${id}` }]);
+  }
+  if (o.ttn) {
+    rows.push([
+      { text: '🔍 Статус НП', callback_data: `nt_${id}` },
+      { text: '🔄 Оновити НП', callback_data: `npsync_${id}` },
+    ]);
+  }
+  rows.push([{ text: '🗑 Видалити', callback_data: `del_order_${id}` }]);
+  rows.push([{ text: '← До списку', callback_data: 'orders' }]);
+  return { inline_keyboard: rows };
 }
 
 async function showOrderDetail(chatId, id, msgId = null) {
   const o = await serverGet(`/api/admin/orders/${id}`);
   if (!o || o.error) return bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB });
   const text =
-    `📋 <b>Замовлення #${o.id}</b>\n━━━━━━━━━━━━━━━\n` +
-    (o.product ? `🛍 Товар: <b>${o.product}</b>\n` : '') +
-    `👤 <b>${o.name}</b>\n📱 ${o.phone}\n` +
-    `👟 Розмір: ${o.size}\n` +
-    (o.color ? `🎨 Колір: ${o.color}\n` : '') +
-    (o.price ? `💵 Ціна: ${o.price} грн\n` : '') +
+    `📋 <b>Замовлення #${esc(o.id)}</b>\n━━━━━━━━━━━━━━━\n` +
+    (o.product ? `🛍 Товар: <b>${esc(o.product)}</b>\n` : '') +
+    `👤 <b>${esc(o.name || '—')}</b>\n📱 ${esc(o.phone || '—')}\n` +
+    `👟 Розмір: ${esc(o.size || '—')}\n` +
+    (o.color ? `🎨 Колір: ${esc(o.color)}\n` : '') +
+    (o.price ? `💵 Ціна: ${esc(o.price)} грн\n` : '') +
     (o.contactViaTelegram ? `💬 Зв'язок: Telegram\n` : `📞 Зв'язок: Дзвінок\n`) +
-    `🏷 Статус: ${statusEmoji(o.status)} ${o.status}\n📅 ${fmtDate(o.createdAt)}\n━━━━━━━━━━━━━━━`;
-  reply(chatId, text, { inline_keyboard: [
-    [{ text: '✅ Підтвердити', callback_data: `confirm_${o.id}` }, { text: '❌ Скасувати', callback_data: `cancel_${o.id}` }],
-    [{ text: '🗑 Видалити', callback_data: `del_order_${o.id}` }],
-    [{ text: '← До списку', callback_data: 'orders' }],
-  ]}, msgId);
+    `🏷 Статус замовлення: ${statusEmoji(o.status)} <b>${esc(o.status || 'new')}</b>\n` +
+    `💳 Статус оплати: <b>${esc(paymentLabel(o))}</b>\n` +
+    `🚚 Статус доставки: <b>${esc(deliveryLabel(o))}</b>\n` +
+    deliveryBlock(o) +
+    novaPoshtaBlock(o) +
+    `📅 ${fmtDate(o.createdAt)}\n━━━━━━━━━━━━━━━`;
+  reply(chatId, text, orderDetailKeyboard(o), msgId);
 }
 
-/* ═══════════════════════════════════════════════════════════
-   REVIEWS
-═══════════════════════════════════════════════════════════ */
+async function showNpTrack(chatId, id, msgId = null) {
+  const order = await serverGet(`/api/admin/orders/${id}`);
+  if (!order || order.error) return bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB });
+  if (!order.ttn) return bot.sendMessage(chatId, '❌ У замовленні немає ТТН.', { reply_markup: MAIN_KB });
+  const track = await serverGet(`/api/admin/np/track/${encodeURIComponent(order.ttn)}`);
+  if (!track || track.error) return bot.sendMessage(chatId, '❌ Не вдалося отримати статус Нової Пошти.', { reply_markup: MAIN_KB });
+  const text =
+    `🔍 <b>ТТН ${esc(order.ttn)}</b>\n━━━━━━━━━━━━━━━\n` +
+    `Статус: <b>${esc(track.status || '—')}</b>\n` +
+    `Код: <b>${esc(track.statusCode || '—')}</b>\n` +
+    `Місто: <b>${esc(track.city || '—')}</b>\n` +
+    `Відділення: <b>${esc(track.warehouse || '—')}</b>\n` +
+    `Дата відправки: <b>${esc(track.sentAt || '—')}</b>\n` +
+    `Дата отримання: <b>${esc(track.receivedAt || '—')}</b>\n` +
+    `Отримано: <b>${track.received ? 'так' : 'ні'}</b>\n` +
+    `Повернення: <b>${track.returned ? 'так' : 'ні'}</b>`;
+  reply(chatId, text, { inline_keyboard: [[{ text: '← До замовлення', callback_data: `od_${id}` }]] }, msgId);
+}
+
+async function syncNpOrder(chatId, id, msgId = null) {
+  const result = await serverPost(`/api/admin/orders/${id}/np/sync`, {});
+  if (!result || result.error) return bot.sendMessage(chatId, '❌ Не вдалося оновити Нову Пошту.', { reply_markup: MAIN_KB });
+  await bot.sendMessage(chatId, `🔄 НП оновлено: <b>${esc(result.track?.status || result.order?.npStatus || 'ok')}</b>`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
+  await showOrderDetail(chatId, id, msgId);
+}
+
+async function showTrackingMenu(chatId, msgId = null) {
+  let orders = await serverGet('/api/admin/orders');
+  if (!Array.isArray(orders)) return reply(chatId, '❌ Не вдалося завантажити відстеження.', MAIN_KB, msgId);
+  orders = orders
+    .filter(o => o.ttn || o.npStatus || deliveryStatusValue(o))
+    .reverse();
+
+  const active = orders.filter(o => o.ttn && !['cancelled', 'returned', 'completed'].includes(o.status || 'new'));
+  let text =
+    `🚚 <b>Відстеження посилок</b>\n━━━━━━━━━━━━━━━\n` +
+    `Активних ТТН: <b>${active.length}</b>\n` +
+    `Усього з доставкою/НП: <b>${orders.length}</b>\n\n`;
+
+  orders.slice(0, 10).forEach(o => {
+    text += `${statusEmoji(o.status)} <b>#${esc(o.id)}</b> ${esc(o.name || '—')}\n`;
+    if (o.ttn) text += `   ТТН: <code>${esc(o.ttn)}</code>\n`;
+    text += `   🚚 ${esc(o.npStatus || deliveryLabel(o))}\n`;
+    if (o.npSyncedAt) text += `   Оновлено: ${fmtDate(o.npSyncedAt)}\n`;
+    text += '\n';
+  });
+  if (orders.length > 10) text += `…і ще ${orders.length - 10}\n`;
+
+  const rows = orders.slice(0, 10).map(o => {
+    const row = [{ text: `📋 #${o.id} ${o.name || '—'}`, callback_data: `od_${o.id}` }];
+    if (o.ttn) row.push({ text: '🔄 НП', callback_data: `npsync_${o.id}` });
+    return row;
+  });
+  rows.push([{ text: '← Меню', callback_data: 'main' }]);
+  reply(chatId, text, { inline_keyboard: rows }, msgId);
+}
+
 async function showReviews(chatId, page = 1, msgId = null) {
   let reviews = await serverGet('/api/admin/reviews');
   if (!Array.isArray(reviews)) return reply(chatId, '❌ Не вдалося завантажити відгуки.', MAIN_KB, msgId);
@@ -462,6 +627,7 @@ bot.onText(/\/start/, async msg => {
 bot.onText(/\/analytics/, msg => { if (!isAdmin(msg.from.id)) return; showAnalyticsMenu(msg.chat.id); });
 bot.onText(/\/search (.+)/, (msg, match) => { if (!isAdmin(msg.from.id)) return; showOrders(msg.chat.id, 1, match[1].trim().toLowerCase()); });
 bot.onText(/\/orders/,  msg => { if (!isAdmin(msg.from.id)) return; showOrders(msg.chat.id); });
+bot.onText(/\/track(?:ing)?/, msg => { if (!isAdmin(msg.from.id)) return; showTrackingMenu(msg.chat.id); });
 bot.onText(/\/reviews/, msg => { if (!isAdmin(msg.from.id)) return; showReviews(msg.chat.id); });
 bot.onText(/\/support/, msg => { if (!isAdmin(msg.from.id)) return; showSupport(msg.chat.id); });
 bot.onText(/\/stats/,   msg => { if (!isAdmin(msg.from.id)) return; showStats(msg.chat.id); });
@@ -499,8 +665,42 @@ bot.on('message', async msg => {
     return;
   }
 
+  if (pendingTtn[chatId]) {
+    const id = pendingTtn[chatId];
+    delete pendingTtn[chatId];
+    const ttn = text.trim();
+
+    if (!ttn) {
+      await bot.sendMessage(chatId, '❌ Введіть ТТН текстом.', { reply_markup: MAIN_KB });
+      return;
+    }
+
+    const order = await serverGet(`/api/admin/orders/${id}`);
+    if (!order || order.error) {
+      await bot.sendMessage(chatId, '❌ Замовлення не знайдено.', { reply_markup: MAIN_KB });
+      return;
+    }
+
+    const updated = await serverPatch(`/api/admin/orders/${id}`, {
+      ttn,
+      status: ['paid', 'completed'].includes(order.status) ? order.status : 'confirmed',
+      deliveryStatus: 'ttn_added',
+      ttnCreatedAt: order.ttnCreatedAt || new Date().toISOString(),
+    });
+
+    if (!updated || updated.error) {
+      await bot.sendMessage(chatId, '❌ Не вдалося зберегти ТТН.', { reply_markup: MAIN_KB });
+      return;
+    }
+
+    await bot.sendMessage(chatId, `✅ ТТН збережено для замовлення #${id}.`, { reply_markup: MAIN_KB });
+    await showOrderDetail(chatId, id);
+    return;
+  }
+
   switch (text) {
     case '📦 Замовлення':  showOrders(chatId);       break;
+    case '🚚 Відстеження': showTrackingMenu(chatId); break;
     case '💬 Відгуки':     showReviews(chatId);      break;
     case '🎧 Підтримка':   showSupport(chatId);      break;
     case '📊 Статистика':  showStats(chatId);         break;
@@ -547,6 +747,10 @@ bot.on('callback_query', async q => {
   await ack(q.id);
 
   try {
+    if (data === 'main') {
+      await reply(chatId, '🟣 <b>Violet Motion — Адмін панель</b>\n\nОберіть розділ кнопками нижче:', MAIN_KB, msgId);
+      return;
+    }
 
     /* ─ Analytics callbacks ─────────────────────────────── */
     if (data === 'an_menu') { showAnalyticsMenu(chatId, msgId); return; }
@@ -581,6 +785,21 @@ bot.on('callback_query', async q => {
     }
 
     if (data.startsWith('od_')) { showOrderDetail(chatId, Number(data.slice(3)), msgId); return; }
+
+    if (data === 'track_menu') { await showTrackingMenu(chatId, msgId); return; }
+
+    if (data.startsWith('nt_')) { await showNpTrack(chatId, Number(data.slice(3)), msgId); return; }
+
+    if (data.startsWith('npsync_')) { await syncNpOrder(chatId, Number(data.slice(7)), msgId); return; }
+
+    if (data.startsWith('ttn_')) {
+      const id = Number(data.slice(4));
+      pendingTtn[chatId] = id;
+      await bot.sendMessage(chatId, `🧾 Введіть ТТН для замовлення #${id}:`, {
+        reply_markup: { inline_keyboard: [[{ text: '← До замовлення', callback_data: `od_${id}` }]] },
+      });
+      return;
+    }
 
     if (data.startsWith('confirm_') || data.startsWith('cancel_')) {
       const isConf = data.startsWith('confirm_');
