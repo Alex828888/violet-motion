@@ -34,7 +34,7 @@ function isAdmin(id) { return ADMIN_IDS.length === 0 || ADMIN_IDS.includes(id) |
 /* ── State ────────────────────────────────────────────────── */
 const managerDialogs = {};
 const pendingSearch  = {};
-const pendingNpData  = {};
+const pendingDelivery = {};
 const pendingTtn     = {};
 const pendingCb      = new Set();
 
@@ -131,6 +131,31 @@ function hasDeliveryInfo(o) {
 
 function hasNovaPoshtaData(o) {
   return !!(o?.fullName && o?.city && o?.postOffice);
+}
+
+const MANAGER_DELIVERY_STEPS = [
+  { key: 'fullName', label: "ПІБ отримувача (ім'я та прізвище)", orderKey: 'fullName' },
+  { key: 'city', label: 'місто або село', orderKey: 'city' },
+  { key: 'postOffice', label: 'відділення або поштомат Нової Пошти', orderKey: 'postOffice' },
+  { key: 'size', label: 'розмір', orderKey: 'size' },
+];
+
+function deliveryStepPrompt(step, order) {
+  const current = order?.[step.orderKey] ? ` Поточне: ${order[step.orderKey]}.` : '';
+  return `✍️ Введіть ${step.label}.${current}\nМожна написати "-" щоб залишити поточне значення.`;
+}
+
+function missingRecipientDeliveryFields(order) {
+  const missing = [];
+  if (!String(order?.fullName || order?.name || '').trim()) missing.push('ПІБ');
+  if (!String(order?.city || '').trim()) missing.push('місто/село');
+  if (!String(order?.postOffice || '').trim()) missing.push('відділення/поштомат НП');
+  if (!String(order?.size || '').trim()) missing.push('розмір');
+  return missing;
+}
+
+function canRecreateNovaTtn(o) {
+  return !!o?.ttn && ['confirmed', 'shipped'].includes(o.status || 'new');
 }
 
 function deliveryBlock(o) {
@@ -264,23 +289,23 @@ function orderDetailKeyboard(o) {
   const id = o.id;
   const rows = [];
   if ((o.status || 'new') === 'new') {
-    rows.push([{ text: '✅ Підтвердити', callback_data: `confirm_${id}` }, { text: '❌ Скасувати', callback_data: `cancel_${id}` }]);
+    rows.push([{ text: '✅ Підтвердити', callback_data: `os_${id}_c` }, { text: '❌ Скасувати', callback_data: `os_${id}_x` }]);
   }
   if (['confirmed', 'shipped'].includes(o.status || 'new')) {
-    rows.push([{ text: hasNovaPoshtaData(o) ? '✏️ Дані НП' : '📦 Заповнити дані НП', callback_data: `npdata_${id}` }]);
+    rows.push([{ text: hasNovaPoshtaData(o) ? '✏️ Дані НП' : '📦 Заповнити дані НП', callback_data: `fill_${id}` }]);
     if (!o.ttn) {
-      rows.push([{ text: '📮 Створити ТТН', callback_data: `npcreate_${id}` }]);
+      rows.push([{ text: '🚚 Створити ТТН НП', callback_data: `npcreate_${id}` }]);
     }
-    rows.push([{ text: '🧾 Внести ТТН вручну', callback_data: `ttn_${id}` }]);
+    rows.push([{ text: '🧾 Внести ТТН вручну', callback_data: `oi_${id}_tt` }]);
+  }
+  if (canRecreateNovaTtn(o)) {
+    rows.push([{ text: '🔁 Створити ТТН заново', callback_data: `npcreate_force_${id}` }]);
   }
   if (o.ttn) {
     rows.push([
       { text: '🔍 Статус НП', callback_data: `nt_${id}` },
       { text: '🔄 Оновити НП', callback_data: `npsync_${id}` },
     ]);
-    if (['confirmed', 'shipped'].includes(o.status || 'new')) {
-      rows.push([{ text: '♻️ Пересоздати ТТН', callback_data: `nprecreate_${id}` }]);
-    }
   }
   rows.push([{ text: '🗑 Видалити', callback_data: `del_order_${id}` }]);
   rows.push([{ text: '← До списку', callback_data: 'orders' }]);
@@ -292,18 +317,22 @@ async function showOrderDetail(chatId, id, msgId = null) {
   if (!o || o.error) return bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB });
   const text =
     `📋 <b>Замовлення #${esc(o.id)}</b>\n━━━━━━━━━━━━━━━\n` +
-    (o.product ? `🛍 Товар: <b>${esc(o.product)}</b>\n` : '') +
-    `👤 <b>${esc(o.name || '—')}</b>\n📱 ${esc(o.phone || '—')}\n` +
-    `👟 Розмір: ${esc(o.size || '—')}\n` +
-    (o.color ? `🎨 Колір: ${esc(o.color)}\n` : '') +
-    (o.price ? `💵 Ціна: ${esc(o.price)} грн\n` : '') +
+    `🆔 ID: <b>${esc(o.id)}</b>\n` +
+    `👤 Ім'я: <b>${esc(o.name || '—')}</b>\n` +
+    `📱 Телефон: <b>${esc(o.phone || '—')}</b>\n` +
+    `🛍 Товар: <b>${esc(o.product || '—')}</b>\n` +
+    `👟 Розмір: <b>${esc(o.size || '—')}</b>\n` +
+    `🎨 Колір: <b>${esc(o.color || '—')}</b>\n` +
+    `💵 Ціна: <b>${esc(o.price || '—')} грн</b>\n` +
     (o.contactViaTelegram ? `💬 Зв'язок: Telegram\n` : `📞 Зв'язок: Дзвінок\n`) +
     `🏷 Статус замовлення: ${statusEmoji(o.status)} <b>${esc(o.status || 'new')}</b>\n` +
     `💳 Статус оплати: <b>${esc(paymentLabel(o))}</b>\n` +
-    `🚚 Статус доставки: <b>${esc(deliveryLabel(o))}</b>\n` +
+    `🚚 ТТН: <code>${esc(o.ttn || '—')}</code>\n` +
+    `📦 Статус доставки: <b>${esc(deliveryLabel(o))}</b>\n` +
+    `📅 Дата: <b>${fmtDate(o.createdAt)}</b>\n` +
     deliveryBlock(o) +
     novaPoshtaBlock(o) +
-    `📅 ${fmtDate(o.createdAt)}\n━━━━━━━━━━━━━━━`;
+    `━━━━━━━━━━━━━━━`;
   reply(chatId, text, orderDetailKeyboard(o), msgId);
 }
 
@@ -333,101 +362,104 @@ async function syncNpOrder(chatId, id, msgId = null) {
   await showOrderDetail(chatId, id, msgId);
 }
 
-const NP_DATA_STEPS = [
-  {
-    key: 'fullName',
-    prompt: '🧾 Введіть ім’я та прізвище отримувача для Нової Пошти:',
-    required: true,
-  },
-  {
-    key: 'city',
-    prompt: '🏙 Введіть місто отримувача:',
-    required: true,
-  },
-  {
-    key: 'district',
-    prompt: '📍 Введіть район, якщо потрібен. Щоб пропустити, напишіть "-":',
-    required: false,
-  },
-  {
-    key: 'postOffice',
-    prompt: '📦 Введіть номер або назву відділення Нової Пошти:',
-    required: true,
-  },
-];
-
-async function promptNpDataStep(chatId, flow) {
-  const step = NP_DATA_STEPS[flow.step];
-  if (!step) return;
-  await bot.sendMessage(chatId, `${step.prompt}\n\nКрок ${flow.step + 1}/${NP_DATA_STEPS.length}`, {
-    reply_markup: { inline_keyboard: [[{ text: '← До замовлення', callback_data: `npcancel_${flow.id}` }]] },
-  });
-}
-
-async function startNpDataFlow(chatId, id) {
+async function askManagerDeliveryStep(chatId, id, stepIndex = 0, data = {}) {
   const order = await serverGet(`/api/admin/orders/${id}`);
   if (!order || order.error) {
     await bot.sendMessage(chatId, '❌ Замовлення не знайдено.', { reply_markup: MAIN_KB });
     return;
   }
-
+  const step = MANAGER_DELIVERY_STEPS[stepIndex];
+  if (!step) return;
   delete pendingTtn[chatId];
-  pendingNpData[chatId] = { id, step: 0, fields: {} };
-  await bot.sendMessage(chatId,
-    `📦 Дані для відправки замовлення #${id}\n` +
-    `Телефон вже беру із замовлення: ${order.phone || '—'}`,
-    { reply_markup: MAIN_KB });
-  await promptNpDataStep(chatId, pendingNpData[chatId]);
+  pendingDelivery[chatId] = { id, stepIndex, data };
+  await bot.sendMessage(chatId, deliveryStepPrompt(step, { ...order, ...data }), {
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: [[{ text: '← До замовлення', callback_data: `delivery_cancel_${id}` }]] },
+  });
 }
 
-async function saveNpDataInput(chatId, text) {
-  const flow = pendingNpData[chatId];
-  const step = NP_DATA_STEPS[flow.step];
-  const value = text.trim();
-  const skipOptional = !step.required && value === '-';
+async function saveManagerDeliveryInput(chatId, text) {
+  const pending = pendingDelivery[chatId];
+  if (!pending) return false;
 
-  if (step.required && !value) {
-    await bot.sendMessage(chatId, '❌ Це поле потрібне для створення ТТН.');
-    await promptNpDataStep(chatId, flow);
-    return;
-  }
-  if (step.key === 'fullName' && value.split(/\s+/).filter(Boolean).length < 2) {
-    await bot.sendMessage(chatId, '❌ Для Нової Пошти введіть ім’я та прізвище.');
-    await promptNpDataStep(chatId, flow);
-    return;
-  }
-
-  flow.fields[step.key] = skipOptional ? null : value;
-  flow.step += 1;
-  if (flow.step < NP_DATA_STEPS.length) {
-    await promptNpDataStep(chatId, flow);
-    return;
-  }
-
-  delete pendingNpData[chatId];
-  const order = await serverGet(`/api/admin/orders/${flow.id}`);
+  const order = await serverGet(`/api/admin/orders/${pending.id}`);
   if (!order || order.error) {
+    delete pendingDelivery[chatId];
     await bot.sendMessage(chatId, '❌ Замовлення не знайдено.', { reply_markup: MAIN_KB });
-    return;
+    return true;
+  }
+
+  const step = MANAGER_DELIVERY_STEPS[pending.stepIndex];
+  if (!step) {
+    delete pendingDelivery[chatId];
+    return true;
+  }
+
+  const raw = text.trim();
+  const current = pending.data?.[step.key] || order[step.orderKey] || '';
+  const value = raw === '-' ? current : raw;
+  if (!value) {
+    await bot.sendMessage(chatId, `❌ Введіть ${step.label}, без цього ТТН не створиться.`);
+    return true;
+  }
+
+  const data = { ...(pending.data || {}), [step.key]: value };
+  const nextIndex = pending.stepIndex + 1;
+  if (MANAGER_DELIVERY_STEPS[nextIndex]) {
+    await askManagerDeliveryStep(chatId, pending.id, nextIndex, data);
+    return true;
   }
 
   const delivery = {
     ...(order.delivery && typeof order.delivery === 'object' ? order.delivery : {}),
-    ...flow.fields,
+    fullName: data.fullName,
+    city: data.city,
+    postOffice: data.postOffice,
   };
-  const patch = {
-    ...flow.fields,
+  const updated = await serverPatch(`/api/admin/orders/${pending.id}`, {
+    fullName: data.fullName,
+    city: data.city,
+    postOffice: data.postOffice,
+    size: data.size,
+    status: 'confirmed',
+    deliveryStatus: order.deliveryStatus || 'ready_for_np',
     delivery,
-    ...(order.ttn ? {} : { deliveryStatus: 'ready_for_np' }),
-  };
-  const updated = await serverPatch(`/api/admin/orders/${flow.id}`, patch);
+    deliveryCollectedByManager: true,
+    deliveryCollectedAt: new Date().toISOString(),
+  });
+  delete pendingDelivery[chatId];
   if (!updated || updated.error) {
-    await bot.sendMessage(chatId, '❌ Не вдалося зберегти дані Нової Пошти.', { reply_markup: MAIN_KB });
-    return;
+    await bot.sendMessage(chatId, '❌ Не вдалося зберегти дані доставки.', { reply_markup: MAIN_KB });
+    return true;
   }
 
-  await bot.sendMessage(chatId, `✅ Дані Нової Пошти збережено для замовлення #${flow.id}.`, { reply_markup: MAIN_KB });
-  await showOrderDetail(chatId, flow.id);
+  await bot.sendMessage(chatId, '✅ Дані доставки збережено. Можна створювати ТТН.', {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '🚚 Створити ТТН НП', callback_data: `npcreate_${pending.id}` }],
+        [{ text: '📋 Відкрити замовлення', callback_data: `od_${pending.id}` }],
+      ],
+    },
+  });
+  await showOrderDetail(chatId, pending.id);
+  return true;
+}
+
+async function confirmOrderByManager(chatId, id, msgId = null, managerId = null) {
+  const patch = {
+    status: 'confirmed',
+    confirmationSource: 'manager',
+    managerConfirmedAt: new Date().toISOString(),
+  };
+  if (managerId) patch.managerConfirmedBy = managerId;
+  const updated = await serverPatch(`/api/admin/orders/${id}`, patch);
+  if (!updated || updated.error) {
+    await bot.sendMessage(chatId, '❌ Не вдалося підтвердити замовлення.', { reply_markup: MAIN_KB });
+    return;
+  }
+  await bot.sendMessage(chatId, `✅ Замовлення #${id} підтверджено менеджером. Тепер заповнимо дані для Нової Пошти.`);
+  await askManagerDeliveryStep(chatId, id, 0);
+  return updated;
 }
 
 async function createNpTtn(chatId, id, force = false, msgId = null) {
@@ -436,9 +468,10 @@ async function createNpTtn(chatId, id, force = false, msgId = null) {
     await bot.sendMessage(chatId, '❌ Замовлення не знайдено.', { reply_markup: MAIN_KB });
     return;
   }
-  if (!hasNovaPoshtaData(order)) {
-    await bot.sendMessage(chatId, '❌ Спочатку заповніть ПІБ, місто та відділення Нової Пошти.', { reply_markup: MAIN_KB });
-    await startNpDataFlow(chatId, id);
+  const missing = missingRecipientDeliveryFields(order).filter(x => x !== 'ПІБ' || !order.name);
+  if (missing.length) {
+    await bot.sendMessage(chatId, `ℹ️ Для створення ТТН не вистачає: <b>${esc(missing.join(', '))}</b>. Заповнимо зараз.`, { parse_mode: 'HTML' });
+    await askManagerDeliveryStep(chatId, id, 0);
     return;
   }
 
@@ -456,35 +489,72 @@ async function createNpTtn(chatId, id, force = false, msgId = null) {
   await showOrderDetail(chatId, id, msgId);
 }
 
-async function showTrackingMenu(chatId, msgId = null) {
-  let orders = await serverGet('/api/admin/orders');
-  if (!Array.isArray(orders)) return reply(chatId, '❌ Не вдалося завантажити відстеження.', MAIN_KB, msgId);
-  orders = orders
-    .filter(o => o.ttn || o.npStatus || deliveryStatusValue(o))
-    .reverse();
+function isOrderActiveForTracking(o) {
+  return !!o?.ttn && !['cancelled', 'returned', 'completed'].includes(o.status || 'new');
+}
 
-  const active = orders.filter(o => o.ttn && !['cancelled', 'returned', 'completed'].includes(o.status || 'new'));
-  let text =
-    `🚚 <b>Відстеження посилок</b>\n━━━━━━━━━━━━━━━\n` +
-    `Активних ТТН: <b>${active.length}</b>\n` +
-    `Усього з доставкою/НП: <b>${orders.length}</b>\n\n`;
+function trackingMenuKeyboard() {
+  return { inline_keyboard: [
+    [{ text: '🚚 Активні ТТН', callback_data: 'trk_active' }, { text: '🔄 Оновити всі НП', callback_data: 'np_sync_all' }],
+    [{ text: '← Меню', callback_data: 'main' }],
+  ] };
+}
 
-  orders.slice(0, 10).forEach(o => {
-    text += `${statusEmoji(o.status)} <b>#${esc(o.id)}</b> ${esc(o.name || '—')}\n`;
-    if (o.ttn) text += `   ТТН: <code>${esc(o.ttn)}</code>\n`;
-    text += `   🚚 ${esc(o.npStatus || deliveryLabel(o))}\n`;
-    if (o.npSyncedAt) text += `   Оновлено: ${fmtDate(o.npSyncedAt)}\n`;
-    text += '\n';
-  });
-  if (orders.length > 10) text += `…і ще ${orders.length - 10}\n`;
-
+function trackingListKeyboard(orders) {
   const rows = orders.slice(0, 10).map(o => {
-    const row = [{ text: `📋 #${o.id} ${o.name || '—'}`, callback_data: `od_${o.id}` }];
+    const row = [{ text: `#${o.id} ${o.name || '—'}`, callback_data: `od_${o.id}` }];
     if (o.ttn) row.push({ text: '🔄 НП', callback_data: `npsync_${o.id}` });
     return row;
   });
-  rows.push([{ text: '← Меню', callback_data: 'main' }]);
-  reply(chatId, text, { inline_keyboard: rows }, msgId);
+  rows.push([{ text: '← Відстеження', callback_data: 'track_menu' }]);
+  return { inline_keyboard: rows };
+}
+
+async function showTrackingMenu(chatId, msgId = null) {
+  const orders = await serverGet('/api/admin/orders');
+  if (!Array.isArray(orders)) return reply(chatId, '❌ Не вдалося завантажити відстеження.', MAIN_KB, msgId);
+
+  const activeTtn = orders.filter(isOrderActiveForTracking);
+  const noTtn = orders.filter(o => !o.ttn && ['confirmed', 'shipped', 'paid'].includes(o.status || 'new'));
+  const newOrders = orders.filter(o => (o.status || 'new') === 'new');
+  const text =
+    `🚚 <b>Відстеження</b>\n━━━━━━━━━━━━━━━\n` +
+    `🆕 Нові заявки: <b>${newOrders.length}</b>\n` +
+    `🚚 Активні ТТН: <b>${activeTtn.length}</b>\n` +
+    `🧾 Підтверджені без ТТН: <b>${noTtn.length}</b>\n` +
+    `━━━━━━━━━━━━━━━`;
+  return reply(chatId, text, trackingMenuKeyboard(), msgId);
+}
+
+async function showTrackingList(chatId, msgId = null) {
+  let orders = await serverGet('/api/admin/orders');
+  if (!Array.isArray(orders)) return reply(chatId, '❌ Не вдалося завантажити відстеження.', trackingMenuKeyboard(), msgId);
+  orders = orders.filter(isOrderActiveForTracking).reverse();
+  if (!orders.length) return reply(chatId, '🚚 <b>Активних ТТН немає</b>', trackingMenuKeyboard(), msgId);
+
+  let text = `🚚 <b>Активні ТТН</b> (${orders.length})\n━━━━━━━━━━━━━━━\n\n`;
+  orders.slice(0, 10).forEach(o => {
+    text += `${statusEmoji(o.status)} <b>#${esc(o.id)}</b> ${esc(o.name || '—')}\n`;
+    if (o.product) text += `   🛍 ${esc(o.product)}\n`;
+    text += `   🚚 <code>${esc(o.ttn || '—')}</code>\n`;
+    text += `   📦 ${esc(o.npStatus || deliveryLabel(o))}`;
+    if (o.npSyncedAt) text += ` · ${fmtDate(o.npSyncedAt)}`;
+    text += '\n\n';
+  });
+  if (orders.length > 10) text += `…і ще ${orders.length - 10} замовлень\n`;
+  return reply(chatId, text, trackingListKeyboard(orders), msgId);
+}
+
+async function syncAllNpOrders(chatId, msgId = null) {
+  const result = await serverPost('/api/admin/np/sync', { limit: 100 });
+  if (!result || result.error) {
+    await bot.sendMessage(chatId, '❌ Не вдалося оновити Нову Пошту.', { reply_markup: MAIN_KB });
+    return;
+  }
+  await bot.sendMessage(chatId,
+    `🔄 НП оновлено. Перевірено: <b>${esc(result.checked || 0)}</b>, змінено: <b>${esc(result.changed || 0)}</b>.`,
+    { parse_mode: 'HTML', reply_markup: MAIN_KB });
+  await showTrackingMenu(chatId, msgId);
 }
 
 async function showReviews(chatId, page = 1, msgId = null) {
@@ -800,8 +870,8 @@ bot.on('message', async msg => {
     return;
   }
 
-  if (pendingNpData[chatId]) {
-    await saveNpDataInput(chatId, text);
+  if (pendingDelivery[chatId]) {
+    await saveManagerDeliveryInput(chatId, text);
     return;
   }
 
@@ -928,23 +998,31 @@ bot.on('callback_query', async q => {
 
     if (data === 'track_menu') { await showTrackingMenu(chatId, msgId); return; }
 
+    if (data === 'trk_active') { await showTrackingList(chatId, msgId); return; }
+
+    if (data === 'np_sync_all') { await syncAllNpOrders(chatId, msgId); return; }
+
     if (data.startsWith('nt_')) { await showNpTrack(chatId, Number(data.slice(3)), msgId); return; }
 
     if (data.startsWith('npsync_')) { await syncNpOrder(chatId, Number(data.slice(7)), msgId); return; }
 
-    if (data.startsWith('npdata_')) {
-      await startNpDataFlow(chatId, Number(data.slice(7)));
+    if (data.startsWith('fill_') || data.startsWith('npdata_')) {
+      const id = Number(data.slice(data.startsWith('fill_') ? 5 : 7));
+      await askManagerDeliveryStep(chatId, id, 0);
       return;
     }
 
-    if (data.startsWith('npcancel_')) {
-      delete pendingNpData[chatId];
-      await showOrderDetail(chatId, Number(data.slice(9)), msgId);
+    if (data.startsWith('delivery_cancel_') || data.startsWith('npcancel_')) {
+      const id = Number(data.slice(data.startsWith('delivery_cancel_') ? 16 : 9));
+      delete pendingDelivery[chatId];
+      await showOrderDetail(chatId, id, msgId);
       return;
     }
 
     if (data.startsWith('npcreate_')) {
-      await createNpTtn(chatId, Number(data.slice(9)), false, msgId);
+      const force = data.startsWith('npcreate_force_');
+      const id = Number(data.slice(force ? 15 : 9));
+      await createNpTtn(chatId, id, force, msgId);
       return;
     }
 
@@ -953,9 +1031,9 @@ bot.on('callback_query', async q => {
       return;
     }
 
-    if (data.startsWith('ttn_')) {
-      const id = Number(data.slice(4));
-      delete pendingNpData[chatId];
+    if (data.startsWith('oi_') || data.startsWith('ttn_')) {
+      const id = data.startsWith('oi_') ? Number(data.split('_')[1]) : Number(data.slice(4));
+      delete pendingDelivery[chatId];
       pendingTtn[chatId] = id;
       await bot.sendMessage(chatId, `🧾 Введіть ТТН для замовлення #${id}:`, {
         reply_markup: { inline_keyboard: [[{ text: '← До замовлення', callback_data: `od_${id}` }]] },
@@ -963,20 +1041,22 @@ bot.on('callback_query', async q => {
       return;
     }
 
-    if (data.startsWith('confirm_') || data.startsWith('cancel_')) {
-      const isConf = data.startsWith('confirm_');
-      const id     = Number(data.replace(isConf ? 'confirm_' : 'cancel_', ''));
+    if (data.startsWith('os_') || data.startsWith('confirm_') || data.startsWith('cancel_')) {
+      const oldStyle = data.startsWith('os_');
+      const [, oldId, oldCode] = oldStyle ? data.split('_') : [];
+      const isConf = oldStyle ? oldCode === 'c' : data.startsWith('confirm_');
+      const id     = oldStyle ? Number(oldId) : Number(data.replace(isConf ? 'confirm_' : 'cancel_', ''));
       const order  = await serverGet(`/api/admin/orders/${id}`);
       if (!order || order.error) { await bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB }); return; }
-      const updated = await serverPatch(`/api/admin/orders/${id}`, { status: isConf ? 'confirmed' : 'cancelled' });
+      if (isConf) {
+        await confirmOrderByManager(chatId, id, msgId, q.from?.id);
+        return;
+      }
+      const updated = await serverPatch(`/api/admin/orders/${id}`, { status: 'cancelled' });
       if (!updated || updated.error) { await bot.sendMessage(chatId, '❌ Не вдалося змінити статус.', { reply_markup: MAIN_KB }); return; }
       await bot.sendMessage(chatId,
-        `${isConf ? '✅' : '❌'} Замовлення #${id} (${updated.name}) — <b>${isConf ? 'підтверджено' : 'скасовано'}</b>`,
+        `❌ Замовлення #${id} (${updated.name}) — <b>скасовано</b>`,
         { parse_mode: 'HTML', reply_markup: MAIN_KB });
-      if (isConf) {
-        if (hasNovaPoshtaData(updated)) await showOrderDetail(chatId, id, msgId);
-        else await startNpDataFlow(chatId, id);
-      }
       return;
     }
 
