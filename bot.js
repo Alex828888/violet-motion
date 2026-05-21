@@ -34,6 +34,7 @@ function isAdmin(id) { return ADMIN_IDS.length === 0 || ADMIN_IDS.includes(id) |
 /* ── State ────────────────────────────────────────────────── */
 const managerDialogs = {};
 const pendingSearch  = {};
+const pendingNpData  = {};
 const pendingTtn     = {};
 const pendingCb      = new Set();
 
@@ -126,6 +127,10 @@ function deliveryLabel(o) {
 
 function hasDeliveryInfo(o) {
   return !!(o?.fullName || o?.city || o?.district || o?.postOffice);
+}
+
+function hasNovaPoshtaData(o) {
+  return !!(o?.fullName && o?.city && o?.postOffice);
 }
 
 function deliveryBlock(o) {
@@ -262,13 +267,20 @@ function orderDetailKeyboard(o) {
     rows.push([{ text: '✅ Підтвердити', callback_data: `confirm_${id}` }, { text: '❌ Скасувати', callback_data: `cancel_${id}` }]);
   }
   if (['confirmed', 'shipped'].includes(o.status || 'new')) {
-    rows.push([{ text: '🧾 Внести ТТН', callback_data: `ttn_${id}` }]);
+    rows.push([{ text: hasNovaPoshtaData(o) ? '✏️ Дані НП' : '📦 Заповнити дані НП', callback_data: `npdata_${id}` }]);
+    if (!o.ttn) {
+      rows.push([{ text: '📮 Створити ТТН', callback_data: `npcreate_${id}` }]);
+    }
+    rows.push([{ text: '🧾 Внести ТТН вручну', callback_data: `ttn_${id}` }]);
   }
   if (o.ttn) {
     rows.push([
       { text: '🔍 Статус НП', callback_data: `nt_${id}` },
       { text: '🔄 Оновити НП', callback_data: `npsync_${id}` },
     ]);
+    if (['confirmed', 'shipped'].includes(o.status || 'new')) {
+      rows.push([{ text: '♻️ Пересоздати ТТН', callback_data: `nprecreate_${id}` }]);
+    }
   }
   rows.push([{ text: '🗑 Видалити', callback_data: `del_order_${id}` }]);
   rows.push([{ text: '← До списку', callback_data: 'orders' }]);
@@ -318,6 +330,129 @@ async function syncNpOrder(chatId, id, msgId = null) {
   const result = await serverPost(`/api/admin/orders/${id}/np/sync`, {});
   if (!result || result.error) return bot.sendMessage(chatId, '❌ Не вдалося оновити Нову Пошту.', { reply_markup: MAIN_KB });
   await bot.sendMessage(chatId, `🔄 НП оновлено: <b>${esc(result.track?.status || result.order?.npStatus || 'ok')}</b>`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
+  await showOrderDetail(chatId, id, msgId);
+}
+
+const NP_DATA_STEPS = [
+  {
+    key: 'fullName',
+    prompt: '🧾 Введіть ім’я та прізвище отримувача для Нової Пошти:',
+    required: true,
+  },
+  {
+    key: 'city',
+    prompt: '🏙 Введіть місто отримувача:',
+    required: true,
+  },
+  {
+    key: 'district',
+    prompt: '📍 Введіть район, якщо потрібен. Щоб пропустити, напишіть "-":',
+    required: false,
+  },
+  {
+    key: 'postOffice',
+    prompt: '📦 Введіть номер або назву відділення Нової Пошти:',
+    required: true,
+  },
+];
+
+async function promptNpDataStep(chatId, flow) {
+  const step = NP_DATA_STEPS[flow.step];
+  if (!step) return;
+  await bot.sendMessage(chatId, `${step.prompt}\n\nКрок ${flow.step + 1}/${NP_DATA_STEPS.length}`, {
+    reply_markup: { inline_keyboard: [[{ text: '← До замовлення', callback_data: `npcancel_${flow.id}` }]] },
+  });
+}
+
+async function startNpDataFlow(chatId, id) {
+  const order = await serverGet(`/api/admin/orders/${id}`);
+  if (!order || order.error) {
+    await bot.sendMessage(chatId, '❌ Замовлення не знайдено.', { reply_markup: MAIN_KB });
+    return;
+  }
+
+  delete pendingTtn[chatId];
+  pendingNpData[chatId] = { id, step: 0, fields: {} };
+  await bot.sendMessage(chatId,
+    `📦 Дані для відправки замовлення #${id}\n` +
+    `Телефон вже беру із замовлення: ${order.phone || '—'}`,
+    { reply_markup: MAIN_KB });
+  await promptNpDataStep(chatId, pendingNpData[chatId]);
+}
+
+async function saveNpDataInput(chatId, text) {
+  const flow = pendingNpData[chatId];
+  const step = NP_DATA_STEPS[flow.step];
+  const value = text.trim();
+  const skipOptional = !step.required && value === '-';
+
+  if (step.required && !value) {
+    await bot.sendMessage(chatId, '❌ Це поле потрібне для створення ТТН.');
+    await promptNpDataStep(chatId, flow);
+    return;
+  }
+  if (step.key === 'fullName' && value.split(/\s+/).filter(Boolean).length < 2) {
+    await bot.sendMessage(chatId, '❌ Для Нової Пошти введіть ім’я та прізвище.');
+    await promptNpDataStep(chatId, flow);
+    return;
+  }
+
+  flow.fields[step.key] = skipOptional ? null : value;
+  flow.step += 1;
+  if (flow.step < NP_DATA_STEPS.length) {
+    await promptNpDataStep(chatId, flow);
+    return;
+  }
+
+  delete pendingNpData[chatId];
+  const order = await serverGet(`/api/admin/orders/${flow.id}`);
+  if (!order || order.error) {
+    await bot.sendMessage(chatId, '❌ Замовлення не знайдено.', { reply_markup: MAIN_KB });
+    return;
+  }
+
+  const delivery = {
+    ...(order.delivery && typeof order.delivery === 'object' ? order.delivery : {}),
+    ...flow.fields,
+  };
+  const patch = {
+    ...flow.fields,
+    delivery,
+    ...(order.ttn ? {} : { deliveryStatus: 'ready_for_np' }),
+  };
+  const updated = await serverPatch(`/api/admin/orders/${flow.id}`, patch);
+  if (!updated || updated.error) {
+    await bot.sendMessage(chatId, '❌ Не вдалося зберегти дані Нової Пошти.', { reply_markup: MAIN_KB });
+    return;
+  }
+
+  await bot.sendMessage(chatId, `✅ Дані Нової Пошти збережено для замовлення #${flow.id}.`, { reply_markup: MAIN_KB });
+  await showOrderDetail(chatId, flow.id);
+}
+
+async function createNpTtn(chatId, id, force = false, msgId = null) {
+  const order = await serverGet(`/api/admin/orders/${id}`);
+  if (!order || order.error) {
+    await bot.sendMessage(chatId, '❌ Замовлення не знайдено.', { reply_markup: MAIN_KB });
+    return;
+  }
+  if (!hasNovaPoshtaData(order)) {
+    await bot.sendMessage(chatId, '❌ Спочатку заповніть ПІБ, місто та відділення Нової Пошти.', { reply_markup: MAIN_KB });
+    await startNpDataFlow(chatId, id);
+    return;
+  }
+
+  const result = await serverPost(`/api/admin/orders/${id}/np/create`, force ? { force: true } : {});
+  if (!result || result.error) {
+    const reason = result?.userMessage || result?.error || 'Не вдалося створити ТТН.';
+    await bot.sendMessage(chatId, `❌ ${reason}`, { reply_markup: MAIN_KB });
+    return;
+  }
+
+  const ttn = result.ttn || result.order?.ttn || order.ttn || '—';
+  await bot.sendMessage(chatId,
+    `${force ? '♻️ ТТН пересоздано' : result.duplicate ? 'ℹ️ ТТН вже існує' : '✅ ТТН створено'} для замовлення #${id}: <code>${esc(ttn)}</code>`,
+    { parse_mode: 'HTML', reply_markup: MAIN_KB });
   await showOrderDetail(chatId, id, msgId);
 }
 
@@ -665,6 +800,11 @@ bot.on('message', async msg => {
     return;
   }
 
+  if (pendingNpData[chatId]) {
+    await saveNpDataInput(chatId, text);
+    return;
+  }
+
   if (pendingTtn[chatId]) {
     const id = pendingTtn[chatId];
     delete pendingTtn[chatId];
@@ -792,8 +932,30 @@ bot.on('callback_query', async q => {
 
     if (data.startsWith('npsync_')) { await syncNpOrder(chatId, Number(data.slice(7)), msgId); return; }
 
+    if (data.startsWith('npdata_')) {
+      await startNpDataFlow(chatId, Number(data.slice(7)));
+      return;
+    }
+
+    if (data.startsWith('npcancel_')) {
+      delete pendingNpData[chatId];
+      await showOrderDetail(chatId, Number(data.slice(9)), msgId);
+      return;
+    }
+
+    if (data.startsWith('npcreate_')) {
+      await createNpTtn(chatId, Number(data.slice(9)), false, msgId);
+      return;
+    }
+
+    if (data.startsWith('nprecreate_')) {
+      await createNpTtn(chatId, Number(data.slice(11)), true, msgId);
+      return;
+    }
+
     if (data.startsWith('ttn_')) {
       const id = Number(data.slice(4));
+      delete pendingNpData[chatId];
       pendingTtn[chatId] = id;
       await bot.sendMessage(chatId, `🧾 Введіть ТТН для замовлення #${id}:`, {
         reply_markup: { inline_keyboard: [[{ text: '← До замовлення', callback_data: `od_${id}` }]] },
@@ -811,6 +973,10 @@ bot.on('callback_query', async q => {
       await bot.sendMessage(chatId,
         `${isConf ? '✅' : '❌'} Замовлення #${id} (${updated.name}) — <b>${isConf ? 'підтверджено' : 'скасовано'}</b>`,
         { parse_mode: 'HTML', reply_markup: MAIN_KB });
+      if (isConf) {
+        if (hasNovaPoshtaData(updated)) await showOrderDetail(chatId, id, msgId);
+        else await startNpDataFlow(chatId, id);
+      }
       return;
     }
 
