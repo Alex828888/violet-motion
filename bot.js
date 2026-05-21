@@ -50,6 +50,7 @@ async function apiFetch(method, pathname, body = null) {
     const r = await fetch(`${SERVER_URL}${pathname}`, opts);
     clearTimeout(t);
     const text = await r.text();
+    if (!r.ok) console.error(`[api] ${method} ${pathname}: ${r.status} ${text.slice(0, 500)}`);
     try { return JSON.parse(text); } catch { return null; }
   } catch (e) {
     clearTimeout(t);
@@ -477,8 +478,15 @@ async function createNpTtn(chatId, id, force = false, msgId = null) {
 
   const result = await serverPost(`/api/admin/orders/${id}/np/create`, force ? { force: true } : {});
   if (!result || result.error) {
-    const reason = result?.userMessage || result?.error || 'Не вдалося створити ТТН.';
-    await bot.sendMessage(chatId, `❌ ${reason}`, { reply_markup: MAIN_KB });
+    const errors = [
+      ...(Array.isArray(result?.details?.errors) ? result.details.errors : []),
+      ...(Array.isArray(result?.details?.raw?.errors) ? result.details.raw.errors : []),
+    ].filter(Boolean).slice(0, 2);
+    const extra = errors.length && !String(result?.userMessage || '').includes(errors[0])
+      ? `\n<b>НП:</b> ${esc(errors.join('; '))}`
+      : '';
+    const reason = esc(result?.userMessage || result?.error || 'Не вдалося створити ТТН.');
+    await bot.sendMessage(chatId, `❌ ${reason}${extra}`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
     return;
   }
 

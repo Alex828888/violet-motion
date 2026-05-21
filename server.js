@@ -498,6 +498,40 @@ function npDetailsText(details = {}) {
 function isNpRateLimited(details = {}) {
   return !!(details.rateLimited || details.status === 429 || /to+\s+many\s+requests|too\s+many\s+requests|rate\s*limit|ліміт|лимит/i.test(npDetailsText(details)));
 }
+function npDetailMessages(details = {}) {
+  return [
+    ...(Array.isArray(details.errors) ? details.errors : []),
+    ...(Array.isArray(details.raw?.errors) ? details.raw.errors : []),
+  ]
+    .map(x => sanitizeStr(x, 220))
+    .filter(Boolean)
+    .slice(0, 3);
+}
+function npUserMessage(error, details = {}) {
+  const message = String(error?.message || '');
+  const missing = Array.isArray(details.missing) ? details.missing : [];
+  const apiErrors = npDetailMessages(details);
+
+  if (missing.includes('NOVA_POSHTA_API_KEY')) {
+    return 'На Render не налаштовано API ключ Нової Пошти.';
+  }
+  if (/sender config/i.test(message) || missing.some(x => /^CitySender|^Sender|^SenderAddress|^ContactSender|^SendersPhone$/.test(x))) {
+    return 'Нова Пошта не знайшла дані відправника. Перевірте налаштування відправника НП на Render.';
+  }
+  if (/city was not found/i.test(message)) {
+    return `Нова Пошта не знайшла місто "${sanitizeStr(details.originalCity || details.city || '', 80)}".`;
+  }
+  if (/warehouse was not found/i.test(message)) {
+    return `Нова Пошта не знайшла відділення "${sanitizeStr(details.warehouse || details.normalizedWarehouse || '', 80)}" у цьому місті.`;
+  }
+  if (/recipient name or phone is incomplete/i.test(message)) {
+    return 'Для ТТН Новій Пошті потрібні коректні ПІБ отримувача та телефон.';
+  }
+  if (apiErrors.length) {
+    return `Нова Пошта відхилила ТТН: ${apiErrors.join('; ')}`;
+  }
+  return 'Nova Poshta не виконала запит. Перевірте дані доставки або спробуйте ще раз.';
+}
 function npErrorPayload(error) {
   const details = error?.details || {};
   const rateLimited = isNpRateLimited(details);
@@ -506,7 +540,7 @@ function npErrorPayload(error) {
     error: error?.message || 'Nova Poshta request failed',
     userMessage: rateLimited
       ? 'Нова Пошта тимчасово обмежила кількість запитів. Зачекайте 30-60 секунд і натисніть створення ТТН ще раз.'
-      : 'Nova Poshta не виконала запит. Перевірте дані доставки або спробуйте ще раз.',
+      : npUserMessage(error, details),
     details,
     missing: details.missing || [],
     retryable,
