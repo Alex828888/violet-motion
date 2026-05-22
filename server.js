@@ -60,6 +60,7 @@ const F = {
   support:   path.join(DATA, 'support.json'),
   analytics: path.join(DATA, 'analytics.json'),
   finance:   path.join(DATA, 'finance.json'),
+  crmProducts: path.join(DATA, 'crm-products.json'),
   orderNotify: path.join(DATA, 'order-notify.json'),
 };
 
@@ -347,7 +348,7 @@ function orderPaidNet(o) {
   const upsell = orderUpsell(o);
   const upsellPaid = upsell && (upsell.incomePosted || upsell.paidAt || upsell.paymentStatus === 'paid');
   let total = 0;
-  if (basePaid) total += asMoneyNumber(o?.price) - asMoneyNumber(o?.cost || o?.costPrice || o?.purchasePrice);
+  if (basePaid) total += orderBaseRevenue(o) - orderBaseCost(o);
   if (upsellPaid) total += asMoneyNumber(upsell.price) - asMoneyNumber(upsell.cost);
   return total;
 }
@@ -379,8 +380,8 @@ function inPeriod(iso, period) {
   return Number.isFinite(t) && t >= start.getTime();
 }
 const PRODUCT_GROUPS = [
-  { key: 'violet', label: 'Violet Motion', aliases: ['violet motion', 'violet-motion', 'violet motion sneakers', 'violet sneakers'] },
-  { key: 'black',  label: 'Black Breeze',  aliases: ['black breeze', 'black-breeze'] },
+  { key: 'violet', label: 'Violet Motion', defaultCost: 420, aliases: ['violet motion', 'violet-motion', 'violet motion sneakers', 'violet sneakers'] },
+  { key: 'black',  label: 'Black Breeze',  defaultCost: 380, aliases: ['black breeze', 'black-breeze', 'black breeze sandals'] },
 ];
 function normalizeProductName(value) {
   return String(value || '').toLowerCase().replace(/ё/g, 'е').replace(/[\s_-]+/g, ' ').trim();
@@ -396,6 +397,79 @@ function productGroupLabel(key) {
   const found = PRODUCT_GROUPS.find(p => p.key === key);
   return found ? found.label : 'Інші / без товару';
 }
+function orderProductKey(order) {
+  return productGroupKey(order?.product || PRODUCT_NAME);
+}
+function readCrmProducts() {
+  const stored = read(F.crmProducts);
+  const items = Array.isArray(stored) ? stored : [];
+  return PRODUCT_GROUPS.map(group => {
+    const item = items.find(x => x?.key === group.key) || {};
+    const cost = asMoneyNumber(item.cost);
+    return {
+      key: group.key,
+      label: group.label,
+      aliases: group.aliases,
+      cost: cost > 0 ? cost : group.defaultCost,
+      defaultCost: group.defaultCost,
+      updatedAt: item.updatedAt || null,
+    };
+  });
+}
+function crmProduct(key) {
+  return readCrmProducts().find(item => item.key === key) || null;
+}
+function orderProduct(order) {
+  return crmProduct(orderProductKey(order)) || {
+    key: orderProductKey(order),
+    label: productGroupLabel(orderProductKey(order)),
+    cost: 0,
+    defaultCost: 0,
+  };
+}
+function orderBaseRevenue(order) {
+  return asMoneyNumber(order?.price);
+}
+function orderBaseCost(order) {
+  const snapshot = asMoneyNumber(order?.cost || order?.costPrice || order?.purchasePrice);
+  return snapshot > 0 ? snapshot : asMoneyNumber(orderProduct(order).cost);
+}
+function orderPaidRevenue(order) {
+  const basePaid = order?.baseIncomePosted || order?.basePaidAt || orderPaymentStatus(order) === 'paid' || order?.status === 'paid' || order?.status === 'completed';
+  const upsell = orderUpsell(order);
+  const upsellPaid = upsell && (upsell.incomePosted || upsell.paidAt || upsell.paymentStatus === 'paid');
+  return (basePaid ? orderBaseRevenue(order) : 0) + (upsellPaid ? asMoneyNumber(upsell.price) : 0);
+}
+function orderPaidCost(order) {
+  const basePaid = order?.baseIncomePosted || order?.basePaidAt || orderPaymentStatus(order) === 'paid' || order?.status === 'paid' || order?.status === 'completed';
+  const upsell = orderUpsell(order);
+  const upsellPaid = upsell && (upsell.incomePosted || upsell.paidAt || upsell.paymentStatus === 'paid');
+  return (basePaid ? orderBaseCost(order) : 0) + (upsellPaid ? asMoneyNumber(upsell.cost) : 0);
+}
+function isPaidOrder(order) {
+  return orderPaymentStatus(order) === 'paid' || order?.status === 'paid' || order?.status === 'completed';
+}
+function isReturnedOrder(order) {
+  return orderPaymentStatus(order) === 'returned' || order?.status === 'returned';
+}
+function isForecastPipelineOrder(order) {
+  if (isPaidOrder(order) || isReturnedOrder(order) || order?.status === 'cancelled') return false;
+  if (orderBaseRevenue(order) <= 0) return false;
+  return orderStatusForDisplay(order) === 'confirmed' || isOrderActuallyShipped(order);
+}
+function saveCrmProductCost(key, cost) {
+  const current = readCrmProducts();
+  const idx = current.findIndex(item => item.key === key);
+  if (idx < 0) return null;
+  current[idx] = { ...current[idx], cost, updatedAt: new Date().toISOString() };
+  write(F.crmProducts, current.map(({ key: itemKey, label, cost: itemCost, updatedAt }) => ({
+    key: itemKey,
+    label,
+    cost: itemCost,
+    updatedAt,
+  })));
+  return current[idx];
+}
 function buildProductBreakdown(orders) {
   const map = new Map([...PRODUCT_GROUPS.map(p => p.key), 'other'].map(key => [key, {
     key,
@@ -409,32 +483,96 @@ function buildProductBreakdown(orders) {
     withoutTtn: 0,
     unpaid: 0,
     expectedIncome: 0,
+    revenue: 0,
+    cost: 0,
+    net: 0,
+    pipelineNet: 0,
   }]));
   orders.forEach(o => {
-    const item = map.get(productGroupKey(o.product)) || map.get('other');
+    const item = map.get(orderProductKey(o)) || map.get('other');
     item.orders += 1;
     if (o.status === 'new') item.newOrders += 1;
     if (['confirmed', 'shipped', 'paid', 'completed'].includes(o.status)) item.confirmedOrders += 1;
     if (isOrderActuallyShipped(o)) item.shippedOrders += 1;
-    if (orderPaymentStatus(o) === 'paid' || o.status === 'paid' || o.status === 'completed') item.paidOrders += 1;
-    if (orderPaymentStatus(o) === 'returned' || o.status === 'returned') item.returns += 1;
+    if (isPaidOrder(o)) item.paidOrders += 1;
+    if (isReturnedOrder(o)) item.returns += 1;
     if (!o.ttn) item.withoutTtn += 1;
     if (orderPaymentStatus(o) !== 'paid') item.unpaid += 1;
     item.expectedIncome += orderPaidNet(o);
+    item.revenue += orderPaidRevenue(o);
+    item.cost += orderPaidCost(o);
+    item.net += orderPaidNet(o);
+    if (isForecastPipelineOrder(o)) item.pipelineNet += orderBaseRevenue(o) - orderBaseCost(o);
   });
   return [...map.values()].filter(x => x.orders > 0);
 }
+function buildBuyoutStats(orders, fallbackOrders = orders) {
+  const paidOrders = orders.filter(isPaidOrder);
+  const returns = orders.filter(isReturnedOrder);
+  const fallbackPaid = fallbackOrders.filter(isPaidOrder).length;
+  const fallbackReturns = fallbackOrders.filter(isReturnedOrder).length;
+  const finalCount = paidOrders.length + returns.length;
+  const fallbackFinalCount = fallbackPaid + fallbackReturns;
+  const buyoutRate = finalCount
+    ? paidOrders.length / finalCount
+    : fallbackFinalCount
+      ? fallbackPaid / fallbackFinalCount
+      : 0.5;
+  return {
+    buyoutRate,
+    returnRate: finalCount ? returns.length / finalCount : 1 - buyoutRate,
+    rateSource: finalCount ? 'period' : fallbackFinalCount ? 'all' : 'default',
+  };
+}
+function buildRecentPayments(paidOrders) {
+  return [...paidOrders]
+    .sort((a, b) => new Date(b.paidAt || b.basePaidAt || b.updatedAt || b.createdAt || 0) - new Date(a.paidAt || a.basePaidAt || a.updatedAt || a.createdAt || 0))
+    .slice(0, 5)
+    .map(order => {
+      const product = orderProduct(order);
+      const revenue = orderPaidRevenue(order);
+      const cost = orderPaidCost(order);
+      return {
+        id: order.id,
+        productKey: product.key,
+        product: product.label,
+        revenue,
+        cost,
+        net: revenue - cost - orderExpensesTotal(order),
+        paidAt: order.paidAt || order.basePaidAt || order.updatedAt || order.createdAt || null,
+      };
+    });
+}
 function buildCrmSummary(period = 'today') {
   const orders = read(F.orders).filter(o => inPeriod(o.createdAt, period));
+  const allOrders = read(F.orders);
   const finance = read(F.finance).filter(x => inPeriod(x.createdAt, period));
   const income = finance.filter(x => x.type === 'income').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
+  const manualIncome = finance.filter(x => x.type === 'income' && x.category !== 'net_order').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
   const expense = finance.filter(x => x.type === 'expense').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
   const adsExpense = finance.filter(x => x.type === 'expense' && x.category === 'ads').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
-  const paidOrders = orders.filter(o => orderPaymentStatus(o) === 'paid' || o.status === 'paid' || o.status === 'completed');
-  const returns = orders.filter(o => orderPaymentStatus(o) === 'returned' || o.status === 'returned');
+  const paidOrders = orders.filter(isPaidOrder);
+  const returns = orders.filter(isReturnedOrder);
+  const pipelineOrders = orders.filter(isForecastPipelineOrder);
   const confirmedOrders = orders.filter(o => orderStatusForDisplay(o) === 'confirmed' || isOrderActuallyShipped(o) || o.status === 'paid' || o.status === 'completed');
-  const expectedIncome = orders.reduce((s, o) => s + orderPaidNet(o), 0);
+  const revenue = paidOrders.reduce((s, o) => s + orderPaidRevenue(o), 0);
+  const cost = paidOrders.reduce((s, o) => s + orderPaidCost(o), 0);
+  const netOrders = paidOrders.reduce((s, o) => s + orderPaidNet(o), 0);
+  const buyout = buildBuyoutStats(orders, allOrders);
+  const pendingRevenue = pipelineOrders.reduce((s, o) => s + orderBaseRevenue(o), 0);
+  const pendingCost = pipelineOrders.reduce((s, o) => s + orderBaseCost(o), 0);
+  const expectedIncome = netOrders + (pendingRevenue - pendingCost) * buyout.buyoutRate;
   const returnsExpense = finance.filter(x => x.type === 'expense' && x.category === 'return').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
+  const products = buildProductBreakdown(orders).map(product => {
+    const finalCount = product.paidOrders + product.returns;
+    const productBuyoutRate = finalCount ? product.paidOrders / finalCount : buyout.buyoutRate;
+    return {
+      ...product,
+      buyoutRate: productBuyoutRate,
+      returnRate: finalCount ? product.returns / finalCount : buyout.returnRate,
+      forecastNet: product.net + product.pipelineNet * productBuyoutRate,
+    };
+  });
   return {
     period,
     orders: orders.length,
@@ -446,18 +584,30 @@ function buildCrmSummary(period = 'today') {
     withoutTtn: orders.filter(o => !o.ttn).length,
     unpaid: orders.filter(o => orderPaymentStatus(o) !== 'paid').length,
     income,
+    manualIncome,
+    revenue,
+    cost,
+    netOrders,
     expense,
     adsExpense,
-    profit: income - expense,
+    profit: netOrders + manualIncome - expense,
     expectedIncome,
+    forecastRevenue: revenue + pendingRevenue * buyout.buyoutRate,
+    forecastCost: cost + pendingCost * buyout.buyoutRate,
+    forecastProfit: expectedIncome + manualIncome - expense,
+    buyoutRate: buyout.buyoutRate,
+    buyoutRateSource: buyout.rateSource,
+    returnRate: buyout.returnRate,
+    pipelineOrders: pipelineOrders.length,
     returnsExpense,
-    difference: income - expectedIncome,
-    avgCheck: paidOrders.length ? expectedIncome / paidOrders.length : 0,
+    difference: netOrders - expectedIncome,
+    avgCheck: paidOrders.length ? revenue / paidOrders.length : 0,
     avgProfit: paidOrders.length ? paidOrders.reduce((s, o) => s + orderProfit(o), 0) / paidOrders.length : 0,
     leadCost: orders.length ? adsExpense / orders.length : 0,
     confirmedOrderCost: confirmedOrders.length ? adsExpense / confirmedOrders.length : 0,
     paidOrderCost: paidOrders.length ? adsExpense / paidOrders.length : 0,
-    products: buildProductBreakdown(orders),
+    products,
+    recentPayments: buildRecentPayments(paidOrders),
   };
 }
 
@@ -478,11 +628,53 @@ function addFinanceEntryOnce(entry) {
     source: sanitizeStr(entry.source || 'system', 60),
     orderId: entry.orderId ? Number(entry.orderId) : null,
     externalId,
+    grossAmount: asMoneyNumber(entry.grossAmount),
+    costAmount: asMoneyNumber(entry.costAmount),
+    productKey: sanitizeStr(entry.productKey || '', 60) || null,
+    productLabel: sanitizeStr(entry.productLabel || '', 100) || null,
     createdAt: entry.createdAt || new Date().toISOString(),
   };
   finance.push(item);
   write(F.finance, finance);
   return item;
+}
+function ensurePaidOrderFinance(order, options = {}) {
+  if (!isPaidOrder(order)) return order;
+  const now = options.at || new Date().toISOString();
+  const product = orderProduct(order);
+  const grossAmount = orderBaseRevenue(order);
+  const costAmount = orderBaseCost(order);
+  const updated = {
+    ...order,
+    cost: asMoneyNumber(order?.cost || order?.costPrice || order?.purchasePrice) || costAmount,
+    costProductKey: order.costProductKey || product.key,
+    costProductLabel: order.costProductLabel || product.label,
+    costSnapshotAt: order.costSnapshotAt || now,
+    paidAt: order.paidAt || now,
+    basePaidAt: order.basePaidAt || now,
+  };
+
+  if (!updated.baseIncomePosted) {
+    if (grossAmount > 0) {
+      addFinanceEntryOnce({
+        type: 'income',
+        title: `${options.title || 'Order payment'} #${order.id}`,
+        amount: grossAmount - costAmount,
+        grossAmount,
+        costAmount,
+        productKey: product.key,
+        productLabel: product.label,
+        category: 'net_order',
+        source: options.source || 'order-status',
+        orderId: order.id,
+        externalId: financeExternalId(options.source || 'order-status', 'payment', order.id, options.extra || 'base'),
+        createdAt: now,
+      });
+      updated.baseIncomePosted = true;
+    }
+  }
+
+  return updated;
 }
 function npDetailsText(details = {}) {
   return [
@@ -562,9 +754,6 @@ function ttnAlreadyUsed(orders, ttn, exceptOrderId = null) {
   const value = String(ttn || '').trim();
   return !!value && orders.some(o => String(o.ttn || '').trim() === value && Number(o.id) !== Number(exceptOrderId));
 }
-function novaIncomeAmount(order) {
-  return Math.max(0, asMoneyNumber(order?.price) - asMoneyNumber(order?.cost || order?.costPrice || order?.purchasePrice));
-}
 function applyNovaTrackingToOrder(order, track) {
   const now = new Date().toISOString();
   const patch = {
@@ -593,22 +782,6 @@ function applyNovaTrackingToOrder(order, track) {
     patch.paymentStatus = 'paid';
     patch.status = ['completed', 'paid'].includes(order.status) ? order.status : 'paid';
     patch.paidAt = order.paidAt || now;
-    if (!order.baseIncomePosted) {
-      const amount = novaIncomeAmount(order);
-      if (amount > 0) {
-        addFinanceEntryOnce({
-          type: 'income',
-          title: `Nova Poshta payment #${order.id}`,
-          amount,
-          category: 'net_order',
-          source: 'nova-poshta',
-          orderId: order.id,
-          externalId: financeExternalId('nova-poshta', 'payment', order.id, track.number || order.ttn),
-        });
-      }
-      patch.baseIncomePosted = true;
-      patch.basePaidAt = now;
-    }
   }
 
   if (track.documentCost > 0) {
@@ -630,7 +803,15 @@ function applyNovaTrackingToOrder(order, track) {
     patch.returnedAt = order.returnedAt || now;
   }
 
-  return { ...order, ...patch, updatedAt: now };
+  const updated = { ...order, ...patch, updatedAt: now };
+  return track.normalizedStatus === 'delivered'
+    ? ensurePaidOrderFinance(updated, {
+      source: 'nova-poshta',
+      title: 'Nova Poshta payment',
+      extra: track.number || order.ttn,
+      at: now,
+    })
+    : updated;
 }
 function applyNovaReturnOrderToOrder(order, returnOrder) {
   if (!returnOrder) return order;
@@ -1347,7 +1528,7 @@ app.patch('/api/admin/orders/:id', authBot, (req, res) => {
   const id = Number(req.params.id); const arr = read(F.orders);
   const idx = arr.findIndex(x => x.id === id);
   if (idx < 0) return res.status(404).json({ error: 'Not found' });
-  arr[idx] = { ...arr[idx], ...req.body, id: arr[idx].id, updatedAt: new Date().toISOString() };
+  arr[idx] = ensurePaidOrderFinance({ ...arr[idx], ...req.body, id: arr[idx].id, updatedAt: new Date().toISOString() });
   write(F.orders, arr);
   if (Object.prototype.hasOwnProperty.call(req.body || {}, 'status')) updateOrderQueueNotice(arr[idx]).catch(e => console.error('[order notice]', e.message));
   res.json(arr[idx]);
@@ -1442,6 +1623,16 @@ app.get('/api/admin/finance/summary', authBot, (req, res) => {
 });
 app.get('/api/admin/crm/summary', authBot, (req, res) => {
   res.json(buildCrmSummary(sanitizeStr(req.query.period || 'today', 20)));
+});
+app.get('/api/admin/crm/products', authBot, (_req, res) => {
+  res.json({ products: readCrmProducts() });
+});
+app.patch('/api/admin/crm/products/:key/cost', authBot, (req, res) => {
+  const amount = asMoneyNumber(req.body?.cost);
+  if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: 'Invalid cost' });
+  const product = saveCrmProductCost(sanitizeStr(req.params.key, 60), amount);
+  if (!product) return res.status(404).json({ error: 'Product model not found' });
+  res.json(product);
 });
 app.get('/api/admin/crm/problems', authBot, (_req, res) => {
   const orders = read(F.orders).map(o => {
@@ -1652,10 +1843,11 @@ app.get('/api/admin/backup', authBot, (_req, res) => {
     support: read(F.support),
     analytics: read(F.analytics),
     finance: read(F.finance),
+    crmProducts: readCrmProducts(),
   });
 });
 app.post('/api/admin/backup/restore', authBot, (req, res) => {
-  const { orders, reviews, support, analytics, finance } = req.body || {};
+  const { orders, reviews, support, analytics, finance, crmProducts } = req.body || {};
   const restored = {};
   if (Array.isArray(orders)) {
     write(F.orders, orders);
@@ -1676,6 +1868,10 @@ app.post('/api/admin/backup/restore', authBot, (req, res) => {
   if (Array.isArray(finance)) {
     write(F.finance, finance);
     restored.finance = finance.length;
+  }
+  if (Array.isArray(crmProducts)) {
+    write(F.crmProducts, crmProducts);
+    restored.crmProducts = crmProducts.length;
   }
   res.json({ success: true, restored });
 });

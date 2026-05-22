@@ -36,6 +36,7 @@ const managerDialogs = {};
 const pendingSearch  = {};
 const pendingDelivery = {};
 const pendingTtn     = {};
+const pendingProductCost = {};
 const pendingCb      = new Set();
 
 /* ── HTTP helpers ─────────────────────────────────────────── */
@@ -70,7 +71,8 @@ const MAIN_KB = {
   keyboard: [
     ['📦 Замовлення', '🚚 Відстеження'],
     ['💬 Відгуки',    '🎧 Підтримка'],
-    ['📊 Статистика', '📈 Аналітика'],
+    ['💼 CRM',        '📊 Статистика'],
+    ['📈 Аналітика'],
     ['🔍 Пошук'],
     ['❓ Допомога'],
   ],
@@ -204,6 +206,13 @@ function fmtDuration(seconds) {
 function pct(num, total) {
   if (!total) return '0%';
   return Math.round((num / total) * 100) + '%';
+}
+function ratePct(value) {
+  return Math.round(Number(value || 0) * 100) + '%';
+}
+function money(value) {
+  const amount = Number(value || 0);
+  return `${Math.round(amount).toLocaleString('uk-UA')} грн`;
 }
 
 /**
@@ -642,6 +651,93 @@ async function showStats(chatId, msgId = null) {
 }
 
 /* ═══════════════════════════════════════════════════════════
+   CRM MONEY DASHBOARD
+═══════════════════════════════════════════════════════════ */
+const CRM_PERIOD_LABELS = {
+  today: 'Сьогодні',
+  week: '7 днів',
+  month: 'Цей місяць',
+  all: 'Увесь час',
+};
+
+function crmMenuKb(period = 'today') {
+  return {
+    inline_keyboard: [
+      [
+        { text: `${period === 'today' ? '• ' : ''}📅 Сьогодні`, callback_data: 'crm_period_today' },
+        { text: `${period === 'week' ? '• ' : ''}📆 7 днів`, callback_data: 'crm_period_week' },
+      ],
+      [
+        { text: `${period === 'month' ? '• ' : ''}🗓 Місяць`, callback_data: 'crm_period_month' },
+        { text: `${period === 'all' ? '• ' : ''}∞ Увесь час`, callback_data: 'crm_period_all' },
+      ],
+      [
+        { text: '🏷 Собівартість моделей', callback_data: 'crm_products' },
+        { text: '🔄 Оновити', callback_data: `crm_period_${period}` },
+      ],
+    ],
+  };
+}
+
+function crmProductsKb(products = []) {
+  return {
+    inline_keyboard: [
+      ...products.map(product => [{
+        text: `✏️ ${product.label}: ${money(product.cost)}`,
+        callback_data: `crm_cost_${product.key}`,
+      }]),
+      [{ text: '← CRM', callback_data: 'crm_period_today' }],
+    ],
+  };
+}
+
+async function showCrmReport(chatId, period = 'today', msgId = null) {
+  const data = await serverGet(`/api/admin/crm/summary?period=${encodeURIComponent(period)}`);
+  if (!data || data.error) {
+    return reply(chatId, '❌ CRM-звіт зараз недоступний.', crmMenuKb(period), msgId);
+  }
+
+  const payments = Array.isArray(data.recentPayments) ? data.recentPayments : [];
+  const products = Array.isArray(data.products) ? data.products : [];
+  const paymentLines = payments.length
+    ? payments.map(item => `#${esc(item.id)} ${esc(item.product)}: <b>+${money(item.revenue)}</b> −${money(item.cost)} = <b>${money(item.net)}</b>`).join('\n')
+    : 'Ще немає викуплених замовлень за період.';
+  const productLines = products.length
+    ? products.map(item => `${esc(item.label)}: викуп ${item.paidOrders}/${item.orders}, факт <b>${money(item.net)}</b>, прогноз <b>${money(item.forecastNet)}</b>, повернення ${ratePct(item.returnRate)}`).join('\n')
+    : 'Замовлень за період ще немає.';
+
+  const text =
+    `💼 <b>CRM Violet Motion — ${CRM_PERIOD_LABELS[period] || period}</b>\n━━━━━━━━━━━━━━━\n` +
+    `📦 Замовлення: <b>${data.orders || 0}</b>  ✅ ${data.paidOrders || 0} викуп  ↩️ ${data.returns || 0} поверн.\n` +
+    `🚚 У прогнозі: <b>${data.pipelineOrders || 0}</b> підтверджених/у дорозі\n\n` +
+    `<b>Факт</b>\n` +
+    `💰 Додано з викупів: <b>+${money(data.revenue)}</b>\n` +
+    `🏷 Собівартість: <b>−${money(data.cost)}</b>\n` +
+    `🧾 Інші витрати: <b>−${money(data.expense)}</b>\n` +
+    `✅ Прибуток факт: <b>${money(data.profit)}</b>\n\n` +
+    `<b>Прогноз</b>\n` +
+    `📈 Очікуваний прибуток: <b>${money(data.forecastProfit)}</b>\n` +
+    `📦 Прогноз грошей: <b>${money(data.forecastRevenue)}</b>\n` +
+    `🎯 Викуп: <b>${ratePct(data.buyoutRate)}</b>  ↩️ Повернення: <b>${ratePct(data.returnRate)}</b>\n\n` +
+    `<b>Останні зарахування</b>\n${paymentLines}\n\n` +
+    `<b>Моделі</b>\n${productLines}`;
+
+  reply(chatId, text, crmMenuKb(period), msgId);
+}
+
+async function showCrmProducts(chatId, msgId = null) {
+  const data = await serverGet('/api/admin/crm/products');
+  const products = Array.isArray(data?.products) ? data.products : [];
+  if (!products.length) return reply(chatId, '❌ Не вдалося завантажити моделі CRM.', crmMenuKb(), msgId);
+
+  const text =
+    `🏷 <b>Собівартість моделей</b>\n━━━━━━━━━━━━━━━\n` +
+    products.map(product => `${esc(product.label)}: <b>${money(product.cost)}</b>`).join('\n') +
+    `\n\nНатисніть модель і надішліть нову собівартість числом.`;
+  reply(chatId, text, crmProductsKb(products), msgId);
+}
+
+/* ═══════════════════════════════════════════════════════════
    ANALYTICS DASHBOARD
    Full UI with sub-menu inside Telegram bot
 ═══════════════════════════════════════════════════════════ */
@@ -843,6 +939,7 @@ bot.onText(/\/orders/,  msg => { if (!isAdmin(msg.from.id)) return; showOrders(m
 bot.onText(/\/track(?:ing)?/, msg => { if (!isAdmin(msg.from.id)) return; showTrackingMenu(msg.chat.id); });
 bot.onText(/\/reviews/, msg => { if (!isAdmin(msg.from.id)) return; showReviews(msg.chat.id); });
 bot.onText(/\/support/, msg => { if (!isAdmin(msg.from.id)) return; showSupport(msg.chat.id); });
+bot.onText(/\/crm/,     msg => { if (!isAdmin(msg.from.id)) return; showCrmReport(msg.chat.id); });
 bot.onText(/\/stats/,   msg => { if (!isAdmin(msg.from.id)) return; showStats(msg.chat.id); });
 
 /* ═══════════════════════════════════════════════════════════
@@ -880,6 +977,32 @@ bot.on('message', async msg => {
 
   if (pendingDelivery[chatId]) {
     await saveManagerDeliveryInput(chatId, text);
+    return;
+  }
+
+  if (pendingProductCost[chatId]) {
+    const product = pendingProductCost[chatId];
+    if (text === '-' || text.toLowerCase() === 'cancel') {
+      delete pendingProductCost[chatId];
+      await showCrmProducts(chatId);
+      return;
+    }
+
+    const cost = Number(text.replace(',', '.').replace(/[^\d.]/g, ''));
+    if (!Number.isFinite(cost) || cost <= 0) {
+      await bot.sendMessage(chatId, '❌ Надішліть собівартість числом, наприклад 420. Для скасування надішліть "-".', { reply_markup: MAIN_KB });
+      return;
+    }
+
+    const updated = await serverPatch(`/api/admin/crm/products/${encodeURIComponent(product.key)}/cost`, { cost });
+    if (!updated || updated.error) {
+      await bot.sendMessage(chatId, '❌ Не вдалося оновити собівартість моделі.', { reply_markup: MAIN_KB });
+      return;
+    }
+
+    delete pendingProductCost[chatId];
+    await bot.sendMessage(chatId, `✅ ${updated.label}: нова собівартість <b>${money(updated.cost)}</b>.`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
+    await showCrmProducts(chatId);
     return;
   }
 
@@ -921,6 +1044,7 @@ bot.on('message', async msg => {
     case '🚚 Відстеження': showTrackingMenu(chatId); break;
     case '💬 Відгуки':     showReviews(chatId);      break;
     case '🎧 Підтримка':   showSupport(chatId);      break;
+    case '💼 CRM':         showCrmReport(chatId);    break;
     case '📊 Статистика':  showStats(chatId);         break;
     case '📈 Аналітика':   showAnalyticsMenu(chatId); break;
 
@@ -933,7 +1057,8 @@ bot.on('message', async msg => {
 
     case '❓ Допомога':
       await bot.sendMessage(chatId,
-        `<b>Команди:</b>\n/orders — замовлення\n/reviews — відгуки\n/support — підтримка\n/stats — статистика\n/analytics — аналітика\n/search Ім'я — пошук\n\n` +
+        `<b>Команди:</b>\n/orders — замовлення\n/crm — CRM та гроші\n/reviews — відгуки\n/support — підтримка\n/stats — статистика\n/analytics — аналітика\n/search Ім'я — пошук\n\n` +
+        `💼 <b>CRM:</b> факт/прогноз прибутку, повернення, заробіток за сьогодні та редагування собівартості моделей.\n\n` +
         `📈 <b>Аналітика:</b> кнопка в меню або /analytics\nПоказує: сесії, скрол, кліки, воронку, останні дії.\n\n` +
         `💬 <b>Підтримка:</b> коли приймаєте діалог — всі ваші повідомлення йдуть клієнту у реальному часі. Для завершення — 🔚 Завершити діалог`,
         { parse_mode: 'HTML', reply_markup: MAIN_KB }
@@ -967,6 +1092,36 @@ bot.on('callback_query', async q => {
   try {
     if (data === 'main') {
       await reply(chatId, '🟣 <b>Violet Motion — Адмін панель</b>\n\nОберіть розділ кнопками нижче:', MAIN_KB, msgId);
+      return;
+    }
+
+    /* ─ CRM callbacks ───────────────────────────────────── */
+    if (data === 'crm_menu') { await showCrmReport(chatId, 'today', msgId); return; }
+
+    if (data.startsWith('crm_period_')) {
+      const period = data.slice('crm_period_'.length);
+      await showCrmReport(chatId, ['today', 'week', 'month', 'all'].includes(period) ? period : 'today', msgId);
+      return;
+    }
+
+    if (data === 'crm_products') {
+      await showCrmProducts(chatId, msgId);
+      return;
+    }
+
+    if (data.startsWith('crm_cost_')) {
+      const key = data.slice('crm_cost_'.length);
+      const catalog = await serverGet('/api/admin/crm/products');
+      const product = Array.isArray(catalog?.products) ? catalog.products.find(item => item.key === key) : null;
+      if (!product) {
+        await bot.sendMessage(chatId, '❌ Модель не знайдено.', { reply_markup: MAIN_KB });
+        return;
+      }
+      pendingProductCost[chatId] = { key: product.key, label: product.label };
+      await bot.sendMessage(chatId, `✏️ Нова собівартість для <b>${esc(product.label)}</b>.\nЗараз: <b>${money(product.cost)}</b>\n\nНадішліть число або "-" для скасування.`, {
+        parse_mode: 'HTML',
+        reply_markup: MAIN_KB,
+      });
       return;
     }
 
