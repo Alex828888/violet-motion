@@ -7,7 +7,7 @@ const NP_MIN_INTERVAL_MS = Math.max(0, Number(process.env.NP_MIN_INTERVAL_MS || 
 const NP_MAX_RETRIES = Math.max(0, Number(process.env.NP_MAX_RETRIES || 3));
 const NP_RETRY_BASE_MS = Math.max(250, Number(process.env.NP_RETRY_BASE_MS || 1200));
 const NP_CACHE_TTL_MS = Math.max(0, Number(process.env.NP_CACHE_TTL_MS || 6 * 60 * 60 * 1000));
-const NP_DEFAULT_PACK_REF = '80049ea8-2ab0-11e3-b441-0050568002cf'; // Nova Poshta: Коробка (1 кг) стандартна
+const NP_DEFAULT_PACK_REF = 'ab0cd73c-da19-11e1-aa18-d4ae527baec9'; // Nova Poshta: Коробка (2 кг)
 
 let novaQueue = Promise.resolve();
 let lastNovaCallAt = 0;
