@@ -91,6 +91,7 @@ function stars(n)     { return '★'.repeat(n) + '☆'.repeat(5 - n); }
 function statusEmoji(s) {
   return {
     new: '🆕',
+    no_answer: '📞',
     confirmed: '✅',
     cancelled: '❌',
     shipped: '📦',
@@ -214,6 +215,15 @@ function money(value) {
   const amount = Number(value || 0);
   return `${Math.round(amount).toLocaleString('uk-UA')} грн`;
 }
+function waitTime(value) {
+  const ms = Number(value || 0);
+  if (!ms || ms < 0) return '—';
+  const minutes = Math.round(ms / 60000);
+  if (minutes < 60) return `${minutes} хв`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours} год`;
+  return `${Math.round(hours / 24)} дн`;
+}
 
 /**
  * Unicode bar chart
@@ -249,33 +259,138 @@ async function ack(id, text = '') {
 /* ═══════════════════════════════════════════════════════════
    ORDERS
 ═══════════════════════════════════════════════════════════ */
-function ordersKeyboard(items, page, total, filter) {
-  const rows = items.map(o => [{ text: `${statusEmoji(o.status)} #${o.id} ${o.name || '—'}${o.product ? ' · ' + o.product : ''} (р.${o.size || '—'})`, callback_data: `od_${o.id}` }]);
+const ORDER_LIST_MODELS = {
+  all: 'Усі моделі',
+  violet: 'Violet Motion',
+  black: 'Black Breeze',
+};
+const ORDER_LIST_STATUSES = {
+  active: 'Замовлення',
+  confirmed: 'Підтверджені',
+  pending: 'Не підтверджені',
+  cancelled: 'Відхилені',
+  paid: 'Оплачені',
+  returned: 'Повернення',
+  all: 'Усі',
+};
+
+function normalizeOrderModel(value) {
+  return Object.prototype.hasOwnProperty.call(ORDER_LIST_MODELS, value) ? value : 'all';
+}
+
+function normalizeOrderStatus(value, fallback = 'active') {
+  return Object.prototype.hasOwnProperty.call(ORDER_LIST_STATUSES, value) ? value : fallback;
+}
+
+function orderListState(state = {}, fallbackStatus = 'active') {
+  return {
+    model: normalizeOrderModel(state.model),
+    status: normalizeOrderStatus(state.status, fallbackStatus),
+  };
+}
+
+function orderModelKey(o) {
+  const product = String(o?.product || '').toLowerCase();
+  if (product.includes('black') || product.includes('breeze') || product.includes('sandal')) return 'black';
+  return 'violet';
+}
+
+function orderStatusMatches(o, status) {
+  const raw = o?.status || 'new';
+  const payment = paymentLabel(o);
+  if (status === 'all') return true;
+  if (status === 'active') return !['cancelled', 'paid', 'completed', 'returned'].includes(raw) && !['paid', 'returned'].includes(payment);
+  if (status === 'confirmed') return raw === 'confirmed';
+  if (status === 'pending') return ['new', 'no_answer'].includes(raw);
+  if (status === 'cancelled') return raw === 'cancelled';
+  if (status === 'paid') return payment === 'paid' || ['paid', 'completed'].includes(raw);
+  if (status === 'returned') return payment === 'returned' || raw === 'returned';
+  return true;
+}
+
+function orderNeedsDeliveryData(o) {
+  return !o?.ttn && !(o?.fullName && o?.city && o?.postOffice && o?.size);
+}
+
+function confirmedOrderUrgency(o) {
+  const baseTime = new Date(o?.managerConfirmedAt || o?.zvonokConfirmedAt || o?.updatedAt || o?.createdAt || 0).getTime() || 0;
+  const rank = orderNeedsDeliveryData(o) ? 3 : !o?.ttn ? 2 : deliveryStatusValue(o) === 'ttn_created' ? 1 : 0;
+  return { rank, baseTime };
+}
+
+function sortOrdersForList(orders, status) {
+  return [...orders].sort((first, second) => {
+    if (status === 'confirmed') {
+      const a = confirmedOrderUrgency(first);
+      const b = confirmedOrderUrgency(second);
+      if (b.rank !== a.rank) return b.rank - a.rank;
+      if (a.baseTime !== b.baseTime) return a.baseTime - b.baseTime;
+    }
+    return new Date(second.createdAt || 0) - new Date(first.createdAt || 0);
+  });
+}
+
+function orderFilterCallback(page, state) {
+  return `of_${page}_${state.model}_${state.status}`;
+}
+
+function orderFilterButton(text, active, callbackData) {
+  return { text: `${active ? '• ' : ''}${text}`, callback_data: callbackData };
+}
+
+function ordersKeyboard(items, page, total, filter, state = orderListState()) {
+  const rows = [
+    [
+      orderFilterButton('Усі моделі', state.model === 'all', orderFilterCallback(1, { ...state, model: 'all' })),
+      orderFilterButton('Violet Motion', state.model === 'violet', orderFilterCallback(1, { ...state, model: 'violet' })),
+      orderFilterButton('Black Breeze', state.model === 'black', orderFilterCallback(1, { ...state, model: 'black' })),
+    ],
+    [
+      orderFilterButton('Замовлення', state.status === 'active', orderFilterCallback(1, { ...state, status: 'active' })),
+      orderFilterButton('Підтверджені', state.status === 'confirmed', orderFilterCallback(1, { ...state, status: 'confirmed' })),
+    ],
+    [
+      orderFilterButton('Не підтверджені', state.status === 'pending', orderFilterCallback(1, { ...state, status: 'pending' })),
+      orderFilterButton('Відхилені', state.status === 'cancelled', orderFilterCallback(1, { ...state, status: 'cancelled' })),
+    ],
+    [
+      orderFilterButton('Оплачені', state.status === 'paid', orderFilterCallback(1, { ...state, status: 'paid' })),
+      orderFilterButton('Повернення', state.status === 'returned', orderFilterCallback(1, { ...state, status: 'returned' })),
+    ],
+    ...items.map(o => [{ text: `${statusEmoji(o.status)} #${o.id} ${o.name || '—'}${o.product ? ' · ' + o.product : ''} (р.${o.size || '—'})`, callback_data: `od_${o.id}` }]),
+  ];
   const nav = [];
-  if (page > 1)     nav.push({ text: '← Назад', callback_data: `op_${page - 1}${filter ? '_f_' + filter : ''}` });
+  if (page > 1)     nav.push({ text: '← Назад', callback_data: filter ? `op_${page - 1}_f_${filter}` : orderFilterCallback(page - 1, state) });
   nav.push({ text: `${page}/${total}`, callback_data: 'noop' });
-  if (page < total) nav.push({ text: 'Далі →', callback_data: `op_${page + 1}${filter ? '_f_' + filter : ''}` });
+  if (page < total) nav.push({ text: 'Далі →', callback_data: filter ? `op_${page + 1}_f_${filter}` : orderFilterCallback(page + 1, state) });
   if (nav.length) rows.push(nav);
   return { inline_keyboard: rows };
 }
 
-async function showOrders(chatId, page = 1, filter = null, msgId = null) {
+async function showOrders(chatId, page = 1, filter = null, msgId = null, state = {}) {
   let orders = await serverGet('/api/admin/orders');
   if (!Array.isArray(orders)) return reply(chatId, '❌ Не вдалося завантажити замовлення.', MAIN_KB, msgId);
-  orders = orders.reverse();
   const q = filter ? String(filter).trim().toLowerCase() : '';
+  const listState = orderListState(state, q ? 'all' : 'active');
   if (q) {
     orders = orders.filter(o => [
       o.name, o.fullName, o.phone, o.size, o.id, o.ttn, o.status, o.paymentStatus,
       o.product, o.color, o.city, o.postOffice, o.npStatus,
     ].some(v => String(v || '').toLowerCase().includes(q)));
   }
-  if (!orders.length) return reply(chatId, q ? `🔍 Нічого по "<b>${esc(q)}</b>"` : '📦 Замовлень поки немає.', MAIN_KB, msgId);
+  if (listState.model !== 'all') orders = orders.filter(o => orderModelKey(o) === listState.model);
+  orders = sortOrdersForList(orders.filter(o => orderStatusMatches(o, listState.status)), listState.status);
+  if (!orders.length) {
+    const emptyText = q
+      ? `🔍 Нічого по "<b>${esc(q)}</b>"`
+      : `📦 У фільтрі <b>${esc(ORDER_LIST_STATUSES[listState.status])}</b> · <b>${esc(ORDER_LIST_MODELS[listState.model])}</b> замовлень немає.`;
+    return reply(chatId, emptyText, ordersKeyboard([], 1, 1, q, listState), msgId);
+  }
 
   const { items, page: p, total } = paginate(orders, page);
   let text = q
     ? `🔍 Пошук "<b>${esc(q)}</b>" — знайдено ${orders.length}:\n\n`
-    : `📦 <b>Замовлення</b> (${orders.length}):\n\n`;
+    : `📦 <b>${esc(ORDER_LIST_STATUSES[listState.status])}</b> · ${esc(ORDER_LIST_MODELS[listState.model])} (${orders.length}):\n\n`;
 
   items.forEach(o => {
     text += `${statusEmoji(o.status)} <b>#${esc(o.id)}</b> ${esc(o.name || '—')}\n`;
@@ -292,13 +407,13 @@ async function showOrders(chatId, page = 1, filter = null, msgId = null) {
     }
     text += `\n   ${fmtDate(o.createdAt)}\n\n`;
   });
-  reply(chatId, text, ordersKeyboard(items, p, total, q), msgId);
+  reply(chatId, text, ordersKeyboard(items, p, total, q, listState), msgId);
 }
 
 function orderDetailKeyboard(o) {
   const id = o.id;
   const rows = [];
-  if ((o.status || 'new') === 'new') {
+  if (['new', 'no_answer'].includes(o.status || 'new')) {
     rows.push([{ text: '✅ Підтвердити', callback_data: `os_${id}_c` }, { text: '❌ Скасувати', callback_data: `os_${id}_x` }]);
   }
   if (['confirmed', 'shipped'].includes(o.status || 'new')) {
@@ -651,7 +766,7 @@ async function showStats(chatId, msgId = null) {
 }
 
 /* ═══════════════════════════════════════════════════════════
-   CRM MONEY DASHBOARD
+   CRM DASHBOARDS
 ═══════════════════════════════════════════════════════════ */
 const CRM_PERIOD_LABELS = {
   today: 'Сьогодні',
@@ -659,6 +774,24 @@ const CRM_PERIOD_LABELS = {
   month: 'Цей місяць',
   all: 'Увесь час',
 };
+
+function crmPickerKb() {
+  return {
+    inline_keyboard: [
+      [
+        { text: '📦 Замовлення', callback_data: 'crm_orders' },
+        { text: '💰 Фінанси', callback_data: 'crm_finance' },
+      ],
+    ],
+  };
+}
+
+async function showCrmPicker(chatId, msgId = null) {
+  const text =
+    `💼 <b>CRM Violet Motion</b>\n━━━━━━━━━━━━━━━\n` +
+    `Оберіть розділ для відстеження:`;
+  reply(chatId, text, crmPickerKb(), msgId);
+}
 
 function crmMenuKb(period = 'today') {
   return {
@@ -675,6 +808,7 @@ function crmMenuKb(period = 'today') {
         { text: '🏷 Собівартість моделей', callback_data: 'crm_products' },
         { text: '🔄 Оновити', callback_data: `crm_period_${period}` },
       ],
+      [{ text: '← CRM', callback_data: 'crm_menu' }],
     ],
   };
 }
@@ -686,7 +820,7 @@ function crmProductsKb(products = []) {
         text: `✏️ ${product.label}: ${money(product.cost)}`,
         callback_data: `crm_cost_${product.key}`,
       }]),
-      [{ text: '← CRM', callback_data: 'crm_period_today' }],
+      [{ text: '← Фінанси', callback_data: 'crm_period_today' }],
     ],
   };
 }
@@ -735,6 +869,139 @@ async function showCrmProducts(chatId, msgId = null) {
     products.map(product => `${esc(product.label)}: <b>${money(product.cost)}</b>`).join('\n') +
     `\n\nНатисніть модель і надішліть нову собівартість числом.`;
   reply(chatId, text, crmProductsKb(products), msgId);
+}
+
+const ORDER_CRM_QUEUE_LABELS = {
+  confirm: 'Підтвердити зараз',
+  delivery: 'Без даних НП',
+  ttn: 'Готові без ТТН',
+  branch: 'Довго на відділенні',
+  stale: 'НП давно не оновлювалась',
+};
+
+function orderCrmMenuKb(period = 'today') {
+  return {
+    inline_keyboard: [
+      [
+        { text: `${period === 'today' ? '• ' : ''}📅 Сьогодні`, callback_data: 'crm_orders_period_today' },
+        { text: `${period === 'week' ? '• ' : ''}📆 7 днів`, callback_data: 'crm_orders_period_week' },
+      ],
+      [
+        { text: `${period === 'month' ? '• ' : ''}🗓 Місяць`, callback_data: 'crm_orders_period_month' },
+        { text: `${period === 'all' ? '• ' : ''}∞ Увесь час`, callback_data: 'crm_orders_period_all' },
+      ],
+      [
+        { text: '🆕 Підтвердити', callback_data: `crm_orders_queue_confirm_${period}` },
+        { text: '🧾 Без даних НП', callback_data: `crm_orders_queue_delivery_${period}` },
+      ],
+      [
+        { text: '🚚 Без ТТН', callback_data: `crm_orders_queue_ttn_${period}` },
+        { text: '🏤 На відділенні', callback_data: `crm_orders_queue_branch_${period}` },
+      ],
+      [
+        { text: '🕒 Стара НП', callback_data: `crm_orders_queue_stale_${period}` },
+        { text: '🔄 Оновити НП', callback_data: 'np_sync_all' },
+      ],
+      [
+        { text: '📦 Всі замовлення', callback_data: 'orders' },
+        { text: '← CRM', callback_data: 'crm_menu' },
+      ],
+    ],
+  };
+}
+
+function orderCrmQueueRows(items, period, view) {
+  const rows = items.slice(0, 10).map(item => [{
+    text: `#${item.id} ${item.name || '—'} · ${waitTime(item.ageMs)}`,
+    callback_data: `od_${item.id}`,
+  }]);
+  rows.push([{ text: '← CRM замовлень', callback_data: `crm_orders_period_${period}` }]);
+  if (view === 'stale') rows.unshift([{ text: '🔄 Оновити всі НП', callback_data: 'np_sync_all' }]);
+  return { inline_keyboard: rows };
+}
+
+function orderQueueItems(data, view) {
+  const queues = data?.queues || {};
+  return {
+    confirm: queues.confirm,
+    delivery: queues.missingDelivery,
+    ttn: queues.readyWithoutTtn,
+    branch: queues.branch,
+    stale: queues.staleTracking,
+  }[view] || [];
+}
+
+function orderCrmItemLine(item, detail = '') {
+  const product = item.product ? ` · ${esc(item.product)}` : '';
+  const np = item.npStatus ? ` · ${esc(item.npStatus)}` : '';
+  return `#${esc(item.id)} ${esc(item.name || '—')}${product} · <b>${waitTime(item.ageMs)}</b>${detail}${np}`;
+}
+
+function queuePreview(items, detail = '') {
+  if (!Array.isArray(items) || !items.length) return 'немає';
+  return items.slice(0, 3).map(item => orderCrmItemLine(item, detail)).join('\n');
+}
+
+async function loadOrderCrmSummary(period) {
+  return serverGet(`/api/admin/crm/orders/summary?period=${encodeURIComponent(period)}`);
+}
+
+async function showOrderCrmReport(chatId, period = 'today', msgId = null) {
+  const data = await loadOrderCrmSummary(period);
+  if (!data || data.error) return reply(chatId, '❌ CRM замовлень зараз недоступна.', orderCrmMenuKb(period), msgId);
+
+  const totals = data.totals || {};
+  const timings = data.timings || {};
+  const queues = data.queues || {};
+  const products = Array.isArray(data.leaders?.products) ? data.leaders.products : [];
+  const sizes = Array.isArray(data.leaders?.sizes) ? data.leaders.sizes : [];
+  const productLine = products.length
+    ? products.map(item => `${esc(item.label)} ${item.orders} шт`).join(' · ')
+    : '—';
+  const sizeLine = sizes.length
+    ? sizes.map(item => `${esc(item.size)}:${item.count}`).join(' · ')
+    : '—';
+
+  const text =
+    `📦 <b>CRM замовлень — ${CRM_PERIOD_LABELS[period] || period}</b>\n━━━━━━━━━━━━━━━\n` +
+    `Створено за період: <b>${totals.periodOrders || 0}</b>  сьогодні: <b>${totals.todayOrders || 0}</b>\n` +
+    `🆕 Чекають підтвердження: <b>${totals.waitingConfirmation || 0}</b>  📞 без відповіді: <b>${totals.noAnswer || 0}</b>\n` +
+    `✅ Підтверджено: <b>${totals.confirmed || 0}</b>  🚚 відправлено: <b>${totals.shipped || 0}</b>\n` +
+    `🏤 На відділенні: <b>${totals.atBranch || 0}</b>  💸 викуп: <b>${totals.paid || 0}</b>  ↩️ поверн.: <b>${totals.returns || 0}</b>\n\n` +
+    `<b>Що потребує дії</b>\n` +
+    `🆕 Підтвердити зараз: <b>${totals.waitingConfirmation || 0}</b>\n` +
+    `🧾 Без даних для НП: <b>${totals.missingDelivery || 0}</b>\n` +
+    `🚚 Готові без ТТН: <b>${totals.readyWithoutTtn || 0}</b>\n` +
+    `🕒 НП давно не оновлювалась: <b>${totals.staleTracking || 0}</b>\n\n` +
+    `<b>Час</b>\n` +
+    `Очікування нових: середнє <b>${waitTime(timings.averageNewAgeMs)}</b>, найдовше <b>${waitTime(timings.oldestNewAgeMs)}</b>\n` +
+    `До підтвердження: <b>${waitTime(timings.averageConfirmMs)}</b> по ${timings.confirmSamples || 0} замовл.\n` +
+    `До ТТН після підтвердження: <b>${waitTime(timings.averageTtnMs)}</b> по ${timings.ttnSamples || 0} замовл.\n` +
+    `Активні ТТН: <b>${totals.activeTracking || 0}</b>, середній вік <b>${waitTime(timings.averageTransitAgeMs)}</b>\n` +
+    `Найдовше на відділенні від відправки: <b>${waitTime(timings.oldestBranchAgeMs)}</b>\n\n` +
+    `<b>Зараз першими</b>\n` +
+    `Підтвердити:\n${queuePreview(queues.confirm)}\n\n` +
+    `На відділенні:\n${queuePreview(queues.branch)}\n\n` +
+    `<b>Лідери періоду</b>\n` +
+    `Моделі: ${productLine}\n` +
+    `Розміри: ${sizeLine}`;
+  reply(chatId, text, orderCrmMenuKb(period), msgId);
+}
+
+async function showOrderCrmQueue(chatId, view, period = 'today', msgId = null) {
+  const data = await loadOrderCrmSummary(period);
+  if (!data || data.error) return reply(chatId, '❌ Черга CRM замовлень зараз недоступна.', orderCrmMenuKb(period), msgId);
+  const items = orderQueueItems(data, view);
+  if (!items.length) return reply(chatId, `✅ <b>${ORDER_CRM_QUEUE_LABELS[view] || 'Черга'}</b>\n\nТут зараз порожньо.`, orderCrmMenuKb(period), msgId);
+
+  let text = `📦 <b>${ORDER_CRM_QUEUE_LABELS[view] || 'Черга замовлень'}</b>\n━━━━━━━━━━━━━━━\n`;
+  items.slice(0, 10).forEach(item => {
+    text += `${orderCrmItemLine(item)}\n`;
+    if (item.ttn) text += `   ТТН <code>${esc(item.ttn)}</code>\n`;
+    if (item.city || item.postOffice) text += `   ${esc([item.city, item.postOffice].filter(Boolean).join(' · '))}\n`;
+  });
+  if (items.length > 10) text += `\n…і ще ${items.length - 10} замовлень`;
+  reply(chatId, text, orderCrmQueueRows(items, period, view), msgId);
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -939,7 +1206,7 @@ bot.onText(/\/orders/,  msg => { if (!isAdmin(msg.from.id)) return; showOrders(m
 bot.onText(/\/track(?:ing)?/, msg => { if (!isAdmin(msg.from.id)) return; showTrackingMenu(msg.chat.id); });
 bot.onText(/\/reviews/, msg => { if (!isAdmin(msg.from.id)) return; showReviews(msg.chat.id); });
 bot.onText(/\/support/, msg => { if (!isAdmin(msg.from.id)) return; showSupport(msg.chat.id); });
-bot.onText(/\/crm/,     msg => { if (!isAdmin(msg.from.id)) return; showCrmReport(msg.chat.id); });
+bot.onText(/\/crm/,     msg => { if (!isAdmin(msg.from.id)) return; showCrmPicker(msg.chat.id); });
 bot.onText(/\/stats/,   msg => { if (!isAdmin(msg.from.id)) return; showStats(msg.chat.id); });
 
 /* ═══════════════════════════════════════════════════════════
@@ -1044,7 +1311,7 @@ bot.on('message', async msg => {
     case '🚚 Відстеження': showTrackingMenu(chatId); break;
     case '💬 Відгуки':     showReviews(chatId);      break;
     case '🎧 Підтримка':   showSupport(chatId);      break;
-    case '💼 CRM':         showCrmReport(chatId);    break;
+    case '💼 CRM':         showCrmPicker(chatId);    break;
     case '📊 Статистика':  showStats(chatId);         break;
     case '📈 Аналітика':   showAnalyticsMenu(chatId); break;
 
@@ -1058,7 +1325,7 @@ bot.on('message', async msg => {
     case '❓ Допомога':
       await bot.sendMessage(chatId,
         `<b>Команди:</b>\n/orders — замовлення\n/crm — CRM та гроші\n/reviews — відгуки\n/support — підтримка\n/stats — статистика\n/analytics — аналітика\n/search Ім'я — пошук\n\n` +
-        `💼 <b>CRM:</b> факт/прогноз прибутку, повернення, заробіток за сьогодні та редагування собівартості моделей.\n\n` +
+        `💼 <b>CRM:</b> окремо замовлення з чергами дій і фінанси з фактом/прогнозом прибутку.\n\n` +
         `📈 <b>Аналітика:</b> кнопка в меню або /analytics\nПоказує: сесії, скрол, кліки, воронку, останні дії.\n\n` +
         `💬 <b>Підтримка:</b> коли приймаєте діалог — всі ваші повідомлення йдуть клієнту у реальному часі. Для завершення — 🔚 Завершити діалог`,
         { parse_mode: 'HTML', reply_markup: MAIN_KB }
@@ -1096,11 +1363,30 @@ bot.on('callback_query', async q => {
     }
 
     /* ─ CRM callbacks ───────────────────────────────────── */
-    if (data === 'crm_menu') { await showCrmReport(chatId, 'today', msgId); return; }
+    if (data === 'crm_menu') { await showCrmPicker(chatId, msgId); return; }
+
+    if (data === 'crm_finance') { await showCrmReport(chatId, 'today', msgId); return; }
+
+    if (data === 'crm_orders') { await showOrderCrmReport(chatId, 'today', msgId); return; }
 
     if (data.startsWith('crm_period_')) {
       const period = data.slice('crm_period_'.length);
       await showCrmReport(chatId, ['today', 'week', 'month', 'all'].includes(period) ? period : 'today', msgId);
+      return;
+    }
+
+    if (data.startsWith('crm_orders_period_')) {
+      const period = data.slice('crm_orders_period_'.length);
+      await showOrderCrmReport(chatId, ['today', 'week', 'month', 'all'].includes(period) ? period : 'today', msgId);
+      return;
+    }
+
+    if (data.startsWith('crm_orders_queue_')) {
+      const rest = data.slice('crm_orders_queue_'.length);
+      const separator = rest.lastIndexOf('_');
+      const view = separator >= 0 ? rest.slice(0, separator) : rest;
+      const period = separator >= 0 ? rest.slice(separator + 1) : 'today';
+      await showOrderCrmQueue(chatId, view, ['today', 'week', 'month', 'all'].includes(period) ? period : 'today', msgId);
       return;
     }
 
@@ -1150,6 +1436,12 @@ bot.on('callback_query', async q => {
 
     /* ─ Orders ──────────────────────────────────────────── */
     if (data === 'orders') { showOrders(chatId, 1, null, msgId); return; }
+
+    if (data.startsWith('of_')) {
+      const [, pageStr, model, status] = data.split('_');
+      showOrders(chatId, Number(pageStr), null, msgId, { model, status });
+      return;
+    }
 
     if (data.startsWith('op_')) {
       const [pageStr, filterStr] = data.replace('op_', '').split('_f_');

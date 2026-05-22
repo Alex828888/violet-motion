@@ -610,6 +610,141 @@ function buildCrmSummary(period = 'today') {
     recentPayments: buildRecentPayments(paidOrders),
   };
 }
+function timestampMs(...values) {
+  for (const value of values) {
+    const time = new Date(value || 0).getTime();
+    if (Number.isFinite(time) && time > 0) return time;
+  }
+  return 0;
+}
+function average(values) {
+  const clean = values.filter(value => Number.isFinite(value) && value >= 0);
+  return clean.length ? clean.reduce((sum, value) => sum + value, 0) / clean.length : 0;
+}
+function orderConfirmationAt(order) {
+  const explicit = timestampMs(order?.managerConfirmedAt, order?.zvonokConfirmedAt, order?.confirmedAt);
+  if (explicit) return explicit;
+  return (order?.status === 'confirmed' && order?.updatedAt) ? timestampMs(order.updatedAt) : 0;
+}
+function isOrderWaitingConfirmation(order) {
+  return ['new', 'no_answer'].includes(order?.status || 'new');
+}
+function hasNovaPoshtaRecipientData(order) {
+  return !!((order?.fullName || order?.name) && order?.city && order?.postOffice && order?.size);
+}
+function isOrderMissingDeliveryData(order) {
+  if (!['confirmed', 'shipped'].includes(order?.status || 'new') || order?.ttn) return false;
+  return !hasNovaPoshtaRecipientData(order);
+}
+function isOrderReadyWithoutTtn(order) {
+  if (!['confirmed', 'shipped', 'paid'].includes(order?.status || 'new') || order?.ttn) return false;
+  return hasNovaPoshtaRecipientData(order);
+}
+function orderAtBranch(order) {
+  if (!order?.ttn || isPaidOrder(order) || isReturnedOrder(order) || ['cancelled', 'completed'].includes(order?.status || 'new')) return false;
+  const text = `${order?.npStatus || ''} ${order?.novaPoshta?.tracking?.status || ''}`.toLowerCase();
+  return /(відділен|отделен|прибув|прибыл|очікує отримання|ожидает получения|доставлен.*відділен|доставлен.*отделен)/i.test(text);
+}
+function activeTrackingOrder(order) {
+  return !!order?.ttn && !isPaidOrder(order) && !isReturnedOrder(order) && !['cancelled', 'completed'].includes(order?.status || 'new');
+}
+function orderAgeMs(order, ...preferredDates) {
+  const start = timestampMs(...preferredDates, order?.createdAt);
+  return start ? Math.max(0, Date.now() - start) : 0;
+}
+function orderOpsItem(order, ageMs = orderAgeMs(order)) {
+  return {
+    id: order.id,
+    name: order.name || order.fullName || '',
+    product: order.product || '',
+    size: order.size || '',
+    phone: order.phone || '',
+    status: order.status || 'new',
+    paymentStatus: orderPaymentStatus(order),
+    deliveryStatus: deliveryStatusValue(order),
+    ttn: order.ttn || '',
+    npStatus: order.npStatus || '',
+    city: order.city || '',
+    postOffice: order.postOffice || '',
+    createdAt: order.createdAt || null,
+    updatedAt: order.updatedAt || null,
+    npSyncedAt: order.npSyncedAt || null,
+    ageMs,
+  };
+}
+function oldestFirst(items, age) {
+  return [...items]
+    .map(order => orderOpsItem(order, age(order)))
+    .sort((a, b) => b.ageMs - a.ageMs);
+}
+function buildOrderCrmSummary(period = 'today') {
+  const allOrders = read(F.orders);
+  const orders = allOrders.filter(order => inPeriod(order.createdAt, period));
+  const waitingConfirmation = allOrders.filter(isOrderWaitingConfirmation);
+  const missingDelivery = allOrders.filter(isOrderMissingDeliveryData);
+  const readyWithoutTtn = allOrders.filter(isOrderReadyWithoutTtn);
+  const atBranch = allOrders.filter(orderAtBranch);
+  const tracked = allOrders.filter(activeTrackingOrder);
+  const staleTracking = tracked.filter(order => orderAgeMs(order, order.npSyncedAt || order.ttnCreatedAt) >= 12 * 60 * 60 * 1000);
+  const confirmedInPeriod = orders.filter(order => orderConfirmationAt(order));
+  const ttnInPeriod = orders.filter(order => timestampMs(order.ttnCreatedAt));
+  const paidInPeriod = orders.filter(isPaidOrder);
+  const productStats = new Map();
+  const sizeStats = new Map();
+
+  orders.forEach(order => {
+    const product = orderProduct(order);
+    const productItem = productStats.get(product.key) || { key: product.key, label: product.label, orders: 0, paid: 0, returns: 0 };
+    productItem.orders += 1;
+    if (isPaidOrder(order)) productItem.paid += 1;
+    if (isReturnedOrder(order)) productItem.returns += 1;
+    productStats.set(product.key, productItem);
+    const size = sanitizeStr(order.size || '', 20);
+    if (size) sizeStats.set(size, (sizeStats.get(size) || 0) + 1);
+  });
+
+  return {
+    period,
+    generatedAt: new Date().toISOString(),
+    totals: {
+      periodOrders: orders.length,
+      todayOrders: allOrders.filter(order => inPeriod(order.createdAt, 'today')).length,
+      waitingConfirmation: waitingConfirmation.length,
+      noAnswer: allOrders.filter(order => order.status === 'no_answer').length,
+      confirmed: orders.filter(order => ['confirmed', 'shipped', 'paid', 'completed'].includes(order.status || 'new')).length,
+      shipped: orders.filter(isOrderActuallyShipped).length,
+      activeTracking: tracked.length,
+      atBranch: atBranch.length,
+      paid: paidInPeriod.length,
+      returns: orders.filter(isReturnedOrder).length,
+      cancelled: orders.filter(order => order.status === 'cancelled').length,
+      missingDelivery: missingDelivery.length,
+      readyWithoutTtn: readyWithoutTtn.length,
+      staleTracking: staleTracking.length,
+    },
+    timings: {
+      averageNewAgeMs: average(waitingConfirmation.map(order => orderAgeMs(order))),
+      oldestNewAgeMs: waitingConfirmation.reduce((max, order) => Math.max(max, orderAgeMs(order)), 0),
+      averageConfirmMs: average(confirmedInPeriod.map(order => orderConfirmationAt(order) - timestampMs(order.createdAt))),
+      confirmSamples: confirmedInPeriod.length,
+      averageTtnMs: average(ttnInPeriod.map(order => timestampMs(order.ttnCreatedAt) - (orderConfirmationAt(order) || timestampMs(order.createdAt)))),
+      ttnSamples: ttnInPeriod.length,
+      averageTransitAgeMs: average(tracked.map(order => orderAgeMs(order, order.shippedAt, order.ttnCreatedAt))),
+      oldestBranchAgeMs: atBranch.reduce((max, order) => Math.max(max, orderAgeMs(order, order.shippedAt, order.ttnCreatedAt)), 0),
+    },
+    queues: {
+      confirm: oldestFirst(waitingConfirmation, order => orderAgeMs(order)),
+      missingDelivery: oldestFirst(missingDelivery, order => orderAgeMs(order, order.managerConfirmedAt, order.zvonokConfirmedAt, order.updatedAt)),
+      readyWithoutTtn: oldestFirst(readyWithoutTtn, order => orderAgeMs(order, order.managerConfirmedAt, order.zvonokConfirmedAt, order.updatedAt)),
+      branch: oldestFirst(atBranch, order => orderAgeMs(order, order.shippedAt, order.ttnCreatedAt)),
+      staleTracking: oldestFirst(staleTracking, order => orderAgeMs(order, order.npSyncedAt || order.ttnCreatedAt)),
+    },
+    leaders: {
+      products: [...productStats.values()].sort((a, b) => b.orders - a.orders).slice(0, 5),
+      sizes: [...sizeStats.entries()].map(([size, count]) => ({ size, count })).sort((a, b) => b.count - a.count).slice(0, 5),
+    },
+  };
+}
 
 function financeExternalId(source, category, orderId, extra = '') {
   return [source, category, orderId || 'none', extra || 'once'].join(':');
@@ -1623,6 +1758,9 @@ app.get('/api/admin/finance/summary', authBot, (req, res) => {
 });
 app.get('/api/admin/crm/summary', authBot, (req, res) => {
   res.json(buildCrmSummary(sanitizeStr(req.query.period || 'today', 20)));
+});
+app.get('/api/admin/crm/orders/summary', authBot, (req, res) => {
+  res.json(buildOrderCrmSummary(sanitizeStr(req.query.period || 'today', 20)));
 });
 app.get('/api/admin/crm/products', authBot, (_req, res) => {
   res.json({ products: readCrmProducts() });
