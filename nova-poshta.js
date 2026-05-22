@@ -7,6 +7,7 @@ const NP_MIN_INTERVAL_MS = Math.max(0, Number(process.env.NP_MIN_INTERVAL_MS || 
 const NP_MAX_RETRIES = Math.max(0, Number(process.env.NP_MAX_RETRIES || 3));
 const NP_RETRY_BASE_MS = Math.max(250, Number(process.env.NP_RETRY_BASE_MS || 1200));
 const NP_CACHE_TTL_MS = Math.max(0, Number(process.env.NP_CACHE_TTL_MS || 6 * 60 * 60 * 1000));
+const NP_DEFAULT_PACK_REF = '80049ea8-2ab0-11e3-b441-0050568002cf'; // Nova Poshta: Коробка (1 кг) стандартна
 
 let novaQueue = Promise.resolve();
 let lastNovaCallAt = 0;
@@ -518,13 +519,26 @@ function buildSeatsOptions() {
   const height = moneyNumber(env('NP_SEAT_HEIGHT_CM', '12'));
   const weight = moneyNumber(env('NP_WEIGHT_KG', '1'));
   const volume = moneyNumber(env('NP_VOLUME_GENERAL', '0.002')) || Math.max(0.001, (width * length * height) / 1000000);
-  return [{
+  const seat = {
     volumetricVolume: volume,
     volumetricWidth: width,
     volumetricLength: length,
     volumetricHeight: height,
     weight,
-  }];
+  };
+  if (env('NP_PACK_ENABLED', 'true') !== 'false') {
+    seat.packRef = env('NP_PACK_REF', NP_DEFAULT_PACK_REF);
+  }
+  return [seat];
+}
+
+function buildInternetDocumentDescription(order = {}) {
+  const description = env('NP_DESCRIPTION');
+  const product = String(order.product || process.env.PRODUCT_NAME || 'Order').trim();
+  const size = String(order.size || '').trim();
+  const parts = [description, product].filter((part, index, items) => part && items.indexOf(part) === index);
+  if (size) parts.push(`size ${size}`);
+  return parts.join(' | ');
 }
 
 async function createInternetDocument(order) {
@@ -533,7 +547,7 @@ async function createInternetDocument(order) {
   const warehouse = await resolveWarehouse(city.ref, order.postOffice || order.delivery?.postOffice);
   const recipient = await createRecipient(order);
   const price = Math.max(1, moneyNumber(order.price || process.env.PRODUCT_PRICE || 0));
-  const description = env('NP_DESCRIPTION', order.product || process.env.PRODUCT_NAME || 'Order');
+  const description = buildInternetDocumentDescription(order);
   const weight = moneyNumber(env('NP_WEIGHT_KG', '1')) || 1;
   const volume = moneyNumber(env('NP_VOLUME_GENERAL', '0.002')) || 0.002;
   const seats = Math.max(1, Math.round(moneyNumber(env('NP_SEATS_AMOUNT', '1')) || 1));
