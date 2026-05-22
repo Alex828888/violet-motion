@@ -36,6 +36,7 @@ const managerDialogs = {};
 const pendingSearch  = {};
 const pendingDelivery = {};
 const pendingTtn     = {};
+const pendingNpSender = {};
 const pendingProductCost = {};
 const pendingCb      = new Set();
 
@@ -587,7 +588,103 @@ async function confirmOrderByManager(chatId, id, msgId = null, managerId = null)
   return updated;
 }
 
-async function createNpTtn(chatId, id, force = false, msgId = null) {
+function npSenderLocationKeyboard(id, force = false) {
+  const forceFlag = force ? 1 : 0;
+  return { inline_keyboard: [
+    [
+      { text: '🏪 Відділення', callback_data: `nps_mode_b_${id}_${forceFlag}` },
+      { text: '📮 Поштомат', callback_data: `nps_mode_p_${id}_${forceFlag}` },
+    ],
+    [{ text: '← До замовлення', callback_data: `od_${id}` }],
+  ] };
+}
+
+function senderLocationTypeLabel(type) {
+  return type === 'postomat' ? 'поштомат' : 'відділення';
+}
+
+function senderLocationPatch(location = {}) {
+  return {
+    type: location.type,
+    category: location.category,
+    cityRef: location.cityRef,
+    ref: location.ref,
+    number: location.number || '',
+    description: location.description || '',
+    shortAddress: location.shortAddress || '',
+  };
+}
+
+async function startNpSenderLocation(chatId, id, force = false, msgId = null) {
+  const order = await serverGet(`/api/admin/orders/${id}`);
+  if (!order || order.error) {
+    await bot.sendMessage(chatId, '❌ Замовлення не знайдено.', { reply_markup: MAIN_KB });
+    return;
+  }
+
+  const missing = missingRecipientDeliveryFields(order).filter(x => x !== 'ПІБ' || !order.name);
+  if (missing.length) {
+    await bot.sendMessage(chatId, `ℹ️ Для створення ТТН не вистачає: <b>${esc(missing.join(', '))}</b>. Заповнимо зараз.`, { parse_mode: 'HTML' });
+    await askManagerDeliveryStep(chatId, id, 0);
+    return;
+  }
+
+  delete pendingNpSender[chatId];
+  await reply(chatId,
+    `🚚 <b>Місце відправки для ТТН #${esc(id)}</b>\n\nОберіть, звідки будете відправляти:`,
+    npSenderLocationKeyboard(id, force),
+    msgId);
+}
+
+async function askNpSenderLocation(chatId, id, type, force = false) {
+  delete pendingDelivery[chatId];
+  pendingNpSender[chatId] = { id, type, force };
+  await bot.sendMessage(chatId,
+    `✍️ Введіть номер або адресу ${senderLocationTypeLabel(type)} Нової Пошти, звідки будете відправляти замовлення #${id}.\n\nНаприклад: <code>29</code>`,
+    {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '← До вибору', callback_data: `nps_back_${id}_${force ? 1 : 0}` }]] },
+    });
+}
+
+async function resolveNpSenderInput(chatId, text) {
+  const pending = pendingNpSender[chatId];
+  if (!pending) return false;
+  const query = text.trim();
+  if (!query) {
+    await bot.sendMessage(chatId, '❌ Введіть номер або адресу місця відправки текстом.', { reply_markup: MAIN_KB });
+    return true;
+  }
+
+  const result = await serverPost('/api/admin/np/sender-location/resolve', { type: pending.type, query });
+  if (!result || result.error || !result.location?.ref) {
+    const reason = esc(result?.userMessage || result?.error || 'Нова Пошта не знайшла це місце відправки.');
+    await bot.sendMessage(chatId, `❌ ${reason}\n\nВведіть інший номер або адресу.`, {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '← До вибору', callback_data: `nps_back_${pending.id}_${pending.force ? 1 : 0}` }]] },
+    });
+    return true;
+  }
+
+  pending.location = senderLocationPatch(result.location);
+  const address = pending.location.shortAddress || pending.location.description || '—';
+  await bot.sendMessage(chatId,
+    `📍 <b>Нова Пошта знайшла ${senderLocationTypeLabel(pending.type)}:</b>\n` +
+    `<b>${esc(pending.location.description || address)}</b>\n` +
+    (pending.location.shortAddress && pending.location.shortAddress !== pending.location.description ? `${esc(pending.location.shortAddress)}\n` : '') +
+    `\nПідтвердити це місце відправки і створити ТТН?`,
+    {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: '✅ Підтвердити', callback_data: `nps_confirm_${pending.id}` }],
+        [{ text: '✏️ Ввести інше', callback_data: `nps_retry_${pending.id}` }],
+        [{ text: '← До замовлення', callback_data: `od_${pending.id}` }],
+      ] },
+    });
+  return true;
+}
+
+async function createNpTtn(chatId, id, force = false, msgId = null, senderLocation = null) {
   const order = await serverGet(`/api/admin/orders/${id}`);
   if (!order || order.error) {
     await bot.sendMessage(chatId, '❌ Замовлення не знайдено.', { reply_markup: MAIN_KB });
@@ -600,7 +697,9 @@ async function createNpTtn(chatId, id, force = false, msgId = null) {
     return;
   }
 
-  const result = await serverPost(`/api/admin/orders/${id}/np/create`, force ? { force: true } : {});
+  const createBody = force ? { force: true } : {};
+  if (senderLocation?.ref) createBody.npSenderLocation = senderLocationPatch(senderLocation);
+  const result = await serverPost(`/api/admin/orders/${id}/np/create`, createBody);
   if (!result || result.error) {
     const errors = [
       ...(Array.isArray(result?.details?.errors) ? result.details.errors : []),
@@ -1247,6 +1346,11 @@ bot.on('message', async msg => {
     return;
   }
 
+  if (pendingNpSender[chatId]) {
+    await resolveNpSenderInput(chatId, text);
+    return;
+  }
+
   if (pendingProductCost[chatId]) {
     const product = pendingProductCost[chatId];
     if (text === '-' || text.toLowerCase() === 'cancel') {
@@ -1449,7 +1553,11 @@ bot.on('callback_query', async q => {
       return;
     }
 
-    if (data.startsWith('od_')) { showOrderDetail(chatId, Number(data.slice(3)), msgId); return; }
+    if (data.startsWith('od_')) {
+      delete pendingNpSender[chatId];
+      showOrderDetail(chatId, Number(data.slice(3)), msgId);
+      return;
+    }
 
     if (data === 'track_menu') { await showTrackingMenu(chatId, msgId); return; }
 
@@ -1474,15 +1582,52 @@ bot.on('callback_query', async q => {
       return;
     }
 
+    if (data.startsWith('nps_mode_')) {
+      const [, , mode, idStr, forceStr] = data.split('_');
+      await askNpSenderLocation(chatId, Number(idStr), mode === 'p' ? 'postomat' : 'branch', forceStr === '1');
+      return;
+    }
+
+    if (data.startsWith('nps_back_')) {
+      const [, , idStr, forceStr] = data.split('_');
+      await startNpSenderLocation(chatId, Number(idStr), forceStr === '1', msgId);
+      return;
+    }
+
+    if (data.startsWith('nps_retry_')) {
+      const id = Number(data.slice('nps_retry_'.length));
+      const pending = pendingNpSender[chatId];
+      if (!pending || pending.id !== id) {
+        await startNpSenderLocation(chatId, id, false, msgId);
+        return;
+      }
+      await askNpSenderLocation(chatId, id, pending.type, pending.force);
+      return;
+    }
+
+    if (data.startsWith('nps_confirm_')) {
+      const id = Number(data.slice('nps_confirm_'.length));
+      const pending = pendingNpSender[chatId];
+      if (!pending || pending.id !== id || !pending.location?.ref) {
+        await startNpSenderLocation(chatId, id, false, msgId);
+        return;
+      }
+      const selectedLocation = pending.location;
+      const force = pending.force;
+      delete pendingNpSender[chatId];
+      await createNpTtn(chatId, id, force, msgId, selectedLocation);
+      return;
+    }
+
     if (data.startsWith('npcreate_')) {
       const force = data.startsWith('npcreate_force_');
       const id = Number(data.slice(force ? 15 : 9));
-      await createNpTtn(chatId, id, force, msgId);
+      await startNpSenderLocation(chatId, id, force, msgId);
       return;
     }
 
     if (data.startsWith('nprecreate_')) {
-      await createNpTtn(chatId, Number(data.slice(11)), true, msgId);
+      await startNpSenderLocation(chatId, Number(data.slice(11)), true, msgId);
       return;
     }
 

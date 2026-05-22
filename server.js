@@ -845,6 +845,9 @@ function npUserMessage(error, details = {}) {
   if (/sender config/i.test(message) || missing.some(x => /^CitySender|^Sender|^SenderAddress|^ContactSender|^SendersPhone$/.test(x))) {
     return 'Нова Пошта не знайшла дані відправника. Перевірте налаштування відправника НП на Render.';
   }
+  if (/sender warehouse was not found/i.test(message)) {
+    return `Нова Пошта не знайшла місце відправки "${sanitizeStr(details.warehouse || details.normalizedWarehouse || '', 80)}".`;
+  }
   if (/city was not found/i.test(message)) {
     return `Нова Пошта не знайшла місто "${sanitizeStr(details.originalCity || details.city || '', 80)}".`;
   }
@@ -1795,6 +1798,21 @@ app.get('/api/admin/np/track/:ttn', authBot, async (req, res) => {
     if (!track) return res.status(404).json({ error: 'TTN not found' });
     res.json(track);
   } catch (error) {
+    res.status(502).json(npErrorPayload(error));
+  }
+});
+app.post('/api/admin/np/sender-location/resolve', authBot, async (req, res) => {
+  const type = sanitizeStr(req.body?.type || '', 20);
+  const query = sanitizeStr(req.body?.query || '', 120);
+  if (!['branch', 'postomat'].includes(type)) return res.status(400).json({ error: 'Invalid sender location type' });
+  if (!query) return res.status(400).json({ error: 'Sender location is required' });
+  try {
+    const location = await novaPoshta.resolveSenderLocation(type, query);
+    res.json({ success: true, location });
+  } catch (error) {
+    if (/warehouse was not found/i.test(String(error?.message || ''))) {
+      error.message = 'Nova Poshta sender warehouse was not found';
+    }
     res.status(502).json(npErrorPayload(error));
   }
 });

@@ -432,12 +432,19 @@ async function resolveCity(cityName) {
   return cacheSet(cityCache, cacheKey, { ref: city.Ref, settlementRef: city.SettlementRef || null, description: city.Description || query, raw: city });
 }
 
-async function resolveWarehouse(cityRef, warehouseQuery) {
+function filterWarehousesByCategory(warehouses = [], category = '') {
+  const expected = String(category || '').trim().toLowerCase();
+  if (!expected) return warehouses;
+  return warehouses.filter(warehouse => String(warehouse.CategoryOfWarehouse || '').trim().toLowerCase() === expected);
+}
+
+async function resolveWarehouse(cityRef, warehouseQuery, options = {}) {
   const normalized = normalizeWarehouseQuery(warehouseQuery);
   const query = normalized.search;
   if (!cityRef) throw new NovaPoshtaError('Recipient city ref is required');
   if (!query) throw new NovaPoshtaError('Recipient warehouse is required');
-  const cacheKey = `${cityRef}:${query.toLowerCase()}`;
+  const category = String(options.category || '').trim();
+  const cacheKey = `${cityRef}:${category.toLowerCase()}:${query.toLowerCase()}`;
   const cached = cacheGet(warehouseCache, cacheKey);
   if (cached) return cached;
 
@@ -451,7 +458,7 @@ async function resolveWarehouse(cityRef, warehouseQuery) {
       Limit: 50,
       Page: 1,
     });
-    list = result.data || [];
+    list = filterWarehousesByCategory(result.data || [], category);
     if (list.length) break;
   }
   if (!list.length && digits) {
@@ -460,7 +467,7 @@ async function resolveWarehouse(cityRef, warehouseQuery) {
       Limit: 500,
       Page: 1,
     });
-    list = result.data || [];
+    list = filterWarehousesByCategory(result.data || [], category);
   }
   const exact = list.find(w => digits && String(w.Number) === digits);
   const byDescription = list.find(w => digits && new RegExp(`(?:№|N|номер|відділення|отделение)?\\s*${digits}\\b`, 'i').test(`${w.Description || ''} ${w.ShortAddress || ''}`));
@@ -471,6 +478,7 @@ async function resolveWarehouse(cityRef, warehouseQuery) {
     normalizedWarehouse: query,
     number: digits,
     cityRef,
+    category,
     checked: list.length,
   });
   return cacheSet(warehouseCache, cacheKey, {
@@ -479,6 +487,25 @@ async function resolveWarehouse(cityRef, warehouseQuery) {
     description: warehouse.Description || warehouse.ShortAddress || query,
     raw: warehouse,
   });
+}
+
+async function resolveSenderLocation(type, query) {
+  const locationType = String(type || '').trim().toLowerCase();
+  const category = locationType === 'postomat' ? 'Postomat' : locationType === 'branch' ? 'Branch' : '';
+  if (!category) throw new NovaPoshtaError('Nova Poshta sender location type is invalid', { type });
+
+  const sender = await resolveSenderConfig();
+  const warehouse = await resolveWarehouse(sender.CitySender, query, { category });
+  return {
+    type: locationType,
+    category,
+    cityRef: sender.CitySender,
+    ref: warehouse.ref,
+    number: warehouse.number || '',
+    description: warehouse.description,
+    shortAddress: warehouse.raw?.ShortAddress || '',
+    raw: warehouse.raw,
+  };
 }
 
 async function createRecipient(order) {
@@ -542,7 +569,13 @@ function buildInternetDocumentDescription(order = {}) {
 }
 
 async function createInternetDocument(order) {
-  const sender = await resolveSenderConfig();
+  const baseSender = await resolveSenderConfig();
+  const selectedSenderLocation = order?.npSenderLocation?.ref ? order.npSenderLocation : null;
+  const sender = selectedSenderLocation ? {
+    ...baseSender,
+    CitySender: selectedSenderLocation.cityRef || baseSender.CitySender,
+    SenderAddress: selectedSenderLocation.ref,
+  } : baseSender;
   const city = await resolveCity(order.city || order.delivery?.city);
   const warehouse = await resolveWarehouse(city.ref, order.postOffice || order.delivery?.postOffice);
   const recipient = await createRecipient(order);
@@ -819,6 +852,7 @@ module.exports = {
   NovaPoshtaError,
   callNovaPoshta,
   createInternetDocument,
+  resolveSenderLocation,
   createReturnOrder,
   syncReturnOrderCost,
   getReturnOrdersList,
