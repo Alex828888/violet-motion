@@ -7,7 +7,7 @@ const NP_MIN_INTERVAL_MS = Math.max(0, Number(process.env.NP_MIN_INTERVAL_MS || 
 const NP_MAX_RETRIES = Math.max(0, Number(process.env.NP_MAX_RETRIES || 3));
 const NP_RETRY_BASE_MS = Math.max(250, Number(process.env.NP_RETRY_BASE_MS || 1200));
 const NP_CACHE_TTL_MS = Math.max(0, Number(process.env.NP_CACHE_TTL_MS || 6 * 60 * 60 * 1000));
-const NP_DEFAULT_PACK_REF = 'ab0cd73c-da19-11e1-aa18-d4ae527baec9'; // Nova Poshta: Коробка (2 кг)
+const NP_DEFAULT_PACK_REF = '6acae69a-e177-4732-9935-acecf090b158'; // Nova Poshta: Коробка (3 кг) пласка
 
 let novaQueue = Promise.resolve();
 let lastNovaCallAt = 0;
@@ -514,9 +514,9 @@ async function createRecipient(order) {
 }
 
 function buildSeatsOptions() {
-  const width = moneyNumber(env('NP_SEAT_WIDTH_CM', '35'));
-  const length = moneyNumber(env('NP_SEAT_LENGTH_CM', '25'));
-  const height = moneyNumber(env('NP_SEAT_HEIGHT_CM', '12'));
+  const width = moneyNumber(env('NP_SEAT_WIDTH_CM', '24'));
+  const length = moneyNumber(env('NP_SEAT_LENGTH_CM', '34'));
+  const height = moneyNumber(env('NP_SEAT_HEIGHT_CM', '14.7'));
   const weight = moneyNumber(env('NP_WEIGHT_KG', '1'));
   const volume = moneyNumber(env('NP_VOLUME_GENERAL', '0.002')) || Math.max(0.001, (width * length * height) / 1000000);
   const seat = {
