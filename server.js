@@ -66,6 +66,7 @@ const F = {
   crmProducts: path.join(DATA, 'crm-products.json'),
   orderNotify: path.join(DATA, 'order-notify.json'),
   npAfterpayments: path.join(DATA, 'np-afterpayments.json'),
+  financeSettings: path.join(DATA, 'finance-settings.json'),
 };
 
 if (!fs.existsSync(DATA)) fs.mkdirSync(DATA, { recursive: true });
@@ -92,6 +93,44 @@ function write(file, data) {
 function nextId(arr) {
   return arr.length ? Math.max(...arr.map(x => x.id || 0)) + 1 : 1;
 }
+const DEFAULT_FINANCE_START_AT = '2026-05-25T21:00:00.000Z';
+const DEFAULT_FINANCE_RESET_KEY = 'finance-reset-2026-05-26';
+function readFinanceSettings() {
+  const stored = read(F.financeSettings);
+  const settings = stored && !Array.isArray(stored) && typeof stored === 'object' ? stored : {};
+  return {
+    startAt: process.env.FINANCE_START_AT || settings.startAt || DEFAULT_FINANCE_START_AT,
+    timezone: settings.timezone || 'Europe/Kyiv',
+    resetLabel: settings.resetLabel || '26.05.2026',
+    resetKey: settings.resetKey || DEFAULT_FINANCE_RESET_KEY,
+    appliedResetKey: settings.appliedResetKey || null,
+    resetAppliedAt: settings.resetAppliedAt || null,
+  };
+}
+function financeStartAt() {
+  return readFinanceSettings().startAt;
+}
+function isOnOrAfterFinanceStart(value) {
+  const time = new Date(value || 0).getTime();
+  const start = new Date(financeStartAt()).getTime();
+  return Number.isFinite(time) && time >= start;
+}
+function inFinancePeriod(value, period) {
+  return isOnOrAfterFinanceStart(value) && inPeriod(value, period);
+}
+function applyPendingFinanceReset() {
+  const settings = readFinanceSettings();
+  if (!settings.resetKey || settings.appliedResetKey === settings.resetKey) return;
+  write(F.finance, []);
+  write(F.npAfterpayments, []);
+  write(F.financeSettings, {
+    ...settings,
+    appliedResetKey: settings.resetKey,
+    resetAppliedAt: new Date().toISOString(),
+  });
+  console.log(`[finance] reset applied: ${settings.resetKey}; orders were preserved`);
+}
+applyPendingFinanceReset();
 function mergeLegacyFileIfDataEmpty(key) {
   const current = read(F[key]);
   const legacyFile = path.join(ROOT, `${key}.json`);
@@ -563,39 +602,34 @@ function financeOrderContext(order) {
     returnTtn: order.npReturnExpressWaybillNumber || order.npReturnOrderNumber || '',
   };
 }
+function paidFinanceDate(order) {
+  return order?.paidAt || order?.basePaidAt || order?.bankPaidAt || null;
+}
+function returnFinanceDate(order) {
+  return order?.returnedAt || order?.npReturnCreatedAt || null;
+}
+function pipelineFinanceDate(order) {
+  return order?.managerConfirmedAt || order?.zvonokConfirmedAt || order?.updatedAt || order?.createdAt || null;
+}
+function afterpaymentFinanceDate(order) {
+  return order?.ttnCreatedAt || order?.shippedAt || order?.createdAt || null;
+}
+function orderBelongsToFinancePeriod(order, period) {
+  if (isPaidOrder(order)) return inFinancePeriod(paidFinanceDate(order), period);
+  if (isReturnedOrder(order)) return inFinancePeriod(returnFinanceDate(order), period);
+  return inFinancePeriod(pipelineFinanceDate(order), period);
+}
 function buildFinanceTransactions(period = 'today', orders = read(F.orders)) {
   const orderMap = new Map(orders.map(order => [Number(order.id), order]));
-  const transactions = read(F.finance)
+  return read(F.finance)
     .filter(item => !item.excludedAt)
     .filter(item => !isUnverifiedNovaFinanceEntry(item))
-    .filter(item => inPeriod(item.createdAt, period))
+    .filter(item => inFinancePeriod(item.createdAt, period))
     .map(item => ({
       ...item,
       linkedOrder: financeOrderContext(orderMap.get(Number(item.orderId))),
-    }));
-  const financeExternalIds = new Set(transactions.map(item => item.externalId).filter(Boolean));
-
-  orders.forEach(order => {
-    (Array.isArray(order.expenses) ? order.expenses : []).forEach(expense => {
-      if (!inPeriod(expense.createdAt || order.updatedAt || order.createdAt, period)) return;
-      const externalId = financeExternalId('order-expense', expense.category || 'order', order.id, expense.id || expense.createdAt || expense.amount);
-      if (financeExternalIds.has(externalId)) return;
-      transactions.push({
-        id: `order-${order.id}-${expense.id || 'expense'}`,
-        type: 'expense',
-        title: expense.title || 'Витрата по замовленню',
-        amount: asMoneyNumber(expense.amount),
-        category: expense.category || 'order',
-        source: 'order-expense',
-        orderId: order.id,
-        externalId,
-        createdAt: expense.createdAt || order.updatedAt || order.createdAt,
-        linkedOrder: financeOrderContext(order),
-      });
-      financeExternalIds.add(externalId);
-    });
-  });
-  return transactions.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+    }))
+    .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
 }
 function isPersonalFinanceEntry(entry) {
   return entry?.category === 'personal';
@@ -608,19 +642,19 @@ function buildAfterpaymentSummary(period = 'today', orders = read(F.orders)) {
   const byTtn = new Map();
   const saved = Array.isArray(read(F.npAfterpayments)) ? read(F.npAfterpayments) : [];
   saved.forEach(item => {
-    if (!item?.ttn || !inPeriod(item.sentAt || item.createdAt, period)) return;
+    if (!item?.ttn || !inFinancePeriod(item.sentAt || item.createdAt, period)) return;
     byTtn.set(String(item.ttn), { ...item, linkedOrder: financeOrderContext(orderMap.get(String(item.ttn))) });
   });
   orders.forEach(order => {
     const amount = asMoneyNumber(order.npRedeliverySum);
-    if (!order.ttn || amount <= 0 || !inPeriod(order.paidAt || order.updatedAt || order.createdAt, period)) return;
+    if (!order.ttn || amount <= 0 || !inFinancePeriod(afterpaymentFinanceDate(order), period)) return;
     if (byTtn.has(String(order.ttn))) return;
     byTtn.set(String(order.ttn), {
       ttn: String(order.ttn),
       amount,
       paymentMethod: order.npRedeliveryPaymentMethod || 'unknown',
       status: order.npRedeliveryStatus || order.npStatus || 'tracked',
-      sentAt: order.paidAt || order.updatedAt || order.createdAt,
+      sentAt: afterpaymentFinanceDate(order),
       source: 'nova-poshta-api',
       linkedOrder: financeOrderContext(order),
     });
@@ -635,9 +669,10 @@ function buildAfterpaymentSummary(period = 'today', orders = read(F.orders)) {
   };
 }
 function buildCrmSummary(period = 'today') {
-  const orders = read(F.orders).filter(o => inPeriod(o.createdAt, period));
   const allOrders = read(F.orders);
+  const orders = allOrders.filter(o => orderBelongsToFinancePeriod(o, period));
   const finance = buildFinanceTransactions(period, allOrders);
+  const reviewTransactions = finance.filter(x => x.reviewRequired === true);
   const income = finance.filter(x => x.type === 'income').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
   const manualIncome = finance.filter(x => x.type === 'income' && ['business_income', 'manual_business_income'].includes(x.category)).reduce((s, x) => s + asMoneyNumber(x.amount), 0);
   const refundIncome = finance.filter(x => x.type === 'income' && isBusinessRefundEntry(x)).reduce((s, x) => s + asMoneyNumber(x.amount), 0);
@@ -646,16 +681,17 @@ function buildCrmSummary(period = 'today') {
   const expense = businessExpenses.reduce((s, x) => s + asMoneyNumber(x.amount), 0);
   const personalExpense = finance.filter(x => x.type === 'expense' && isPersonalFinanceEntry(x)).reduce((s, x) => s + asMoneyNumber(x.amount), 0);
   const adsExpense = businessExpenses.filter(x => x.category === 'ads').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
-  const paidOrders = orders.filter(isPaidOrder);
-  const returns = orders.filter(isReturnedOrder);
-  const pipelineOrders = orders.filter(isForecastPipelineOrder);
+  const paidOrders = allOrders.filter(o => isPaidOrder(o) && inFinancePeriod(paidFinanceDate(o), period));
+  const returns = allOrders.filter(o => isReturnedOrder(o) && inFinancePeriod(returnFinanceDate(o), period));
+  const pipelineOrders = allOrders.filter(o => isForecastPipelineOrder(o) && inFinancePeriod(pipelineFinanceDate(o), period));
   const confirmedOrders = orders.filter(o => orderStatusForDisplay(o) === 'confirmed' || isOrderActuallyShipped(o) || o.status === 'paid' || o.status === 'completed');
   const paymentTransactions = finance.filter(x => x.type === 'income' && x.category === 'net_order' && x.source === 'monobank');
   const bankPayoutGross = paymentTransactions.reduce((s, x) => s + (asMoneyNumber(x.grossAmount) || asMoneyNumber(x.amount) + asMoneyNumber(x.costAmount)), 0);
   const revenue = paidOrders.reduce((s, order) => s + orderPaidRevenue(order), 0);
   const cost = paidOrders.reduce((s, order) => s + orderPaidCost(order), 0);
   const netOrders = paidOrders.reduce((s, order) => s + orderPaidNet(order), 0);
-  const buyout = buildBuyoutStats(orders, allOrders);
+  const trackedOrders = allOrders.filter(o => orderBelongsToFinancePeriod(o, 'all'));
+  const buyout = buildBuyoutStats(orders, trackedOrders);
   const pendingRevenue = pipelineOrders.reduce((s, o) => s + orderBaseRevenue(o), 0);
   const pendingCost = pipelineOrders.reduce((s, o) => s + orderBaseCost(o), 0);
   const expectedIncome = netOrders + (pendingRevenue - pendingCost) * buyout.buyoutRate;
@@ -687,6 +723,8 @@ function buildCrmSummary(period = 'today') {
   });
   return {
     period,
+    financeStartAt: financeStartAt(),
+    financeResetLabel: readFinanceSettings().resetLabel,
     orders: orders.length,
     newOrders: orders.filter(o => o.status === 'new').length,
     confirmedOrders: confirmedOrders.length,
@@ -731,6 +769,8 @@ function buildCrmSummary(period = 'today') {
     products,
     recentPayments: buildRecentPayments(paidOrders),
     transactions: finance,
+    reviewTransactions,
+    reviewCount: reviewTransactions.length,
   };
 }
 function timestampMs(...values) {
@@ -899,6 +939,8 @@ function addFinanceEntryOnce(entry) {
     bankTransactionId: sanitizeStr(entry.bankTransactionId || '', 120) || null,
     bankDescription: sanitizeStr(entry.bankDescription || '', 240) || null,
     counterName: sanitizeStr(entry.counterName || '', 180) || null,
+    classificationReason: sanitizeStr(entry.classificationReason || '', 120) || null,
+    reviewRequired: entry.reviewRequired === true,
     createdAt: entry.createdAt || new Date().toISOString(),
   };
   finance.push(item);
@@ -979,30 +1021,33 @@ function findOrderForMonoItem(orders, item) {
 function importMonobankStatementItem(item, orders = read(F.orders)) {
   if (!item?.id || item.hold === true || Number(item.currencyCode || 980) !== 980) return { imported: false, ignored: true };
   const text = monoStatementText(item);
+  const createdAt = new Date(Number(item.time || 0) * 1000).toISOString();
+  if (!inFinancePeriod(createdAt, 'all')) return { imported: false, ignored: true, reason: 'before_finance_start' };
   const isNova = monoMatches(text, 'MONOBANK_NP_KEYWORDS', 'нова пошта,nova poshta,novaposhta');
   const isAds = monoMatches(text, 'MONOBANK_ADS_KEYWORDS', 'facebook,meta,instagram,google ads,tiktok,tik tok');
-  if (!isNova && !isAds) return { imported: false, ignored: true };
+  const isBusiness = monoMatches(text, 'MONOBANK_BUSINESS_KEYWORDS', 'постачальник,supplier,упаковка,packaging');
+  const isPersonal = monoMatches(text, 'MONOBANK_PERSONAL_KEYWORDS', 'таврія,таври,rozetka,temu,київстар,kyivstar,farm,medicap,into-sana,jet.ua');
   const bankAmount = asMoneyNumber(item.amount) / 100;
   if (!bankAmount) return { imported: false, ignored: true };
-  const createdAt = new Date(Number(item.time || 0) * 1000).toISOString();
   const match = isNova ? findOrderForMonoItem(orders, item) : { order: null, ttn: '', returnOperation: false };
   const order = match.order;
   const isCancellation = /(скасув|отмен|cancel|refund|reversal|повернен.*кошт)/i.test(text);
+  const isReturnCharge = match.returnOperation || /(повернен.*посил|зворотн.*достав|return delivery|return shipment|возврат.*посыл)/i.test(text);
   let entry = null;
 
-  if (isNova && bankAmount > 0 && isCancellation) {
+  if (isNova && bankAmount > 0 && isCancellation && order) {
     entry = addFinanceEntryOnce({
       type: 'income',
       title: 'Monobank: Nova Poshta charge reversal',
       amount: bankAmount,
-      category: match.returnOperation ? 'return_refund' : 'shipping_refund',
+      category: isReturnCharge ? 'return_refund' : 'shipping_refund',
       source: 'monobank',
       orderId: order?.id || null,
       verifiedBy: 'monobank',
       bankTransactionId: item.id,
       bankDescription: item.description,
       counterName: item.counterName,
-      externalId: financeExternalId('monobank', match.returnOperation ? 'return-refund' : 'shipping-refund', order?.id, item.id),
+      externalId: financeExternalId('monobank', isReturnCharge ? 'return-refund' : 'shipping-refund', order.id, item.id),
       createdAt,
     });
   } else if (isNova && bankAmount > 0 && order) {
@@ -1056,19 +1101,36 @@ function importMonobankStatementItem(item, orders = read(F.orders)) {
       externalId: financeExternalId('monobank', 'unmatched-payout', null, item.id),
       createdAt,
     });
-  } else if (isNova && bankAmount < 0) {
+  } else if (isNova && bankAmount < 0 && order) {
     entry = addFinanceEntryOnce({
       type: 'expense',
-      title: `Monobank: Nova Poshta ${match.returnOperation ? 'return' : 'charge'}`,
+      title: `Monobank: Nova Poshta ${isReturnCharge ? 'return' : 'charge'}`,
       amount: Math.abs(bankAmount),
-      category: match.returnOperation ? 'return' : 'shipping',
+      category: isReturnCharge ? 'return' : 'shipping',
       source: 'monobank',
       orderId: order?.id || null,
       verifiedBy: 'monobank',
       bankTransactionId: item.id,
       bankDescription: item.description,
       counterName: item.counterName,
-      externalId: financeExternalId('monobank', match.returnOperation ? 'return' : 'shipping', order?.id, item.id),
+      externalId: financeExternalId('monobank', isReturnCharge ? 'return' : 'shipping', order.id, item.id),
+      classificationReason: 'linked_order_ttn',
+      createdAt,
+    });
+  } else if (isNova && bankAmount < 0) {
+    entry = addFinanceEntryOnce({
+      type: 'expense',
+      title: 'Monobank: Nova Poshta expense to review',
+      amount: Math.abs(bankAmount),
+      category: 'personal',
+      source: 'monobank',
+      verifiedBy: 'monobank',
+      bankTransactionId: item.id,
+      bankDescription: item.description,
+      counterName: item.counterName,
+      externalId: financeExternalId('monobank', 'np-review', null, item.id),
+      classificationReason: 'nova_poshta_without_linked_order',
+      reviewRequired: true,
       createdAt,
     });
   } else if (isAds && bankAmount < 0) {
@@ -1083,6 +1145,69 @@ function importMonobankStatementItem(item, orders = read(F.orders)) {
       bankDescription: item.description,
       counterName: item.counterName,
       externalId: financeExternalId('monobank', 'ads', null, item.id),
+      classificationReason: 'ads_keyword',
+      createdAt,
+    });
+  } else if (isAds && bankAmount > 0 && isCancellation) {
+    entry = addFinanceEntryOnce({
+      type: 'income',
+      title: 'Monobank: advertising charge reversal',
+      amount: bankAmount,
+      category: 'ads_refund',
+      source: 'monobank',
+      verifiedBy: 'monobank',
+      bankTransactionId: item.id,
+      bankDescription: item.description,
+      counterName: item.counterName,
+      externalId: financeExternalId('monobank', 'ads-refund', null, item.id),
+      classificationReason: 'ads_refund_keyword',
+      createdAt,
+    });
+  } else if (isBusiness && bankAmount < 0) {
+    entry = addFinanceEntryOnce({
+      type: 'expense',
+      title: 'Monobank: business expense',
+      amount: Math.abs(bankAmount),
+      category: 'business',
+      source: 'monobank',
+      verifiedBy: 'monobank',
+      bankTransactionId: item.id,
+      bankDescription: item.description,
+      counterName: item.counterName,
+      externalId: financeExternalId('monobank', 'business', null, item.id),
+      classificationReason: 'business_keyword',
+      createdAt,
+    });
+  } else if (bankAmount < 0) {
+    entry = addFinanceEntryOnce({
+      type: 'expense',
+      title: 'Monobank: personal or unclassified expense',
+      amount: Math.abs(bankAmount),
+      category: 'personal',
+      source: 'monobank',
+      verifiedBy: 'monobank',
+      bankTransactionId: item.id,
+      bankDescription: item.description,
+      counterName: item.counterName,
+      externalId: financeExternalId('monobank', 'personal', null, item.id),
+      classificationReason: isPersonal ? 'personal_keyword' : 'safe_default_not_business',
+      reviewRequired: !isPersonal,
+      createdAt,
+    });
+  } else if (bankAmount > 0) {
+    entry = addFinanceEntryOnce({
+      type: 'unmatched',
+      title: 'Monobank: income to review',
+      amount: bankAmount,
+      category: 'income_review',
+      source: 'monobank',
+      verifiedBy: 'monobank',
+      bankTransactionId: item.id,
+      bankDescription: item.description,
+      counterName: item.counterName,
+      externalId: financeExternalId('monobank', 'income-review', null, item.id),
+      classificationReason: 'unmatched_income',
+      reviewRequired: true,
       createdAt,
     });
   }
@@ -1956,6 +2081,11 @@ if (npConfig.autoSync && npConfig.apiConfigured) {
 const monoConfig = monobank.configStatus();
 if (monoConfig.configured && process.env.MONOBANK_AUTO_SYNC !== 'false') {
   const monoIntervalMs = Math.max(2, Number(process.env.MONOBANK_SYNC_INTERVAL_MINUTES || 5)) * 60 * 1000;
+  syncMonobankFinance(3)
+    .then(result => {
+      if (result.imported) console.log('[Monobank initial sync]', result);
+    })
+    .catch(error => console.error('[Monobank initial sync]', error.message));
   setInterval(() => {
     syncMonobankFinance(3)
       .then(result => {
@@ -2054,6 +2184,28 @@ app.delete('/api/admin/finance/:id', authBot, (req, res) => {
   arr[idx] = { ...arr[idx], excludedAt: new Date().toISOString(), excludedReason: 'manager_deleted' };
   write(F.finance, arr);
   res.json({ success: true, deleted: arr[idx] });
+});
+app.patch('/api/admin/finance/:id/classify', authBot, (req, res) => {
+  const id = Number(req.params.id);
+  const category = sanitizeStr(req.body?.category, 60);
+  const allowed = ['personal', 'ads', 'shipping', 'return', 'business', 'business_income', 'ignored_income'];
+  if (!allowed.includes(category)) return res.status(400).json({ error: 'Invalid finance category' });
+  const arr = read(F.finance);
+  const idx = arr.findIndex(entry => Number(entry.id) === id);
+  if (idx < 0) return res.status(404).json({ error: 'Finance operation not found' });
+  const wasIncoming = arr[idx].type === 'income' || arr[idx].type === 'unmatched';
+  const incomingCategory = ['business_income', 'ignored_income'].includes(category);
+  if (wasIncoming !== incomingCategory) return res.status(400).json({ error: 'Category does not match operation direction' });
+  arr[idx] = {
+    ...arr[idx],
+    type: category === 'business_income' ? 'income' : category === 'ignored_income' ? 'unmatched' : 'expense',
+    category,
+    reviewRequired: false,
+    classifiedAt: new Date().toISOString(),
+    classifiedBy: 'manager',
+  };
+  write(F.finance, arr);
+  res.json(arr[idx]);
 });
 app.get('/api/admin/finance/summary', authBot, (req, res) => {
   res.json(buildCrmSummary(sanitizeStr(req.query.period || 'today', 20)));
@@ -2345,12 +2497,13 @@ app.get('/api/admin/backup', authBot, (_req, res) => {
     support: read(F.support),
     analytics: read(F.analytics),
     finance: read(F.finance),
+    financeSettings: readFinanceSettings(),
     crmProducts: readCrmProducts(),
     npAfterpayments: read(F.npAfterpayments),
   });
 });
 app.post('/api/admin/backup/restore', authBot, (req, res) => {
-  const { orders, reviews, support, analytics, finance, crmProducts, npAfterpayments } = req.body || {};
+  const { orders, reviews, support, analytics, finance, financeSettings, crmProducts, npAfterpayments } = req.body || {};
   const restored = {};
   if (Array.isArray(orders)) {
     write(F.orders, orders);
@@ -2371,6 +2524,17 @@ app.post('/api/admin/backup/restore', authBot, (req, res) => {
   if (Array.isArray(finance)) {
     write(F.finance, finance);
     restored.finance = finance.length;
+  }
+  if (financeSettings && !Array.isArray(financeSettings) && typeof financeSettings === 'object') {
+    write(F.financeSettings, {
+      startAt: financeSettings.startAt || DEFAULT_FINANCE_START_AT,
+      timezone: financeSettings.timezone || 'Europe/Kyiv',
+      resetLabel: financeSettings.resetLabel || '26.05.2026',
+      resetKey: financeSettings.resetKey || DEFAULT_FINANCE_RESET_KEY,
+      appliedResetKey: financeSettings.appliedResetKey || null,
+      resetAppliedAt: financeSettings.resetAppliedAt || null,
+    });
+    restored.financeSettings = true;
   }
   if (Array.isArray(crmProducts)) {
     write(F.crmProducts, crmProducts);

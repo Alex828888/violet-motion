@@ -38,7 +38,6 @@ const pendingDelivery = {};
 const pendingTtn     = {};
 const pendingNpSender = {};
 const pendingProductCost = {};
-const pendingFinanceExpense = {};
 const pendingCb      = new Set();
 
 /* ── HTTP helpers ─────────────────────────────────────────── */
@@ -215,7 +214,8 @@ function ratePct(value) {
 }
 function money(value) {
   const amount = Number(value || 0);
-  return `${Math.round(amount).toLocaleString('uk-UA')} грн`;
+  const hasCents = Math.round(amount * 100) % 100 !== 0;
+  return `${amount.toLocaleString('uk-UA', { minimumFractionDigits: hasCents ? 2 : 0, maximumFractionDigits: 2 })} грн`;
 }
 function waitTime(value) {
   const ms = Number(value || 0);
@@ -993,22 +993,13 @@ function crmMenuKb(period = 'today') {
         { text: `${period === 'all' ? '• ' : ''}∞ Увесь час`, callback_data: 'crm_period_all' },
       ],
       [
-        { text: '🏷 Собівартість моделей', callback_data: 'crm_products' },
-        { text: '🧾 Рух коштів', callback_data: `crm_tx_${period}_1` },
+        { text: '🧾 Операції', callback_data: `crm_tx_${period}_1` },
+        { text: '⚠️ Перевірити', callback_data: `crm_review_${period}_1` },
       ],
       [
-        { text: '💵 Післяплати НП', callback_data: `crm_np_cash_${period}` },
-        { text: '🔄 Оновити НП', callback_data: `crm_np_cash_sync_${period}` },
+        { text: '🏷 Собівартість', callback_data: 'crm_products' },
+        { text: '🔄 Оновити', callback_data: `crm_period_${period}` },
       ],
-      [
-        { text: '➕ Бізнес-витрата', callback_data: `crm_add_business_${period}` },
-        { text: '👤 Особиста витрата', callback_data: `crm_add_personal_${period}` },
-      ],
-      [
-        { text: '🏦 Синхр. monobank', callback_data: `crm_mono_sync_${period}` },
-        { text: '🔔 Monobank live', callback_data: `crm_mono_hook_${period}` },
-      ],
-      [{ text: '🔄 Оновити', callback_data: `crm_period_${period}` }],
       [{ text: '← CRM', callback_data: 'crm_menu' }],
     ],
   };
@@ -1032,55 +1023,35 @@ async function showCrmReport(chatId, period = 'today', msgId = null) {
     return reply(chatId, '❌ CRM-звіт зараз недоступний.', crmMenuKb(period), msgId);
   }
 
-  const payments = Array.isArray(data.recentPayments) ? data.recentPayments : [];
-  const products = Array.isArray(data.products) ? data.products : [];
-  const paymentLines = payments.length
-    ? payments.map(item => `#${esc(item.id)} ${esc(item.product)}: <b>+${money(item.revenue)}</b> −${money(item.cost)} = <b>${money(item.net)}</b>`).join('\n')
-    : 'Ще немає викуплених замовлень за період.';
-  const additionalIncomeLine = Number(data.manualIncome || 0) > 0
-    ? `➕ Інші зараховані надходження: <b>+${money(data.manualIncome)}</b>\n`
-    : '';
   const refundLine = Number(data.refundIncome || 0) > 0
     ? `↩️ Повернення списань: <b>+${money(data.refundIncome)}</b>\n`
     : '';
-  const unclassifiedIncomeLine = Number(data.unclassifiedIncome || 0) > 0
-    ? `⚠️ Не класифіковані старі надходження: <b>+${money(data.unclassifiedIncome)}</b> (не в прибутку)\n`
+  const businessIncomeLine = Number(data.manualIncome || 0) > 0
+    ? `➕ Інші бізнес-надходження: <b>+${money(data.manualIncome)}</b>\n`
     : '';
   const afterpayments = data.afterpayments || {};
-  const productLines = products.length
-    ? products.map(item => `${esc(item.label)}: викуп ${item.paidOrders}/${item.orders}, маржа <b>${money(item.net)}</b>, витрати замовл. −${money(item.linkedExpense)}, разом <b>${money(item.profitAfterLinkedExpenses)}</b>, прогноз <b>${money(item.forecastNet)}</b>, повернення ${ratePct(item.returnRate)}`).join('\n')
-    : 'Замовлень за період ще немає.';
+  const reviewLine = Number(data.reviewCount || 0) > 0
+    ? `⚠️ Потрібно перевірити: <b>${data.reviewCount}</b> операц.\n`
+    : `✅ Неперевірених операцій немає\n`;
 
   const text =
     `💼 <b>CRM Violet Motion — ${CRM_PERIOD_LABELS[period] || period}</b>\n━━━━━━━━━━━━━━━\n` +
-    `📦 Замовлення: <b>${data.orders || 0}</b>  ✅ ${data.paidOrders || 0} викуп  ↩️ ${data.returns || 0} поверн.\n` +
-    `🚚 У прогнозі: <b>${data.pipelineOrders || 0}</b> підтверджених/у дорозі\n\n` +
-    `<b>Факт</b>\n` +
-    `📦 Виручка з викупів НП: <b>+${money(data.revenue)}</b>\n` +
+    `Облік з: <b>${esc(data.financeResetLabel || '26.05.2026')}</b>\n\n` +
+    `<b>Бізнес</b>\n` +
+    `✅ Викуплено: <b>${data.paidOrders || 0}</b> · виручка <b>+${money(data.revenue)}</b>\n` +
     `🏷 Собівартість: <b>−${money(data.cost)}</b>\n` +
-    `💵 Маржа викупів: <b>+${money(data.netOrders)}</b>\n` +
-    `🧾 Підтверджені витрати: <b>−${money(data.expense)}</b>\n` +
-    `   🏦 monobank: −${money(data.monobankExpense)}  ✍️ внесено вручну: −${money(data.recordedExpense)}\n` +
-    `   🚚 доставка: −${money(data.shippingExpense)}  ↩️ повернення: −${money(data.returnsExpense)}\n` +
-    `   📣 реклама: −${money(data.adsExpense)}  • інше: −${money(data.otherExpense)}\n` +
+    `📣 Реклама: <b>−${money(data.adsExpense)}</b>\n` +
+    `🚚 Нова Пошта: <b>−${money(Number(data.shippingExpense || 0) + Number(data.returnsExpense || 0))}</b>\n` +
+    `🧾 Інші бізнес-витрати: <b>−${money(data.otherExpense)}</b>\n` +
     refundLine +
-    additionalIncomeLine +
-    unclassifiedIncomeLine +
-    `✅ Прибуток факт: <b>${money(data.profit)}</b>\n` +
-    `   Формула: ${money(data.netOrders)} + ${money(data.manualIncome)} + ${money(data.refundIncome)} − ${money(data.expense)} = <b>${money(data.profit)}</b>\n` +
-    `👤 Особисті витрати (не у прибутку): <b>−${money(data.personalExpense)}</b>\n\n` +
-    `<b>Післяплати НП</b>\n` +
-    `💵 Готівкою/до звірки: <b>${money(afterpayments.cashAmount || afterpayments.amount)}</b> (${afterpayments.records || 0})\n` +
-    `Це гроші за викуплені замовлення, а не додатковий дохід поверх продажу.\n\n` +
-    `<b>Звірка monobank</b>\n` +
-    `🏦 Надходження НП, знайдені на картці: <b>+${money(data.bankPayoutGross)}</b> (${data.bankMatchedPayouts || 0})\n` +
-    `Ця звірка не обнуляє викупи, підтверджені Новою Поштою.\n\n` +
-    `<b>Прогноз</b>\n` +
-    `📈 Очікуваний прибуток: <b>${money(data.forecastProfit)}</b>\n` +
-    `📦 Прогноз грошей: <b>${money(data.forecastRevenue)}</b>\n` +
-    `🎯 Викуп: <b>${ratePct(data.buyoutRate)}</b>  ↩️ Повернення: <b>${ratePct(data.returnRate)}</b>\n\n` +
-    `<b>Останні викуплені замовлення</b>\n${paymentLines}\n\n` +
-    `<b>Моделі</b>\n${productLines}`;
+    businessIncomeLine +
+    `💰 Прибуток: <b>${money(data.profit)}</b>\n` +
+    `   ${money(data.netOrders)} + ${money(data.manualIncome)} + ${money(data.refundIncome)} − ${money(data.expense)} = ${money(data.profit)}\n\n` +
+    `<b>Гроші та контроль</b>\n` +
+    `💵 Післяплати в актуальних ТТН: <b>${money(afterpayments.cashAmount || afterpayments.amount)}</b>\n` +
+    `👤 Особисті витрати: <b>−${money(data.personalExpense)}</b> (не в прибутку)\n` +
+    reviewLine +
+    `\n<i>Продажі — за статусом викупу НП. Витрати — з monobank. Невідомі списання не входять у бізнес без підтвердження.</i>`;
 
   reply(chatId, text, crmMenuKb(period), msgId);
 }
@@ -1096,8 +1067,11 @@ function financeCategoryLabel(category) {
     ads_refund: 'Повернення реклами',
     business_refund: 'Повернення бізнес-витрати',
     manual_business: 'Бізнес-витрата',
+    business: 'Інша бізнес-витрата',
     personal: 'Особиста витрата',
     business_income: 'Бізнес-надходження',
+    income_review: 'Надходження на перевірку',
+    ignored_income: 'Не враховується',
     order: 'Витрата по замовленню',
     manual: 'Ручна операція',
     np_payout_unmatched: 'НП: надходження без замовлення',
@@ -1106,9 +1080,6 @@ function financeCategoryLabel(category) {
 
 function crmTransactionsKb(period, page, total, items = []) {
   const rows = [];
-  items.filter(item => item.type === 'expense' && Number.isFinite(Number(item.id))).forEach(item => {
-    rows.push([{ text: `🗑 Видалити витрату −${money(item.amount)}`, callback_data: `crm_tx_del_${item.id}_${period}_${page}` }]);
-  });
   const nav = [];
   if (page > 1) nav.push({ text: '← Назад', callback_data: `crm_tx_${period}_${page - 1}` });
   nav.push({ text: `${page}/${total}`, callback_data: 'noop' });
@@ -1156,6 +1127,65 @@ async function showCrmTransactions(chatId, period = 'today', page = 1, msgId = n
     });
   }
   return reply(chatId, text, crmTransactionsKb(period, current, total, items), msgId);
+}
+
+function crmReviewKb(period, page, total, items = []) {
+  const rows = items.map(item => [{
+    text: `⚠️ ${item.type === 'expense' ? '−' : '+'}${money(item.amount)} ${item.bankDescription || item.title || ''}`.slice(0, 58),
+    callback_data: `crm_review_item_${item.id}_${period}_${page}`,
+  }]);
+  const nav = [];
+  if (page > 1) nav.push({ text: '← Назад', callback_data: `crm_review_${period}_${page - 1}` });
+  nav.push({ text: `${page}/${total}`, callback_data: 'noop' });
+  if (page < total) nav.push({ text: 'Далі →', callback_data: `crm_review_${period}_${page + 1}` });
+  rows.push(nav);
+  rows.push([{ text: '← Фінанси', callback_data: `crm_period_${period}` }]);
+  return { inline_keyboard: rows };
+}
+
+async function showCrmReview(chatId, period = 'today', page = 1, msgId = null) {
+  const data = await serverGet(`/api/admin/crm/summary?period=${encodeURIComponent(period)}`);
+  if (!data || data.error) return reply(chatId, '❌ Перевірка операцій зараз недоступна.', crmMenuKb(period), msgId);
+  const records = Array.isArray(data.reviewTransactions) ? data.reviewTransactions : [];
+  const pageSize = 6;
+  const total = Math.ceil(records.length / pageSize) || 1;
+  const current = Math.max(1, Math.min(Number(page) || 1, total));
+  const items = records.slice((current - 1) * pageSize, current * pageSize);
+  let text = `⚠️ <b>Потрібно перевірити — ${CRM_PERIOD_LABELS[period] || period}</b>\n━━━━━━━━━━━━━━━\n`;
+  if (!items.length) {
+    text += '\n✅ Неперевірених операцій немає.';
+  } else {
+    text += '\nЦі операції не впливають на прибуток бізнесу, доки ви не підтвердите категорію.\n';
+    items.forEach(item => {
+      const sign = item.type === 'expense' ? '−' : '+';
+      text += `\n${sign}<b>${money(item.amount)}</b> · ${esc(item.bankDescription || item.title || 'Операція')}\n   ${fmtDate(item.createdAt)}\n`;
+    });
+  }
+  return reply(chatId, text, crmReviewKb(period, current, total, items), msgId);
+}
+
+async function showCrmReviewItem(chatId, id, period = 'today', page = 1, msgId = null) {
+  const data = await serverGet(`/api/admin/crm/summary?period=${encodeURIComponent(period)}`);
+  const item = Array.isArray(data?.reviewTransactions) ? data.reviewTransactions.find(entry => Number(entry.id) === Number(id)) : null;
+  if (!item) return showCrmReview(chatId, period, page, msgId);
+  const incoming = item.type === 'unmatched' || item.type === 'income';
+  const rows = incoming
+    ? [[{ text: '✅ Бізнес-надходження', callback_data: `crm_class_${id}_business_income_${period}_${page}` }],
+       [{ text: '🚫 Не враховувати', callback_data: `crm_class_${id}_ignored_income_${period}_${page}` }]]
+    : [[{ text: '👤 Особисте', callback_data: `crm_class_${id}_personal_${period}_${page}` },
+        { text: '📣 Реклама', callback_data: `crm_class_${id}_ads_${period}_${page}` }],
+       [{ text: '🚚 Доставка НП', callback_data: `crm_class_${id}_shipping_${period}_${page}` },
+        { text: '↩️ Повернення', callback_data: `crm_class_${id}_return_${period}_${page}` }],
+       [{ text: '🧾 Інший бізнес', callback_data: `crm_class_${id}_business_${period}_${page}` }]];
+  rows.push([{ text: '← До перевірки', callback_data: `crm_review_${period}_${page}` }]);
+  const sign = incoming ? '+' : '−';
+  const text =
+    `⚠️ <b>Класифікувати операцію</b>\n━━━━━━━━━━━━━━━\n` +
+    `${sign}<b>${money(item.amount)}</b>\n` +
+    `${esc(item.bankDescription || item.title || 'Операція')}\n` +
+    `${fmtDate(item.createdAt)}\n\n` +
+    `Оберіть, що це за операція:`;
+  return reply(chatId, text, { inline_keyboard: rows }, msgId);
 }
 
 async function showNpAfterpayments(chatId, period = 'today', msgId = null) {
@@ -1600,38 +1630,6 @@ bot.on('message', async msg => {
     return;
   }
 
-  if (pendingFinanceExpense[chatId]) {
-    const pending = pendingFinanceExpense[chatId];
-    if (text === '-' || text.toLowerCase() === 'cancel') {
-      delete pendingFinanceExpense[chatId];
-      await showCrmReport(chatId, pending.period || 'today');
-      return;
-    }
-    const match = text.match(/^(\d+(?:[.,]\d{1,2})?)\s+(.+)$/);
-    if (!match) {
-      await bot.sendMessage(chatId, '❌ Надішліть суму і назву одним повідомленням, наприклад: <code>300 Київстар</code>. Для скасування надішліть "-".', { parse_mode: 'HTML', reply_markup: MAIN_KB });
-      return;
-    }
-    const amount = Number(match[1].replace(',', '.'));
-    const title = match[2].trim();
-    const result = await serverPost('/api/admin/finance', {
-      type: 'expense',
-      amount,
-      title,
-      category: pending.category,
-      source: 'manual',
-    });
-    if (!result || result.error) {
-      await bot.sendMessage(chatId, '❌ Не вдалося зберегти витрату.', { reply_markup: MAIN_KB });
-      return;
-    }
-    delete pendingFinanceExpense[chatId];
-    const label = pending.category === 'personal' ? 'Особисту витрату' : 'Бізнес-витрату';
-    await bot.sendMessage(chatId, `✅ ${label} збережено: <b>−${money(amount)}</b> · ${esc(title)}`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
-    await showCrmReport(chatId, pending.period || 'today');
-    return;
-  }
-
   if (pendingTtn[chatId]) {
     const id = pendingTtn[chatId];
     delete pendingTtn[chatId];
@@ -1734,79 +1732,33 @@ bot.on('callback_query', async q => {
       return;
     }
 
-    if (data.startsWith('crm_np_cash_sync_')) {
-      const period = data.slice('crm_np_cash_sync_'.length);
-      const result = await serverPost('/api/admin/np/afterpayments/sync', { period, limit: 100 });
+    if (data.startsWith('crm_review_item_')) {
+      const match = data.match(/^crm_review_item_(\d+)_(today|week|month|all)_(\d+)$/);
+      if (match) await showCrmReviewItem(chatId, Number(match[1]), match[2], Number(match[3]) || 1, msgId);
+      return;
+    }
+
+    if (data.startsWith('crm_review_')) {
+      const match = data.match(/^crm_review_(today|week|month|all)_(\d+)$/);
+      if (match) await showCrmReview(chatId, match[1], Number(match[2]) || 1, msgId);
+      return;
+    }
+
+    if (data.startsWith('crm_class_')) {
+      const match = data.match(/^crm_class_(\d+)_(business_income|ignored_income|personal|ads|shipping|return|business)_(today|week|month|all)_(\d+)$/);
+      if (!match) return;
+      const result = await serverPatch(`/api/admin/finance/${encodeURIComponent(match[1])}/classify`, { category: match[2] });
       if (!result || result.error) {
-        await reply(chatId, `❌ Нову Пошту не оновлено: ${esc(result?.error || 'перевірте API НП')}`, crmMenuKb(period), msgId);
+        await reply(chatId, `❌ Не вдалося класифікувати операцію: ${esc(result?.error || 'помилка')}`, crmMenuKb(match[3]), msgId);
         return;
       }
-      await showNpAfterpayments(chatId, period, msgId);
-      return;
-    }
-
-    if (data.startsWith('crm_np_cash_')) {
-      const period = data.slice('crm_np_cash_'.length);
-      await showNpAfterpayments(chatId, ['today', 'week', 'month', 'all'].includes(period) ? period : 'today', msgId);
-      return;
-    }
-
-    if (data.startsWith('crm_add_business_') || data.startsWith('crm_add_personal_')) {
-      const personal = data.startsWith('crm_add_personal_');
-      const period = data.slice((personal ? 'crm_add_personal_' : 'crm_add_business_').length);
-      pendingFinanceExpense[chatId] = { category: personal ? 'personal' : 'manual_business', period };
-      await bot.sendMessage(chatId,
-        `${personal ? '👤' : '➕'} <b>${personal ? 'Особиста' : 'Бізнес'} витрата</b>\n\nНадішліть суму і назву одним повідомленням:\n<code>300 Київстар</code>\n\nДля скасування надішліть "-".`,
-        { parse_mode: 'HTML', reply_markup: MAIN_KB });
+      await showCrmReview(chatId, match[3], Number(match[4]) || 1, msgId);
       return;
     }
 
     if (data.startsWith('crm_tx_')) {
-      if (data.startsWith('crm_tx_del_')) {
-        const [, , , idStr, period, pageStr] = data.split('_');
-        await reply(chatId,
-          `🗑 <b>Видалити цю витрату?</b>\n\nПісля підтвердження вона більше не буде враховуватись у фінансах.`,
-          { inline_keyboard: [
-            [{ text: '🗑 Так, видалити витрату', callback_data: `crm_tx_delok_${idStr}_${period}_${pageStr}` }],
-            [{ text: '← Скасувати', callback_data: `crm_tx_${period}_${pageStr}` }],
-          ] },
-          msgId);
-        return;
-      }
-      if (data.startsWith('crm_tx_delok_')) {
-        const [, , , idStr, period, pageStr] = data.split('_');
-        const result = await serverDelete(`/api/admin/finance/${encodeURIComponent(idStr)}`);
-        if (!result || result.error) {
-          await reply(chatId, '❌ Не вдалося видалити витрату.', crmMenuKb(period), msgId);
-          return;
-        }
-        await showCrmTransactions(chatId, period, Number(pageStr) || 1, msgId);
-        return;
-      }
       const [, , period, pageStr] = data.split('_');
       await showCrmTransactions(chatId, ['today', 'week', 'month', 'all'].includes(period) ? period : 'today', Number(pageStr) || 1, msgId);
-      return;
-    }
-
-    if (data.startsWith('crm_mono_sync_')) {
-      const period = data.slice('crm_mono_sync_'.length);
-      const result = await serverPost('/api/admin/monobank/sync', { daysBack: period === 'all' || period === 'month' ? 31 : period === 'week' ? 7 : 3 });
-      if (!result || result.error) {
-        await reply(chatId, `❌ Monobank не синхронізовано: ${esc(result?.error || 'перевірте токен у Render')}`, crmMenuKb(period), msgId);
-        return;
-      }
-      await showCrmTransactions(chatId, period, 1, msgId);
-      return;
-    }
-
-    if (data.startsWith('crm_mono_hook_')) {
-      const period = data.slice('crm_mono_hook_'.length);
-      const result = await serverPost('/api/admin/monobank/webhook/setup', {});
-      if (!result || result.error) {
-        await reply(chatId, `❌ Live monobank не підключено: ${esc(result?.error || 'перевірте настройки Render')}`, crmMenuKb(period), msgId);
-        return;
-      }
-      await reply(chatId, '✅ Live monobank підключено. Нові потрібні операції будуть надходити автоматично.', crmMenuKb(period), msgId);
       return;
     }
 
