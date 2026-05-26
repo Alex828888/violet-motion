@@ -39,7 +39,6 @@ const pendingTtn     = {};
 const pendingNpSender = {};
 const pendingProductCost = {};
 const pendingCb      = new Set();
-const activePanelMessages = {};
 
 /* ── HTTP helpers ─────────────────────────────────────────── */
 const FETCH_TIMEOUT = 12000;
@@ -87,7 +86,6 @@ const DIALOG_KB = {
   resize_keyboard: true,
   persistent: true,
 };
-const MAIN_MENU_COMMANDS = new Set(MAIN_KB.keyboard.flat());
 
 /* ── Formatting helpers ───────────────────────────────────── */
 function stars(n)     { return '★'.repeat(n) + '☆'.repeat(5 - n); }
@@ -248,22 +246,11 @@ function paginate(arr, p) {
 /* ── Send/edit helper ─────────────────────────────────────── */
 async function reply(chatId, text, keyboard, msgId = null) {
   const opts = { parse_mode: 'HTML', reply_markup: keyboard };
-  const editId = msgId || activePanelMessages[chatId];
-  if (editId) {
-    try {
-      await bot.editMessageText(text, { chat_id: chatId, message_id: editId, ...opts });
-      activePanelMessages[chatId] = editId;
-      return;
-    }
-    catch (error) {
-      if (/message is not modified/i.test(String(error?.message || ''))) {
-        activePanelMessages[chatId] = editId;
-        return;
-      }
-    }
+  if (msgId) {
+    try { await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, ...opts }); return; }
+    catch {}
   }
-  const sent = await bot.sendMessage(chatId, text, opts);
-  if (sent?.message_id) activePanelMessages[chatId] = sent.message_id;
+  await bot.sendMessage(chatId, text, opts);
 }
 
 async function ack(id, text = '') {
@@ -1008,6 +995,10 @@ function crmMenuKb(period = 'today') {
         { text: '🏷 Собівартість моделей', callback_data: 'crm_products' },
         { text: '🧾 Рух коштів', callback_data: `crm_tx_${period}_1` },
       ],
+      [
+        { text: '🏦 Синхр. monobank', callback_data: `crm_mono_sync_${period}` },
+        { text: '🔔 Monobank live', callback_data: `crm_mono_hook_${period}` },
+      ],
       [{ text: '🔄 Оновити', callback_data: `crm_period_${period}` }],
       [{ text: '← CRM', callback_data: 'crm_menu' }],
     ],
@@ -1046,15 +1037,15 @@ async function showCrmReport(chatId, period = 'today', msgId = null) {
     `📦 Замовлення: <b>${data.orders || 0}</b>  ✅ ${data.paidOrders || 0} викуп  ↩️ ${data.returns || 0} поверн.\n` +
     `🚚 У прогнозі: <b>${data.pipelineOrders || 0}</b> підтверджених/у дорозі\n\n` +
     `<b>Факт</b>\n` +
-    `💰 Додано з викупів: <b>+${money(data.revenue)}</b>\n` +
+    `💰 Зараховано на картку: <b>+${money(data.revenue)}</b>\n` +
     `🏷 Собівартість: <b>−${money(data.cost)}</b>\n` +
-    `🧾 Інші витрати: <b>−${money(data.expense)}</b>\n` +
+    `🧾 Підтверджені витрати: <b>−${money(data.expense)}</b>\n` +
     `✅ Прибуток факт: <b>${money(data.profit)}</b>\n\n` +
     `<b>Прогноз</b>\n` +
     `📈 Очікуваний прибуток: <b>${money(data.forecastProfit)}</b>\n` +
     `📦 Прогноз грошей: <b>${money(data.forecastRevenue)}</b>\n` +
     `🎯 Викуп: <b>${ratePct(data.buyoutRate)}</b>  ↩️ Повернення: <b>${ratePct(data.returnRate)}</b>\n\n` +
-    `<b>Останні зарахування</b>\n${paymentLines}\n\n` +
+    `<b>Останні зарахування з monobank</b>\n${paymentLines}\n\n` +
     `<b>Моделі</b>\n${productLines}`;
 
   reply(chatId, text, crmMenuKb(period), msgId);
@@ -1068,11 +1059,15 @@ function financeCategoryLabel(category) {
     ads: 'Реклама',
     order: 'Витрата по замовленню',
     manual: 'Ручна операція',
+    np_payout_unmatched: 'НП: надходження без замовлення',
   })[category] || category || 'Операція';
 }
 
-function crmTransactionsKb(period, page, total) {
+function crmTransactionsKb(period, page, total, items = []) {
   const rows = [];
+  items.filter(item => item.type === 'expense' && Number.isFinite(Number(item.id))).forEach(item => {
+    rows.push([{ text: `🗑 Видалити витрату −${money(item.amount)}`, callback_data: `crm_tx_del_${item.id}_${period}_${page}` }]);
+  });
   const nav = [];
   if (page > 1) nav.push({ text: '← Назад', callback_data: `crm_tx_${period}_${page - 1}` });
   nav.push({ text: `${page}/${total}`, callback_data: 'noop' });
@@ -1096,15 +1091,19 @@ async function showCrmTransactions(chatId, period = 'today', page = 1, msgId = n
   } else {
     items.forEach(item => {
       const incoming = item.type === 'income';
+      const unmatched = item.type === 'unmatched';
       const amount = incoming ? `+${money(item.amount)}` : `−${money(item.amount)}`;
       const order = item.linkedOrder;
       if (incoming && item.grossAmount) {
         text += `\n✅ <b>${esc(financeCategoryLabel(item.category))}</b>\n`;
         text += `   +${money(item.grossAmount)} − ${money(item.costAmount)} = <b>${money(item.amount)}</b>\n`;
+      } else if (unmatched) {
+        text += `\n⚠️ <b>+${money(item.amount)}</b> · ${esc(financeCategoryLabel(item.category))}\n`;
       } else {
         text += `\n${incoming ? '✅' : '➖'} <b>${amount}</b> · ${esc(financeCategoryLabel(item.category))}\n`;
       }
       text += `   ${esc(item.title || 'Операція')}\n`;
+      if (item.bankDescription) text += `   Monobank: ${esc(item.bankDescription)}\n`;
       if (order?.id) {
         text += `   Замовлення #${esc(order.id)} · ${esc(order.product || '—')}`;
         if (order.size) text += ` · р.${esc(order.size)}`;
@@ -1115,7 +1114,7 @@ async function showCrmTransactions(chatId, period = 'today', page = 1, msgId = n
       text += `   ${fmtDate(item.createdAt)}\n`;
     });
   }
-  return reply(chatId, text, crmTransactionsKb(period, current, total), msgId);
+  return reply(chatId, text, crmTransactionsKb(period, current, total, items), msgId);
 }
 
 async function showCrmProducts(chatId, msgId = null) {
@@ -1570,10 +1569,6 @@ bot.on('message', async msg => {
     return;
   }
 
-  if (MAIN_MENU_COMMANDS.has(text)) {
-    try { await bot.deleteMessage(chatId, msg.message_id); } catch {}
-  }
-
   switch (text) {
     case '📦 Замовлення':  showOrders(chatId);       break;
     case '🚚 Відстеження': showTrackingMenu(chatId); break;
@@ -1644,8 +1639,51 @@ bot.on('callback_query', async q => {
     }
 
     if (data.startsWith('crm_tx_')) {
+      if (data.startsWith('crm_tx_del_')) {
+        const [, , , idStr, period, pageStr] = data.split('_');
+        await reply(chatId,
+          `🗑 <b>Видалити цю витрату?</b>\n\nПісля підтвердження вона більше не буде враховуватись у фінансах.`,
+          { inline_keyboard: [
+            [{ text: '🗑 Так, видалити витрату', callback_data: `crm_tx_delok_${idStr}_${period}_${pageStr}` }],
+            [{ text: '← Скасувати', callback_data: `crm_tx_${period}_${pageStr}` }],
+          ] },
+          msgId);
+        return;
+      }
+      if (data.startsWith('crm_tx_delok_')) {
+        const [, , , idStr, period, pageStr] = data.split('_');
+        const result = await serverDelete(`/api/admin/finance/${encodeURIComponent(idStr)}`);
+        if (!result || result.error) {
+          await reply(chatId, '❌ Не вдалося видалити витрату.', crmMenuKb(period), msgId);
+          return;
+        }
+        await showCrmTransactions(chatId, period, Number(pageStr) || 1, msgId);
+        return;
+      }
       const [, , period, pageStr] = data.split('_');
       await showCrmTransactions(chatId, ['today', 'week', 'month', 'all'].includes(period) ? period : 'today', Number(pageStr) || 1, msgId);
+      return;
+    }
+
+    if (data.startsWith('crm_mono_sync_')) {
+      const period = data.slice('crm_mono_sync_'.length);
+      const result = await serverPost('/api/admin/monobank/sync', { daysBack: period === 'month' ? 31 : period === 'week' ? 7 : 3 });
+      if (!result || result.error) {
+        await reply(chatId, `❌ Monobank не синхронізовано: ${esc(result?.error || 'перевірте токен у Render')}`, crmMenuKb(period), msgId);
+        return;
+      }
+      await showCrmTransactions(chatId, period, 1, msgId);
+      return;
+    }
+
+    if (data.startsWith('crm_mono_hook_')) {
+      const period = data.slice('crm_mono_hook_'.length);
+      const result = await serverPost('/api/admin/monobank/webhook/setup', {});
+      if (!result || result.error) {
+        await reply(chatId, `❌ Live monobank не підключено: ${esc(result?.error || 'перевірте настройки Render')}`, crmMenuKb(period), msgId);
+        return;
+      }
+      await reply(chatId, '✅ Live monobank підключено. Нові потрібні операції будуть надходити автоматично.', crmMenuKb(period), msgId);
       return;
     }
 

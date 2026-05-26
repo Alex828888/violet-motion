@@ -18,6 +18,7 @@ const path    = require('path');
 const cors    = require('cors');
 const crypto  = require('crypto');
 const novaPoshta = require('./nova-poshta');
+const monobank = require('./monobank');
 
 const app        = express();
 const PORT       = process.env.PORT       || 3000;
@@ -33,6 +34,8 @@ const SUPPORT_AI_MAX_PER_SESSION = Math.max(1, Number(process.env.SUPPORT_AI_MAX
 const ZVONOK_API_KEY = process.env.ZVONOK_API_KEY || '';
 const ZVONOK_CAMPAIGN_ID = process.env.ZVONOK_CAMPAIGN_ID || '';
 const ZVONOK_WEBHOOK_SECRET = process.env.ZVONOK_WEBHOOK_SECRET || '';
+const MONOBANK_WEBHOOK_SECRET = process.env.MONOBANK_WEBHOOK_SECRET || '';
+const APP_PUBLIC_URL = String(process.env.APP_PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
 const ZVONOK_CALL_URL = 'https://zvonok.com/manager/cabapi_external/api/v1/phones/call/';
 const SHOP_NAME = process.env.SHOP_NAME || 'Violet Motion';
 const PRODUCT_NAME = process.env.PRODUCT_NAME || 'Violet Motion sneakers';
@@ -347,7 +350,7 @@ function orderUpsell(o) {
   return o?.upsell && typeof o.upsell === 'object' ? o.upsell : null;
 }
 function orderPaidNet(o) {
-  const basePaid = o?.baseIncomePosted || o?.basePaidAt || orderPaymentStatus(o) === 'paid' || o?.status === 'paid' || o?.status === 'completed';
+  const basePaid = !!(o?.baseIncomeVerified || o?.bankPaidAt);
   const upsell = orderUpsell(o);
   const upsellPaid = upsell && (upsell.incomePosted || upsell.paidAt || upsell.paymentStatus === 'paid');
   let total = 0;
@@ -438,13 +441,13 @@ function orderBaseCost(order) {
   return snapshot > 0 ? snapshot : asMoneyNumber(orderProduct(order).cost);
 }
 function orderPaidRevenue(order) {
-  const basePaid = order?.baseIncomePosted || order?.basePaidAt || orderPaymentStatus(order) === 'paid' || order?.status === 'paid' || order?.status === 'completed';
+  const basePaid = !!(order?.baseIncomeVerified || order?.bankPaidAt);
   const upsell = orderUpsell(order);
   const upsellPaid = upsell && (upsell.incomePosted || upsell.paidAt || upsell.paymentStatus === 'paid');
   return (basePaid ? orderBaseRevenue(order) : 0) + (upsellPaid ? asMoneyNumber(upsell.price) : 0);
 }
 function orderPaidCost(order) {
-  const basePaid = order?.baseIncomePosted || order?.basePaidAt || orderPaymentStatus(order) === 'paid' || order?.status === 'paid' || order?.status === 'completed';
+  const basePaid = !!(order?.baseIncomeVerified || order?.bankPaidAt);
   const upsell = orderUpsell(order);
   const upsellPaid = upsell && (upsell.incomePosted || upsell.paidAt || upsell.paymentStatus === 'paid');
   return (basePaid ? orderBaseCost(order) : 0) + (upsellPaid ? asMoneyNumber(upsell.cost) : 0);
@@ -560,6 +563,8 @@ function financeOrderContext(order) {
 function buildFinanceTransactions(period = 'today', orders = read(F.orders)) {
   const orderMap = new Map(orders.map(order => [Number(order.id), order]));
   const transactions = read(F.finance)
+    .filter(item => !item.excludedAt)
+    .filter(item => !isUnverifiedNovaFinanceEntry(item))
     .filter(item => inPeriod(item.createdAt, period))
     .map(item => ({
       ...item,
@@ -568,29 +573,6 @@ function buildFinanceTransactions(period = 'today', orders = read(F.orders)) {
   const financeExternalIds = new Set(transactions.map(item => item.externalId).filter(Boolean));
 
   orders.forEach(order => {
-    const paidAt = order.paidAt || order.basePaidAt || order.updatedAt || order.createdAt;
-    const paymentExists = transactions.some(item => item.type === 'income' && item.category === 'net_order' && Number(item.orderId) === Number(order.id));
-    if (isPaidOrder(order) && !paymentExists && inPeriod(paidAt, period)) {
-      const product = orderProduct(order);
-      const grossAmount = orderPaidRevenue(order);
-      const costAmount = orderPaidCost(order);
-      transactions.push({
-        id: `order-${order.id}-payment`,
-        type: 'income',
-        title: `Order payment #${order.id}`,
-        amount: grossAmount - costAmount,
-        grossAmount,
-        costAmount,
-        productKey: product.key,
-        productLabel: product.label,
-        category: 'net_order',
-        source: 'order-status',
-        orderId: order.id,
-        externalId: financeExternalId('order-status', 'payment', order.id, 'legacy'),
-        createdAt: paidAt,
-        linkedOrder: financeOrderContext(order),
-      });
-    }
     (Array.isArray(order.expenses) ? order.expenses : []).forEach(expense => {
       if (!inPeriod(expense.createdAt || order.updatedAt || order.createdAt, period)) return;
       const externalId = financeExternalId('order-expense', expense.category || 'order', order.id, expense.id || expense.createdAt || expense.amount);
@@ -625,29 +607,35 @@ function buildCrmSummary(period = 'today') {
   const pipelineOrders = orders.filter(isForecastPipelineOrder);
   const confirmedOrders = orders.filter(o => orderStatusForDisplay(o) === 'confirmed' || isOrderActuallyShipped(o) || o.status === 'paid' || o.status === 'completed');
   const paymentTransactions = finance.filter(x => x.type === 'income' && x.category === 'net_order');
-  const usePaymentLedger = paymentTransactions.length > 0;
-  const revenue = usePaymentLedger
-    ? paymentTransactions.reduce((s, x) => s + (asMoneyNumber(x.grossAmount) || asMoneyNumber(x.amount) + asMoneyNumber(x.costAmount)), 0)
-    : paidOrders.reduce((s, o) => s + orderPaidRevenue(o), 0);
-  const cost = usePaymentLedger
-    ? paymentTransactions.reduce((s, x) => s + asMoneyNumber(x.costAmount), 0)
-    : paidOrders.reduce((s, o) => s + orderPaidCost(o), 0);
-  const netOrders = usePaymentLedger
-    ? paymentTransactions.reduce((s, x) => s + asMoneyNumber(x.amount), 0)
-    : paidOrders.reduce((s, o) => s + orderPaidNet(o), 0);
+  const revenue = paymentTransactions.reduce((s, x) => s + (asMoneyNumber(x.grossAmount) || asMoneyNumber(x.amount) + asMoneyNumber(x.costAmount)), 0);
+  const cost = paymentTransactions.reduce((s, x) => s + asMoneyNumber(x.costAmount), 0);
+  const netOrders = paymentTransactions.reduce((s, x) => s + asMoneyNumber(x.amount), 0);
   const buyout = buildBuyoutStats(orders, allOrders);
   const pendingRevenue = pipelineOrders.reduce((s, o) => s + orderBaseRevenue(o), 0);
   const pendingCost = pipelineOrders.reduce((s, o) => s + orderBaseCost(o), 0);
   const expectedIncome = netOrders + (pendingRevenue - pendingCost) * buyout.buyoutRate;
   const returnsExpense = finance.filter(x => x.type === 'expense' && x.category === 'return').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
+  const productPayments = new Map();
+  paymentTransactions.forEach(transaction => {
+    const key = transaction.productKey || orderProductKey(allOrders.find(order => Number(order.id) === Number(transaction.orderId)));
+    const totals = productPayments.get(key) || { revenue: 0, cost: 0, net: 0 };
+    totals.revenue += asMoneyNumber(transaction.grossAmount) || asMoneyNumber(transaction.amount) + asMoneyNumber(transaction.costAmount);
+    totals.cost += asMoneyNumber(transaction.costAmount);
+    totals.net += asMoneyNumber(transaction.amount);
+    productPayments.set(key, totals);
+  });
   const products = buildProductBreakdown(orders).map(product => {
     const finalCount = product.paidOrders + product.returns;
     const productBuyoutRate = finalCount ? product.paidOrders / finalCount : buyout.buyoutRate;
+    const actual = productPayments.get(product.key);
     return {
       ...product,
+      revenue: actual?.revenue || 0,
+      cost: actual?.cost || 0,
+      net: actual?.net || 0,
       buyoutRate: productBuyoutRate,
       returnRate: finalCount ? product.returns / finalCount : buyout.returnRate,
-      forecastNet: product.net + product.pipelineNet * productBuyoutRate,
+      forecastNet: (actual?.net || 0) + product.pipelineNet * productBuyoutRate,
     };
   });
   return {
@@ -678,13 +666,13 @@ function buildCrmSummary(period = 'today') {
     pipelineOrders: pipelineOrders.length,
     returnsExpense,
     difference: netOrders - expectedIncome,
-    avgCheck: paidOrders.length ? revenue / paidOrders.length : 0,
-    avgProfit: paidOrders.length ? paidOrders.reduce((s, o) => s + orderProfit(o), 0) / paidOrders.length : 0,
+    avgCheck: paymentTransactions.length ? revenue / paymentTransactions.length : 0,
+    avgProfit: paymentTransactions.length ? netOrders / paymentTransactions.length : 0,
     leadCost: orders.length ? adsExpense / orders.length : 0,
     confirmedOrderCost: confirmedOrders.length ? adsExpense / confirmedOrders.length : 0,
     paidOrderCost: paidOrders.length ? adsExpense / paidOrders.length : 0,
     products,
-    recentPayments: buildRecentPayments(paidOrders),
+    recentPayments: buildRecentPayments(paidOrders.filter(order => order.baseIncomeVerified || order.bankPaidAt)),
     transactions: finance,
   };
 }
@@ -827,6 +815,11 @@ function buildOrderCrmSummary(period = 'today') {
 function financeExternalId(source, category, orderId, extra = '') {
   return [source, category, orderId || 'none', extra || 'once'].join(':');
 }
+function isUnverifiedNovaFinanceEntry(entry) {
+  if (entry?.verifiedBy === 'monobank' || entry?.source === 'monobank') return false;
+  if (entry?.category === 'net_order') return true;
+  return entry?.source === 'nova-poshta' && ['shipping', 'return'].includes(entry?.category);
+}
 function addFinanceEntryOnce(entry) {
   const finance = read(F.finance);
   const externalId = entry.externalId || financeExternalId(entry.source || 'system', entry.category || 'manual', entry.orderId, entry.kind);
@@ -845,6 +838,10 @@ function addFinanceEntryOnce(entry) {
     costAmount: asMoneyNumber(entry.costAmount),
     productKey: sanitizeStr(entry.productKey || '', 60) || null,
     productLabel: sanitizeStr(entry.productLabel || '', 100) || null,
+    verifiedBy: sanitizeStr(entry.verifiedBy || '', 30) || null,
+    bankTransactionId: sanitizeStr(entry.bankTransactionId || '', 120) || null,
+    bankDescription: sanitizeStr(entry.bankDescription || '', 240) || null,
+    counterName: sanitizeStr(entry.counterName || '', 180) || null,
     createdAt: entry.createdAt || new Date().toISOString(),
   };
   finance.push(item);
@@ -852,7 +849,7 @@ function addFinanceEntryOnce(entry) {
   return item;
 }
 function ensurePaidOrderFinance(order, options = {}) {
-  if (!isPaidOrder(order)) return order;
+  if (!isPaidOrder(order) && !options.verified) return order;
   const now = options.at || new Date().toISOString();
   const product = orderProduct(order);
   const grossAmount = orderBaseRevenue(order);
@@ -867,7 +864,7 @@ function ensurePaidOrderFinance(order, options = {}) {
     basePaidAt: order.basePaidAt || now,
   };
 
-  if (!updated.baseIncomePosted) {
+  if (options.verified && !updated.baseIncomePosted) {
     if (grossAmount > 0) {
       addFinanceEntryOnce({
         type: 'income',
@@ -881,13 +878,154 @@ function ensurePaidOrderFinance(order, options = {}) {
         source: options.source || 'order-status',
         orderId: order.id,
         externalId: financeExternalId(options.source || 'order-status', 'payment', order.id, options.extra || 'base'),
+        verifiedBy: options.verifiedBy,
+        bankTransactionId: options.bankTransactionId,
+        bankDescription: options.bankDescription,
         createdAt: now,
       });
       updated.baseIncomePosted = true;
+      updated.baseIncomeVerified = true;
+      updated.bankPaidAt = updated.bankPaidAt || now;
     }
   }
 
   return updated;
+}
+function monoStatementText(item = {}) {
+  return [item.description, item.comment, item.counterName].filter(Boolean).join(' ').toLowerCase();
+}
+function monoMatches(text, envName, fallback) {
+  const values = String(process.env[envName] || fallback)
+    .split(',')
+    .map(value => value.trim().toLowerCase())
+    .filter(Boolean);
+  return values.some(value => text.includes(value));
+}
+function monoExtractTtn(text) {
+  return String(text || '').match(/\b\d{14,15}\b/)?.[0] || '';
+}
+function findOrderForMonoItem(orders, item) {
+  const text = monoStatementText(item);
+  const ttn = monoExtractTtn(text);
+  if (!ttn) return { order: null, ttn: '', returnOperation: false };
+  const order = orders.find(candidate => (
+    String(candidate.ttn || '') === ttn ||
+    String(candidate.npReturnExpressWaybillNumber || '') === ttn ||
+    String(candidate.npReturnOrderNumber || '') === ttn
+  )) || null;
+  return {
+    order,
+    ttn,
+    returnOperation: !!order && [order.npReturnExpressWaybillNumber, order.npReturnOrderNumber].map(String).includes(ttn),
+  };
+}
+function importMonobankStatementItem(item, orders = read(F.orders)) {
+  if (!item?.id || item.hold === true || Number(item.currencyCode || 980) !== 980) return { imported: false, ignored: true };
+  const text = monoStatementText(item);
+  const isNova = monoMatches(text, 'MONOBANK_NP_KEYWORDS', 'нова пошта,nova poshta,novaposhta');
+  const isAds = monoMatches(text, 'MONOBANK_ADS_KEYWORDS', 'facebook,meta,instagram,google ads,tiktok,tik tok');
+  if (!isNova && !isAds) return { imported: false, ignored: true };
+  const bankAmount = asMoneyNumber(item.amount) / 100;
+  if (!bankAmount) return { imported: false, ignored: true };
+  const createdAt = new Date(Number(item.time || 0) * 1000).toISOString();
+  const match = isNova ? findOrderForMonoItem(orders, item) : { order: null, ttn: '', returnOperation: false };
+  const order = match.order;
+  let entry = null;
+
+  if (isNova && bankAmount > 0 && order) {
+    const product = orderProduct(order);
+    const costAmount = orderBaseCost(order);
+    entry = addFinanceEntryOnce({
+      type: 'income',
+      title: `Monobank: Nova Poshta payout #${order.id}`,
+      amount: bankAmount - costAmount,
+      grossAmount: bankAmount,
+      costAmount,
+      productKey: product.key,
+      productLabel: product.label,
+      category: 'net_order',
+      source: 'monobank',
+      orderId: order.id,
+      verifiedBy: 'monobank',
+      bankTransactionId: item.id,
+      bankDescription: item.description,
+      counterName: item.counterName,
+      externalId: financeExternalId('monobank', 'payment', order.id, item.id),
+      createdAt,
+    });
+    const idx = orders.findIndex(candidate => candidate.id === order.id);
+    if (idx >= 0) {
+      orders[idx] = {
+        ...orders[idx],
+        bankPaidAt: orders[idx].bankPaidAt || createdAt,
+        baseIncomePosted: true,
+        baseIncomeVerified: true,
+        monoIncomeTransactionId: item.id,
+        actualPayoutAmount: bankAmount,
+        cost: asMoneyNumber(orders[idx].cost) || costAmount,
+        costProductKey: orders[idx].costProductKey || product.key,
+        costProductLabel: orders[idx].costProductLabel || product.label,
+        updatedAt: new Date().toISOString(),
+      };
+      write(F.orders, orders);
+    }
+  } else if (isNova && bankAmount > 0) {
+    entry = addFinanceEntryOnce({
+      type: 'unmatched',
+      title: 'Monobank: Nova Poshta payout without linked order',
+      amount: bankAmount,
+      category: 'np_payout_unmatched',
+      source: 'monobank',
+      verifiedBy: 'monobank',
+      bankTransactionId: item.id,
+      bankDescription: item.description,
+      counterName: item.counterName,
+      externalId: financeExternalId('monobank', 'unmatched-payout', null, item.id),
+      createdAt,
+    });
+  } else if (isNova && bankAmount < 0) {
+    entry = addFinanceEntryOnce({
+      type: 'expense',
+      title: `Monobank: Nova Poshta ${match.returnOperation ? 'return' : 'charge'}`,
+      amount: Math.abs(bankAmount),
+      category: match.returnOperation ? 'return' : 'shipping',
+      source: 'monobank',
+      orderId: order?.id || null,
+      verifiedBy: 'monobank',
+      bankTransactionId: item.id,
+      bankDescription: item.description,
+      counterName: item.counterName,
+      externalId: financeExternalId('monobank', match.returnOperation ? 'return' : 'shipping', order?.id, item.id),
+      createdAt,
+    });
+  } else if (isAds && bankAmount < 0) {
+    entry = addFinanceEntryOnce({
+      type: 'expense',
+      title: 'Monobank: advertising charge',
+      amount: Math.abs(bankAmount),
+      category: 'ads',
+      source: 'monobank',
+      verifiedBy: 'monobank',
+      bankTransactionId: item.id,
+      bankDescription: item.description,
+      counterName: item.counterName,
+      externalId: financeExternalId('monobank', 'ads', null, item.id),
+      createdAt,
+    });
+  }
+  return { imported: !!entry, ignored: !entry, entry, orderId: order?.id || null };
+}
+async function syncMonobankFinance(daysBack = 3) {
+  const safeDays = Math.max(1, Math.min(31, Number(daysBack || 3)));
+  const to = Math.floor(Date.now() / 1000);
+  const from = to - safeDays * 24 * 60 * 60;
+  const items = await monobank.getStatement({ from, to });
+  const results = items.map(item => importMonobankStatementItem(item));
+  return {
+    checked: items.length,
+    imported: results.filter(result => result.imported).length,
+    ignored: results.filter(result => result.ignored).length,
+  };
 }
 function npDetailsText(details = {}) {
   return [
@@ -1001,15 +1139,6 @@ function applyNovaTrackingToOrder(order, track) {
   }
 
   if (track.documentCost > 0) {
-    addFinanceEntryOnce({
-      type: 'expense',
-      title: `Nova Poshta delivery #${order.id}`,
-      amount: track.documentCost,
-      category: 'shipping',
-      source: 'nova-poshta',
-      orderId: order.id,
-      externalId: financeExternalId('nova-poshta', 'shipping', order.id, track.number || order.ttn),
-    });
     patch.npDeliveryCost = order.npDeliveryCost || track.documentCost;
   }
 
@@ -1019,15 +1148,7 @@ function applyNovaTrackingToOrder(order, track) {
     patch.returnedAt = order.returnedAt || now;
   }
 
-  const updated = { ...order, ...patch, updatedAt: now };
-  return track.normalizedStatus === 'delivered'
-    ? ensurePaidOrderFinance(updated, {
-      source: 'nova-poshta',
-      title: 'Nova Poshta payment',
-      extra: track.number || order.ttn,
-      at: now,
-    })
-    : updated;
+  return { ...order, ...patch, updatedAt: now };
 }
 function applyNovaReturnOrderToOrder(order, returnOrder) {
   if (!returnOrder) return order;
@@ -1048,16 +1169,6 @@ function applyNovaReturnOrderToOrder(order, returnOrder) {
   };
   if (returnOrder.deliveryCost > 0) {
     patch.npReturnDeliveryCost = returnOrder.deliveryCost;
-    patch.returnExpense = order.returnExpense || returnOrder.deliveryCost;
-    addFinanceEntryOnce({
-      type: 'expense',
-      title: `Nova Poshta return #${order.id}`,
-      amount: returnOrder.deliveryCost,
-      category: 'return',
-      source: 'nova-poshta',
-      orderId: order.id,
-      externalId: financeExternalId('nova-poshta', 'return', order.id, returnOrder.number || returnOrder.ref || order.ttn),
-    });
   }
   return { ...order, ...patch };
 }
@@ -1763,6 +1874,17 @@ if (npConfig.autoSync && npConfig.apiConfigured) {
 } else if (!npConfig.apiConfigured) {
   console.warn('[NovaPoshta] NOVA_POSHTA_API_KEY is not set; tracking and TTN creation are disabled.');
 }
+const monoConfig = monobank.configStatus();
+if (monoConfig.configured && process.env.MONOBANK_AUTO_SYNC !== 'false') {
+  const monoIntervalMs = Math.max(2, Number(process.env.MONOBANK_SYNC_INTERVAL_MINUTES || 5)) * 60 * 1000;
+  setInterval(() => {
+    syncMonobankFinance(3)
+      .then(result => {
+        if (result.imported) console.log('[Monobank sync]', result);
+      })
+      .catch(error => console.error('[Monobank sync]', error.message));
+  }, monoIntervalMs).unref();
+}
 app.delete('/api/admin/orders/cancelled', authBot, (_req, res) => {
   const arr = read(F.orders);
   const kept = arr.filter(x => (x.status || 'new') !== 'cancelled');
@@ -1845,6 +1967,15 @@ app.delete('/api/admin/finance/expenses/today', authBot, (_req, res) => {
     totalAmount: removed.reduce((sum, x) => sum + asMoneyNumber(x.amount), 0),
   });
 });
+app.delete('/api/admin/finance/:id', authBot, (req, res) => {
+  const id = Number(req.params.id);
+  const arr = read(F.finance);
+  const idx = arr.findIndex(entry => Number(entry.id) === id);
+  if (idx < 0) return res.status(404).json({ error: 'Finance operation not found' });
+  arr[idx] = { ...arr[idx], excludedAt: new Date().toISOString(), excludedReason: 'manager_deleted' };
+  write(F.finance, arr);
+  res.json({ success: true, deleted: arr[idx] });
+});
 app.get('/api/admin/finance/summary', authBot, (req, res) => {
   res.json(buildCrmSummary(sanitizeStr(req.query.period || 'today', 20)));
 });
@@ -1880,6 +2011,39 @@ app.get('/api/admin/crm/problems', authBot, (_req, res) => {
 });
 app.get('/api/admin/np/config', authBot, (_req, res) => {
   res.json(novaPoshta.configStatus());
+});
+app.get('/api/admin/monobank/config', authBot, (_req, res) => {
+  res.json({ ...monobank.configStatus(), webhookAvailable: !!(APP_PUBLIC_URL && MONOBANK_WEBHOOK_SECRET) });
+});
+app.post('/api/admin/monobank/sync', authBot, async (req, res) => {
+  try {
+    res.json({ success: true, ...(await syncMonobankFinance(req.body?.daysBack || 3)) });
+  } catch (error) {
+    res.status(502).json({ error: error.message, details: error.details || {} });
+  }
+});
+app.post('/api/admin/monobank/webhook/setup', authBot, async (_req, res) => {
+  if (!APP_PUBLIC_URL || !MONOBANK_WEBHOOK_SECRET) {
+    return res.status(400).json({ error: 'APP_PUBLIC_URL and MONOBANK_WEBHOOK_SECRET are required' });
+  }
+  const webhookUrl = `${APP_PUBLIC_URL}/api/monobank/webhook/${encodeURIComponent(MONOBANK_WEBHOOK_SECRET)}`;
+  try {
+    await monobank.setWebhook(webhookUrl);
+    res.json({ success: true, webhookUrl });
+  } catch (error) {
+    res.status(502).json({ error: error.message, details: error.details || {} });
+  }
+});
+app.get('/api/monobank/webhook/:secret', (req, res) => {
+  if (!MONOBANK_WEBHOOK_SECRET || req.params.secret !== MONOBANK_WEBHOOK_SECRET) return res.sendStatus(403);
+  res.sendStatus(200);
+});
+app.post('/api/monobank/webhook/:secret', (req, res) => {
+  if (!MONOBANK_WEBHOOK_SECRET || req.params.secret !== MONOBANK_WEBHOOK_SECRET) return res.sendStatus(403);
+  if (req.body?.type === 'StatementItem' && req.body?.data?.statementItem) {
+    importMonobankStatementItem(req.body.data.statementItem);
+  }
+  res.sendStatus(200);
 });
 app.get('/api/admin/np/track/:ttn', authBot, async (req, res) => {
   try {
@@ -1981,17 +2145,6 @@ app.post('/api/admin/orders/:id/np/create', authBot, async (req, res) => {
       updatedAt: now,
     };
     write(F.orders, orders);
-    if (created.cost > 0) {
-      addFinanceEntryOnce({
-        type: 'expense',
-        title: `Nova Poshta delivery #${id}`,
-        amount: created.cost,
-        category: 'shipping',
-        source: 'nova-poshta',
-        orderId: id,
-        externalId: financeExternalId('nova-poshta', 'shipping', id, created.ttn),
-      });
-    }
     updateOrderQueueNotice(orders[idx]).catch(e => console.error('[order notice]', e.message));
     res.json({ success: true, order: orders[idx], novaPoshta: created, ttn: created.ttn });
   } catch (error) {
