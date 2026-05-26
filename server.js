@@ -350,7 +350,7 @@ function orderUpsell(o) {
   return o?.upsell && typeof o.upsell === 'object' ? o.upsell : null;
 }
 function orderPaidNet(o) {
-  const basePaid = !!(o?.baseIncomeVerified || o?.bankPaidAt);
+  const basePaid = isPaidOrder(o);
   const upsell = orderUpsell(o);
   const upsellPaid = upsell && (upsell.incomePosted || upsell.paidAt || upsell.paymentStatus === 'paid');
   let total = 0;
@@ -441,13 +441,13 @@ function orderBaseCost(order) {
   return snapshot > 0 ? snapshot : asMoneyNumber(orderProduct(order).cost);
 }
 function orderPaidRevenue(order) {
-  const basePaid = !!(order?.baseIncomeVerified || order?.bankPaidAt);
+  const basePaid = isPaidOrder(order);
   const upsell = orderUpsell(order);
   const upsellPaid = upsell && (upsell.incomePosted || upsell.paidAt || upsell.paymentStatus === 'paid');
   return (basePaid ? orderBaseRevenue(order) : 0) + (upsellPaid ? asMoneyNumber(upsell.price) : 0);
 }
 function orderPaidCost(order) {
-  const basePaid = !!(order?.baseIncomeVerified || order?.bankPaidAt);
+  const basePaid = isPaidOrder(order);
   const upsell = orderUpsell(order);
   const upsellPaid = upsell && (upsell.incomePosted || upsell.paidAt || upsell.paymentStatus === 'paid');
   return (basePaid ? orderBaseCost(order) : 0) + (upsellPaid ? asMoneyNumber(upsell.cost) : 0);
@@ -606,36 +606,38 @@ function buildCrmSummary(period = 'today') {
   const returns = orders.filter(isReturnedOrder);
   const pipelineOrders = orders.filter(isForecastPipelineOrder);
   const confirmedOrders = orders.filter(o => orderStatusForDisplay(o) === 'confirmed' || isOrderActuallyShipped(o) || o.status === 'paid' || o.status === 'completed');
-  const paymentTransactions = finance.filter(x => x.type === 'income' && x.category === 'net_order');
-  const revenue = paymentTransactions.reduce((s, x) => s + (asMoneyNumber(x.grossAmount) || asMoneyNumber(x.amount) + asMoneyNumber(x.costAmount)), 0);
-  const cost = paymentTransactions.reduce((s, x) => s + asMoneyNumber(x.costAmount), 0);
-  const netOrders = paymentTransactions.reduce((s, x) => s + asMoneyNumber(x.amount), 0);
+  const paymentTransactions = finance.filter(x => x.type === 'income' && x.category === 'net_order' && x.source === 'monobank');
+  const bankPayoutGross = paymentTransactions.reduce((s, x) => s + (asMoneyNumber(x.grossAmount) || asMoneyNumber(x.amount) + asMoneyNumber(x.costAmount)), 0);
+  const revenue = paidOrders.reduce((s, order) => s + orderPaidRevenue(order), 0);
+  const cost = paidOrders.reduce((s, order) => s + orderPaidCost(order), 0);
+  const netOrders = paidOrders.reduce((s, order) => s + orderPaidNet(order), 0);
   const buyout = buildBuyoutStats(orders, allOrders);
   const pendingRevenue = pipelineOrders.reduce((s, o) => s + orderBaseRevenue(o), 0);
   const pendingCost = pipelineOrders.reduce((s, o) => s + orderBaseCost(o), 0);
   const expectedIncome = netOrders + (pendingRevenue - pendingCost) * buyout.buyoutRate;
   const returnsExpense = finance.filter(x => x.type === 'expense' && x.category === 'return').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
-  const productPayments = new Map();
-  paymentTransactions.forEach(transaction => {
-    const key = transaction.productKey || orderProductKey(allOrders.find(order => Number(order.id) === Number(transaction.orderId)));
-    const totals = productPayments.get(key) || { revenue: 0, cost: 0, net: 0 };
-    totals.revenue += asMoneyNumber(transaction.grossAmount) || asMoneyNumber(transaction.amount) + asMoneyNumber(transaction.costAmount);
-    totals.cost += asMoneyNumber(transaction.costAmount);
-    totals.net += asMoneyNumber(transaction.amount);
-    productPayments.set(key, totals);
+  const shippingExpense = finance.filter(x => x.type === 'expense' && x.category === 'shipping').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
+  const monobankExpense = finance.filter(x => x.type === 'expense' && x.source === 'monobank').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
+  const otherExpense = expense - adsExpense - returnsExpense - shippingExpense;
+  const recordedExpense = expense - monobankExpense;
+  const productExpenses = new Map();
+  finance.filter(x => x.type === 'expense' && x.orderId).forEach(entry => {
+    const order = allOrders.find(candidate => Number(candidate.id) === Number(entry.orderId));
+    if (!order) return;
+    const key = orderProductKey(order);
+    productExpenses.set(key, (productExpenses.get(key) || 0) + asMoneyNumber(entry.amount));
   });
   const products = buildProductBreakdown(orders).map(product => {
     const finalCount = product.paidOrders + product.returns;
     const productBuyoutRate = finalCount ? product.paidOrders / finalCount : buyout.buyoutRate;
-    const actual = productPayments.get(product.key);
+    const linkedExpense = productExpenses.get(product.key) || 0;
     return {
       ...product,
-      revenue: actual?.revenue || 0,
-      cost: actual?.cost || 0,
-      net: actual?.net || 0,
+      linkedExpense,
+      profitAfterLinkedExpenses: product.net - linkedExpense,
       buyoutRate: productBuyoutRate,
       returnRate: finalCount ? product.returns / finalCount : buyout.returnRate,
-      forecastNet: (actual?.net || 0) + product.pipelineNet * productBuyoutRate,
+      forecastNet: product.net - linkedExpense + product.pipelineNet * productBuyoutRate,
     };
   });
   return {
@@ -655,6 +657,12 @@ function buildCrmSummary(period = 'today') {
     netOrders,
     expense,
     adsExpense,
+    shippingExpense,
+    monobankExpense,
+    recordedExpense,
+    otherExpense,
+    bankPayoutGross,
+    bankMatchedPayouts: paymentTransactions.length,
     profit: netOrders + manualIncome - expense,
     expectedIncome,
     forecastRevenue: revenue + pendingRevenue * buyout.buyoutRate,
@@ -666,13 +674,13 @@ function buildCrmSummary(period = 'today') {
     pipelineOrders: pipelineOrders.length,
     returnsExpense,
     difference: netOrders - expectedIncome,
-    avgCheck: paymentTransactions.length ? revenue / paymentTransactions.length : 0,
-    avgProfit: paymentTransactions.length ? netOrders / paymentTransactions.length : 0,
+    avgCheck: paidOrders.length ? revenue / paidOrders.length : 0,
+    avgProfit: paidOrders.length ? netOrders / paidOrders.length : 0,
     leadCost: orders.length ? adsExpense / orders.length : 0,
     confirmedOrderCost: confirmedOrders.length ? adsExpense / confirmedOrders.length : 0,
     paidOrderCost: paidOrders.length ? adsExpense / paidOrders.length : 0,
     products,
-    recentPayments: buildRecentPayments(paidOrders.filter(order => order.baseIncomeVerified || order.bankPaidAt)),
+    recentPayments: buildRecentPayments(paidOrders),
     transactions: finance,
   };
 }

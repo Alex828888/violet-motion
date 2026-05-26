@@ -1028,8 +1028,11 @@ async function showCrmReport(chatId, period = 'today', msgId = null) {
   const paymentLines = payments.length
     ? payments.map(item => `#${esc(item.id)} ${esc(item.product)}: <b>+${money(item.revenue)}</b> −${money(item.cost)} = <b>${money(item.net)}</b>`).join('\n')
     : 'Ще немає викуплених замовлень за період.';
+  const additionalIncomeLine = Number(data.manualIncome || 0) > 0
+    ? `➕ Інші зараховані надходження: <b>+${money(data.manualIncome)}</b>\n`
+    : '';
   const productLines = products.length
-    ? products.map(item => `${esc(item.label)}: викуп ${item.paidOrders}/${item.orders}, факт <b>${money(item.net)}</b>, прогноз <b>${money(item.forecastNet)}</b>, повернення ${ratePct(item.returnRate)}`).join('\n')
+    ? products.map(item => `${esc(item.label)}: викуп ${item.paidOrders}/${item.orders}, маржа <b>${money(item.net)}</b>, витрати замовл. −${money(item.linkedExpense)}, разом <b>${money(item.profitAfterLinkedExpenses)}</b>, прогноз <b>${money(item.forecastNet)}</b>, повернення ${ratePct(item.returnRate)}`).join('\n')
     : 'Замовлень за період ще немає.';
 
   const text =
@@ -1037,15 +1040,24 @@ async function showCrmReport(chatId, period = 'today', msgId = null) {
     `📦 Замовлення: <b>${data.orders || 0}</b>  ✅ ${data.paidOrders || 0} викуп  ↩️ ${data.returns || 0} поверн.\n` +
     `🚚 У прогнозі: <b>${data.pipelineOrders || 0}</b> підтверджених/у дорозі\n\n` +
     `<b>Факт</b>\n` +
-    `💰 Зараховано на картку: <b>+${money(data.revenue)}</b>\n` +
+    `📦 Виручка з викупів НП: <b>+${money(data.revenue)}</b>\n` +
     `🏷 Собівартість: <b>−${money(data.cost)}</b>\n` +
+    `💵 Маржа викупів: <b>+${money(data.netOrders)}</b>\n` +
     `🧾 Підтверджені витрати: <b>−${money(data.expense)}</b>\n` +
-    `✅ Прибуток факт: <b>${money(data.profit)}</b>\n\n` +
+    `   🏦 monobank: −${money(data.monobankExpense)}  ✍️ внесено вручну: −${money(data.recordedExpense)}\n` +
+    `   🚚 доставка: −${money(data.shippingExpense)}  ↩️ повернення: −${money(data.returnsExpense)}\n` +
+    `   📣 реклама: −${money(data.adsExpense)}  • інше: −${money(data.otherExpense)}\n` +
+    additionalIncomeLine +
+    `✅ Прибуток факт: <b>${money(data.profit)}</b>\n` +
+    `   Формула: ${money(data.netOrders)} + ${money(data.manualIncome)} − ${money(data.expense)} = <b>${money(data.profit)}</b>\n\n` +
+    `<b>Звірка monobank</b>\n` +
+    `🏦 Надходження НП, знайдені на картці: <b>+${money(data.bankPayoutGross)}</b> (${data.bankMatchedPayouts || 0})\n` +
+    `Ця звірка не обнуляє викупи, підтверджені Новою Поштою.\n\n` +
     `<b>Прогноз</b>\n` +
     `📈 Очікуваний прибуток: <b>${money(data.forecastProfit)}</b>\n` +
     `📦 Прогноз грошей: <b>${money(data.forecastRevenue)}</b>\n` +
     `🎯 Викуп: <b>${ratePct(data.buyoutRate)}</b>  ↩️ Повернення: <b>${ratePct(data.returnRate)}</b>\n\n` +
-    `<b>Останні зарахування з monobank</b>\n${paymentLines}\n\n` +
+    `<b>Останні викуплені замовлення</b>\n${paymentLines}\n\n` +
     `<b>Моделі</b>\n${productLines}`;
 
   reply(chatId, text, crmMenuKb(period), msgId);
