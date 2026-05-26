@@ -692,6 +692,7 @@ async function trackDocuments(documents) {
     documentCost: moneyNumber(item.DocumentCost || item.CheckWeight || 0),
     announcedPrice: moneyNumber(item.AnnouncedPrice || item.Cost || 0),
     redeliverySum: moneyNumber(item.RedeliverySum || item.AfterpaymentOnGoodsCost || 0),
+    redeliveryPaymentMethod: item.RedeliveryPaymentMethod || item.RedeliveryPaymentCardDescription || item.PaymentMethod || '',
     raw: item,
   }));
 }

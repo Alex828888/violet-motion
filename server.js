@@ -65,12 +65,13 @@ const F = {
   finance:   path.join(DATA, 'finance.json'),
   crmProducts: path.join(DATA, 'crm-products.json'),
   orderNotify: path.join(DATA, 'order-notify.json'),
+  npAfterpayments: path.join(DATA, 'np-afterpayments.json'),
 };
 
 if (!fs.existsSync(DATA)) fs.mkdirSync(DATA, { recursive: true });
 for (const [name, file] of Object.entries(F)) {
   if (fs.existsSync(file)) continue;
-  const bundledFile = path.join(DEFAULT_DATA, `${name}.json`);
+  const bundledFile = path.join(DEFAULT_DATA, path.basename(file));
   if (DATA !== DEFAULT_DATA && fs.existsSync(bundledFile)) {
     fs.copyFileSync(bundledFile, file);
   } else {
@@ -438,7 +439,9 @@ function orderBaseRevenue(order) {
 }
 function orderBaseCost(order) {
   const snapshot = asMoneyNumber(order?.cost || order?.costPrice || order?.purchasePrice);
-  return snapshot > 0 ? snapshot : asMoneyNumber(orderProduct(order).cost);
+  const configured = asMoneyNumber(orderProduct(order).cost);
+  if (order?.costLocked === true && snapshot > 0) return snapshot;
+  return configured > 0 ? configured : snapshot;
 }
 function orderPaidRevenue(order) {
   const basePaid = isPaidOrder(order);
@@ -594,14 +597,55 @@ function buildFinanceTransactions(period = 'today', orders = read(F.orders)) {
   });
   return transactions.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
 }
+function isPersonalFinanceEntry(entry) {
+  return entry?.category === 'personal';
+}
+function isBusinessRefundEntry(entry) {
+  return ['shipping_refund', 'return_refund', 'ads_refund', 'business_refund'].includes(entry?.category);
+}
+function buildAfterpaymentSummary(period = 'today', orders = read(F.orders)) {
+  const orderMap = new Map(orders.filter(order => order.ttn).map(order => [String(order.ttn), order]));
+  const byTtn = new Map();
+  const saved = Array.isArray(read(F.npAfterpayments)) ? read(F.npAfterpayments) : [];
+  saved.forEach(item => {
+    if (!item?.ttn || !inPeriod(item.sentAt || item.createdAt, period)) return;
+    byTtn.set(String(item.ttn), { ...item, linkedOrder: financeOrderContext(orderMap.get(String(item.ttn))) });
+  });
+  orders.forEach(order => {
+    const amount = asMoneyNumber(order.npRedeliverySum);
+    if (!order.ttn || amount <= 0 || !inPeriod(order.paidAt || order.updatedAt || order.createdAt, period)) return;
+    if (byTtn.has(String(order.ttn))) return;
+    byTtn.set(String(order.ttn), {
+      ttn: String(order.ttn),
+      amount,
+      paymentMethod: order.npRedeliveryPaymentMethod || 'unknown',
+      status: order.npRedeliveryStatus || order.npStatus || 'tracked',
+      sentAt: order.paidAt || order.updatedAt || order.createdAt,
+      source: 'nova-poshta-api',
+      linkedOrder: financeOrderContext(order),
+    });
+  });
+  const items = [...byTtn.values()].sort((a, b) => new Date(b.sentAt || 0) - new Date(a.sentAt || 0));
+  return {
+    amount: items.reduce((sum, item) => sum + asMoneyNumber(item.amount), 0),
+    cashAmount: items.filter(item => String(item.paymentMethod || '').toLowerCase() === 'cash').reduce((sum, item) => sum + asMoneyNumber(item.amount), 0),
+    records: items.length,
+    matchedOrders: items.filter(item => item.linkedOrder?.id).length,
+    items,
+  };
+}
 function buildCrmSummary(period = 'today') {
   const orders = read(F.orders).filter(o => inPeriod(o.createdAt, period));
   const allOrders = read(F.orders);
   const finance = buildFinanceTransactions(period, allOrders);
   const income = finance.filter(x => x.type === 'income').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
-  const manualIncome = finance.filter(x => x.type === 'income' && x.category !== 'net_order').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
-  const expense = finance.filter(x => x.type === 'expense').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
-  const adsExpense = finance.filter(x => x.type === 'expense' && x.category === 'ads').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
+  const manualIncome = finance.filter(x => x.type === 'income' && ['business_income', 'manual_business_income'].includes(x.category)).reduce((s, x) => s + asMoneyNumber(x.amount), 0);
+  const refundIncome = finance.filter(x => x.type === 'income' && isBusinessRefundEntry(x)).reduce((s, x) => s + asMoneyNumber(x.amount), 0);
+  const unclassifiedIncome = finance.filter(x => x.type === 'income' && x.category !== 'net_order' && !isBusinessRefundEntry(x) && !['business_income', 'manual_business_income'].includes(x.category)).reduce((s, x) => s + asMoneyNumber(x.amount), 0);
+  const businessExpenses = finance.filter(x => x.type === 'expense' && !isPersonalFinanceEntry(x));
+  const expense = businessExpenses.reduce((s, x) => s + asMoneyNumber(x.amount), 0);
+  const personalExpense = finance.filter(x => x.type === 'expense' && isPersonalFinanceEntry(x)).reduce((s, x) => s + asMoneyNumber(x.amount), 0);
+  const adsExpense = businessExpenses.filter(x => x.category === 'ads').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
   const paidOrders = orders.filter(isPaidOrder);
   const returns = orders.filter(isReturnedOrder);
   const pipelineOrders = orders.filter(isForecastPipelineOrder);
@@ -615,13 +659,14 @@ function buildCrmSummary(period = 'today') {
   const pendingRevenue = pipelineOrders.reduce((s, o) => s + orderBaseRevenue(o), 0);
   const pendingCost = pipelineOrders.reduce((s, o) => s + orderBaseCost(o), 0);
   const expectedIncome = netOrders + (pendingRevenue - pendingCost) * buyout.buyoutRate;
-  const returnsExpense = finance.filter(x => x.type === 'expense' && x.category === 'return').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
-  const shippingExpense = finance.filter(x => x.type === 'expense' && x.category === 'shipping').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
-  const monobankExpense = finance.filter(x => x.type === 'expense' && x.source === 'monobank').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
+  const returnsExpense = businessExpenses.filter(x => x.category === 'return').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
+  const shippingExpense = businessExpenses.filter(x => x.category === 'shipping').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
+  const monobankExpense = businessExpenses.filter(x => x.source === 'monobank').reduce((s, x) => s + asMoneyNumber(x.amount), 0);
   const otherExpense = expense - adsExpense - returnsExpense - shippingExpense;
   const recordedExpense = expense - monobankExpense;
+  const afterpayments = buildAfterpaymentSummary(period, allOrders);
   const productExpenses = new Map();
-  finance.filter(x => x.type === 'expense' && x.orderId).forEach(entry => {
+  finance.filter(x => x.type === 'expense' && x.orderId && !isPersonalFinanceEntry(x)).forEach(entry => {
     const order = allOrders.find(candidate => Number(candidate.id) === Number(entry.orderId));
     if (!order) return;
     const key = orderProductKey(order);
@@ -652,10 +697,13 @@ function buildCrmSummary(period = 'today') {
     unpaid: orders.filter(o => orderPaymentStatus(o) !== 'paid').length,
     income,
     manualIncome,
+    refundIncome,
+    unclassifiedIncome,
     revenue,
     cost,
     netOrders,
     expense,
+    personalExpense,
     adsExpense,
     shippingExpense,
     monobankExpense,
@@ -663,11 +711,12 @@ function buildCrmSummary(period = 'today') {
     otherExpense,
     bankPayoutGross,
     bankMatchedPayouts: paymentTransactions.length,
-    profit: netOrders + manualIncome - expense,
+    afterpayments,
+    profit: netOrders + manualIncome + refundIncome - expense,
     expectedIncome,
     forecastRevenue: revenue + pendingRevenue * buyout.buyoutRate,
     forecastCost: cost + pendingCost * buyout.buyoutRate,
-    forecastProfit: expectedIncome + manualIncome - expense,
+    forecastProfit: expectedIncome + manualIncome + refundIncome - expense,
     buyoutRate: buyout.buyoutRate,
     buyoutRateSource: buyout.rateSource,
     returnRate: buyout.returnRate,
@@ -938,9 +987,25 @@ function importMonobankStatementItem(item, orders = read(F.orders)) {
   const createdAt = new Date(Number(item.time || 0) * 1000).toISOString();
   const match = isNova ? findOrderForMonoItem(orders, item) : { order: null, ttn: '', returnOperation: false };
   const order = match.order;
+  const isCancellation = /(скасув|отмен|cancel|refund|reversal|повернен.*кошт)/i.test(text);
   let entry = null;
 
-  if (isNova && bankAmount > 0 && order) {
+  if (isNova && bankAmount > 0 && isCancellation) {
+    entry = addFinanceEntryOnce({
+      type: 'income',
+      title: 'Monobank: Nova Poshta charge reversal',
+      amount: bankAmount,
+      category: match.returnOperation ? 'return_refund' : 'shipping_refund',
+      source: 'monobank',
+      orderId: order?.id || null,
+      verifiedBy: 'monobank',
+      bankTransactionId: item.id,
+      bankDescription: item.description,
+      counterName: item.counterName,
+      externalId: financeExternalId('monobank', match.returnOperation ? 'return-refund' : 'shipping-refund', order?.id, item.id),
+      createdAt,
+    });
+  } else if (isNova && bankAmount > 0 && order) {
     const product = orderProduct(order);
     const costAmount = orderBaseCost(order);
     entry = addFinanceEntryOnce({
@@ -1148,6 +1213,12 @@ function applyNovaTrackingToOrder(order, track) {
 
   if (track.documentCost > 0) {
     patch.npDeliveryCost = order.npDeliveryCost || track.documentCost;
+  }
+  if (track.redeliverySum > 0) {
+    patch.npRedeliverySum = track.redeliverySum;
+    patch.npRedeliveryStatus = track.status || order.npRedeliveryStatus || null;
+    patch.npRedeliveryPaymentMethod = track.redeliveryPaymentMethod || order.npRedeliveryPaymentMethod || null;
+    patch.npRedeliverySyncedAt = now;
   }
 
   if (track.normalizedStatus === 'returned') {
@@ -2020,6 +2091,21 @@ app.get('/api/admin/crm/problems', authBot, (_req, res) => {
 app.get('/api/admin/np/config', authBot, (_req, res) => {
   res.json(novaPoshta.configStatus());
 });
+app.get('/api/admin/np/afterpayments', authBot, (req, res) => {
+  res.json(buildAfterpaymentSummary(sanitizeStr(req.query.period || 'today', 20), read(F.orders)));
+});
+app.post('/api/admin/np/afterpayments/sync', authBot, async (req, res) => {
+  try {
+    const result = await syncOpenNovaPoshtaOrders(Math.max(1, Math.min(150, Number(req.body?.limit || 100))));
+    res.json({
+      success: true,
+      sync: result,
+      afterpayments: buildAfterpaymentSummary(sanitizeStr(req.body?.period || 'all', 20), read(F.orders)),
+    });
+  } catch (error) {
+    res.status(502).json(npErrorPayload(error));
+  }
+});
 app.get('/api/admin/monobank/config', authBot, (_req, res) => {
   res.json({ ...monobank.configStatus(), webhookAvailable: !!(APP_PUBLIC_URL && MONOBANK_WEBHOOK_SECRET) });
 });
@@ -2260,10 +2346,11 @@ app.get('/api/admin/backup', authBot, (_req, res) => {
     analytics: read(F.analytics),
     finance: read(F.finance),
     crmProducts: readCrmProducts(),
+    npAfterpayments: read(F.npAfterpayments),
   });
 });
 app.post('/api/admin/backup/restore', authBot, (req, res) => {
-  const { orders, reviews, support, analytics, finance, crmProducts } = req.body || {};
+  const { orders, reviews, support, analytics, finance, crmProducts, npAfterpayments } = req.body || {};
   const restored = {};
   if (Array.isArray(orders)) {
     write(F.orders, orders);
@@ -2288,6 +2375,10 @@ app.post('/api/admin/backup/restore', authBot, (req, res) => {
   if (Array.isArray(crmProducts)) {
     write(F.crmProducts, crmProducts);
     restored.crmProducts = crmProducts.length;
+  }
+  if (Array.isArray(npAfterpayments)) {
+    write(F.npAfterpayments, npAfterpayments);
+    restored.npAfterpayments = npAfterpayments.length;
   }
   res.json({ success: true, restored });
 });
