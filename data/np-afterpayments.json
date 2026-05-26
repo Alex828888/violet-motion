@@ -1,0 +1,90 @@
+[
+  {
+    "id": 1,
+    "ttn": "20451445983175",
+    "amount": 690,
+    "paymentMethod": "cash",
+    "status": "sent",
+    "createdAt": "2026-05-23T00:00:00+03:00",
+    "sentAt": "2026-05-24T00:00:00+03:00",
+    "source": "manager-screenshot",
+    "note": "Післяплату відправлено"
+  },
+  {
+    "id": 2,
+    "ttn": "20451443173565",
+    "amount": 895,
+    "paymentMethod": "cash",
+    "status": "sent",
+    "createdAt": "2026-05-19T00:00:00+03:00",
+    "sentAt": "2026-05-22T00:00:00+03:00",
+    "source": "manager-screenshot",
+    "note": "Післяплату відправлено"
+  },
+  {
+    "id": 3,
+    "ttn": "20451443173323",
+    "amount": 895,
+    "paymentMethod": "cash",
+    "status": "sent",
+    "createdAt": "2026-05-19T00:00:00+03:00",
+    "sentAt": "2026-05-20T00:00:00+03:00",
+    "source": "manager-screenshot",
+    "note": "Післяплату відправлено"
+  },
+  {
+    "id": 4,
+    "ttn": "20451442176269",
+    "amount": 699,
+    "paymentMethod": "cash",
+    "status": "sent",
+    "createdAt": "2026-05-18T00:00:00+03:00",
+    "sentAt": "2026-05-21T00:00:00+03:00",
+    "source": "manager-screenshot",
+    "note": "Післяплату відправлено"
+  },
+  {
+    "id": 5,
+    "ttn": "20451447213529",
+    "amount": 690,
+    "paymentMethod": "cash",
+    "status": "sent",
+    "createdAt": "2026-05-24T00:00:00+03:00",
+    "sentAt": "2026-05-25T00:00:00+03:00",
+    "source": "manager-screenshot",
+    "note": "Післяплату відправлено"
+  },
+  {
+    "id": 6,
+    "ttn": "20451445988359",
+    "amount": 690,
+    "paymentMethod": "cash",
+    "status": "sent",
+    "createdAt": "2026-05-23T00:00:00+03:00",
+    "sentAt": "2026-05-24T00:00:00+03:00",
+    "source": "manager-screenshot",
+    "note": "Післяплату відправлено"
+  },
+  {
+    "id": 7,
+    "ttn": "20451445965752",
+    "amount": 690,
+    "paymentMethod": "cash",
+    "status": "sent",
+    "createdAt": "2026-05-23T00:00:00+03:00",
+    "sentAt": "2026-05-25T00:00:00+03:00",
+    "source": "manager-screenshot",
+    "note": "Післяплату відправлено"
+  },
+  {
+    "id": 8,
+    "ttn": "20451445975590",
+    "amount": 690,
+    "paymentMethod": "cash",
+    "status": "sent",
+    "createdAt": "2026-05-23T00:00:00+03:00",
+    "sentAt": "2026-05-24T00:00:00+03:00",
+    "source": "manager-screenshot",
+    "note": "Післяплату відправлено"
+  }
+]
