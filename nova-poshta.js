@@ -432,6 +432,36 @@ async function resolveCity(cityName) {
   return cacheSet(cityCache, cacheKey, { ref: city.Ref, settlementRef: city.SettlementRef || null, description: city.Description || query, raw: city });
 }
 
+function settlementCandidate(item = {}) {
+  return {
+    ref: item.DeliveryCity || item.Ref || '',
+    settlementRef: item.Ref || null,
+    name: item.MainDescription || '',
+    type: item.SettlementTypeCode || '',
+    area: item.Area || '',
+    region: item.Region || '',
+    present: item.Present || item.MainDescription || '',
+    warehouses: Number(item.Warehouses || 0),
+  };
+}
+
+async function searchRecipientSettlements(value) {
+  const raw = String(value || '').trim();
+  const query = raw.replace(/^\s*(?:село|с\.|с-ще|смт)\s*/iu, '').trim() || raw;
+  if (!query) throw new NovaPoshtaError('Recipient city is required');
+  const searched = await callNovaPoshta('Address', 'searchSettlements', { CityName: query, Limit: 20, Page: 1 });
+  const normalized = query.toLowerCase();
+  const choices = (searched.data || [])
+    .flatMap(group => group.Addresses || [])
+    .map(settlementCandidate)
+    .filter(item => item.ref && item.name.toLowerCase() === normalized && item.warehouses > 0);
+  if (!choices.length) throw new NovaPoshtaError('Nova Poshta city was not found', { city: query, originalCity: value });
+  const exactCity = choices.find(item => item.type === 'м.');
+  if (exactCity) return { resolved: true, selected: exactCity, choices: [exactCity] };
+  if (choices.length === 1) return { resolved: true, selected: choices[0], choices };
+  return { resolved: false, choices: choices.slice(0, 12) };
+}
+
 function filterWarehousesByCategory(warehouses = [], category = '') {
   const expected = String(category || '').trim().toLowerCase();
   if (!expected) return warehouses;
@@ -576,7 +606,9 @@ async function createInternetDocument(order) {
     CitySender: selectedSenderLocation.cityRef || baseSender.CitySender,
     SenderAddress: selectedSenderLocation.ref,
   } : baseSender;
-  const city = await resolveCity(order.city || order.delivery?.city);
+  const city = (order.cityRef || order.delivery?.cityRef)
+    ? { ref: order.cityRef || order.delivery.cityRef, description: order.city || order.delivery?.city || '' }
+    : await resolveCity(order.city || order.delivery?.city);
   const warehouse = await resolveWarehouse(city.ref, order.postOffice || order.delivery?.postOffice);
   const recipient = await createRecipient(order);
   const price = Math.max(1, moneyNumber(order.price || process.env.PRODUCT_PRICE || 0));
@@ -853,6 +885,7 @@ module.exports = {
   callNovaPoshta,
   createInternetDocument,
   resolveSenderLocation,
+  searchRecipientSettlements,
   createReturnOrder,
   syncReturnOrderCost,
   getReturnOrdersList,
