@@ -920,15 +920,39 @@ function isUnverifiedNovaFinanceEntry(entry) {
 function addFinanceEntryOnce(entry) {
   const finance = read(F.finance);
   const externalId = entry.externalId || financeExternalId(entry.source || 'system', entry.category || 'manual', entry.orderId, entry.kind);
-  const existing = finance.find(x => x.externalId === externalId);
-  if (existing) return existing;
   const bankTransactionId = sanitizeStr(entry.bankTransactionId || '', 120) || null;
+  const incomingBankHold = entry.bankHold === true;
+  const bankHoldUpdatedAt = entry.bankHoldUpdatedAt || new Date().toISOString();
+  const existingIdx = finance.findIndex(x => x.externalId === externalId);
+  if (existingIdx >= 0) {
+    const existing = finance[existingIdx];
+    if (bankTransactionId && (existing.bankTransactionId !== bankTransactionId || existing.bankHold !== incomingBankHold)) {
+      finance[existingIdx] = {
+        ...existing,
+        bankTransactionId,
+        bankHold: incomingBankHold,
+        bankHoldUpdatedAt,
+      };
+      write(F.finance, finance);
+    }
+    return finance[existingIdx];
+  }
   const existingBankIdx = bankTransactionId
     ? finance.findIndex(x => x.bankTransactionId && x.bankTransactionId === bankTransactionId)
     : -1;
   if (existingBankIdx >= 0) {
     const current = finance[existingBankIdx];
-    if (current.classifiedAt) return current;
+    if (current.classifiedAt) {
+      if (current.bankHold !== incomingBankHold) {
+        finance[existingBankIdx] = {
+          ...current,
+          bankHold: incomingBankHold,
+          bankHoldUpdatedAt,
+        };
+        write(F.finance, finance);
+      }
+      return finance[existingBankIdx];
+    }
     finance[existingBankIdx] = {
       ...current,
       type: entry.type,
@@ -945,6 +969,8 @@ function addFinanceEntryOnce(entry) {
       verifiedBy: sanitizeStr(entry.verifiedBy || current.verifiedBy || '', 30) || null,
       bankDescription: sanitizeStr(entry.bankDescription || current.bankDescription || '', 240) || null,
       counterName: sanitizeStr(entry.counterName || current.counterName || '', 180) || null,
+      bankHold: incomingBankHold,
+      bankHoldUpdatedAt,
       classificationReason: sanitizeStr(entry.classificationReason || current.classificationReason || '', 120) || null,
       reviewRequired: entry.reviewRequired === true,
       reclassifiedAutomaticallyAt: new Date().toISOString(),
@@ -969,6 +995,8 @@ function addFinanceEntryOnce(entry) {
     bankTransactionId,
     bankDescription: sanitizeStr(entry.bankDescription || '', 240) || null,
     counterName: sanitizeStr(entry.counterName || '', 180) || null,
+    bankHold: incomingBankHold,
+    bankHoldUpdatedAt: incomingBankHold ? bankHoldUpdatedAt : null,
     classificationReason: sanitizeStr(entry.classificationReason || '', 120) || null,
     reviewRequired: entry.reviewRequired === true,
     createdAt: entry.createdAt || new Date().toISOString(),
@@ -1055,9 +1083,10 @@ function findOrderForMonoItem(orders, item) {
   };
 }
 function importMonobankStatementItem(item, orders = read(F.orders)) {
-  if (!item?.id || item.hold === true || Number(item.currencyCode || 980) !== 980) return { imported: false, ignored: true };
+  if (!item?.id || Number(item.currencyCode || 980) !== 980) return { imported: false, ignored: true };
   const text = monoStatementText(item);
   const createdAt = new Date(Number(item.time || 0) * 1000).toISOString();
+  const bankMeta = { bankHold: item.hold === true };
   if (!inFinancePeriod(createdAt, 'all')) return { imported: false, ignored: true, reason: 'before_finance_start' };
   const isNova = monoMatches(text, 'MONOBANK_NP_KEYWORDS', 'нова пошта,новая почта,nova poshta,nova post,nova posta,novaposhta,novapost,nova pay,novapay,novaposta');
   const isAds = monoMatches(text, 'MONOBANK_ADS_KEYWORDS', 'facebook,facebk,fb ads,fbpay,meta,meta platforms,instagram,google ads,tiktok,tik tok');
@@ -1263,6 +1292,19 @@ function importMonobankStatementItem(item, orders = read(F.orders)) {
       reviewRequired: true,
       createdAt,
     });
+  }
+  if (entry?.bankTransactionId) {
+    const finance = read(F.finance);
+    const idx = finance.findIndex(x => x.bankTransactionId === entry.bankTransactionId);
+    if (idx >= 0 && finance[idx].bankHold !== bankMeta.bankHold) {
+      finance[idx] = {
+        ...finance[idx],
+        bankHold: bankMeta.bankHold,
+        bankHoldUpdatedAt: new Date().toISOString(),
+      };
+      write(F.finance, finance);
+      entry = finance[idx];
+    }
   }
   return { imported: !!entry, ignored: !entry, entry, orderId: order?.id || null };
 }

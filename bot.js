@@ -998,7 +998,7 @@ function crmMenuKb(period = 'today') {
       ],
       [
         { text: '🏷 Собівартість', callback_data: 'crm_products' },
-        { text: '🔄 Оновити', callback_data: `crm_period_${period}` },
+        { text: '🔄 Оновити', callback_data: `crm_sync_${period}` },
       ],
       [{ text: '← CRM', callback_data: 'crm_menu' }],
     ],
@@ -1729,6 +1729,18 @@ bot.on('callback_query', async q => {
     if (data.startsWith('crm_period_')) {
       const period = data.slice('crm_period_'.length);
       await showCrmReport(chatId, ['today', 'week', 'month', 'all'].includes(period) ? period : 'today', msgId);
+      return;
+    }
+
+    if (data.startsWith('crm_sync_')) {
+      const period = data.slice('crm_sync_'.length);
+      const safePeriod = ['today', 'week', 'month', 'all'].includes(period) ? period : 'today';
+      const sync = await serverPost('/api/admin/monobank/sync', { daysBack: 7 });
+      if (!sync || sync.error) {
+        await reply(chatId, `❌ Monobank не синхронізувався: ${esc(sync?.error || 'помилка')}`, crmMenuKb(safePeriod), msgId);
+        return;
+      }
+      await showCrmReport(chatId, safePeriod, msgId);
       return;
     }
 
