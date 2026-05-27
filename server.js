@@ -922,6 +922,36 @@ function addFinanceEntryOnce(entry) {
   const externalId = entry.externalId || financeExternalId(entry.source || 'system', entry.category || 'manual', entry.orderId, entry.kind);
   const existing = finance.find(x => x.externalId === externalId);
   if (existing) return existing;
+  const bankTransactionId = sanitizeStr(entry.bankTransactionId || '', 120) || null;
+  const existingBankIdx = bankTransactionId
+    ? finance.findIndex(x => x.bankTransactionId && x.bankTransactionId === bankTransactionId)
+    : -1;
+  if (existingBankIdx >= 0) {
+    const current = finance[existingBankIdx];
+    if (current.classifiedAt) return current;
+    finance[existingBankIdx] = {
+      ...current,
+      type: entry.type,
+      title: sanitizeStr(entry.title || current.title || (entry.type === 'income' ? 'Income' : 'Expense'), 180),
+      amount: asMoneyNumber(entry.amount),
+      category: sanitizeStr(entry.category || current.category || 'manual', 60),
+      source: sanitizeStr(entry.source || current.source || 'system', 60),
+      orderId: entry.orderId ? Number(entry.orderId) : current.orderId || null,
+      externalId,
+      grossAmount: asMoneyNumber(entry.grossAmount),
+      costAmount: asMoneyNumber(entry.costAmount),
+      productKey: sanitizeStr(entry.productKey || '', 60) || current.productKey || null,
+      productLabel: sanitizeStr(entry.productLabel || '', 100) || current.productLabel || null,
+      verifiedBy: sanitizeStr(entry.verifiedBy || current.verifiedBy || '', 30) || null,
+      bankDescription: sanitizeStr(entry.bankDescription || current.bankDescription || '', 240) || null,
+      counterName: sanitizeStr(entry.counterName || current.counterName || '', 180) || null,
+      classificationReason: sanitizeStr(entry.classificationReason || current.classificationReason || '', 120) || null,
+      reviewRequired: entry.reviewRequired === true,
+      reclassifiedAutomaticallyAt: new Date().toISOString(),
+    };
+    write(F.finance, finance);
+    return finance[existingBankIdx];
+  }
   const item = {
     id: nextId(finance),
     type: entry.type,
@@ -936,7 +966,7 @@ function addFinanceEntryOnce(entry) {
     productKey: sanitizeStr(entry.productKey || '', 60) || null,
     productLabel: sanitizeStr(entry.productLabel || '', 100) || null,
     verifiedBy: sanitizeStr(entry.verifiedBy || '', 30) || null,
-    bankTransactionId: sanitizeStr(entry.bankTransactionId || '', 120) || null,
+    bankTransactionId,
     bankDescription: sanitizeStr(entry.bankDescription || '', 240) || null,
     counterName: sanitizeStr(entry.counterName || '', 180) || null,
     classificationReason: sanitizeStr(entry.classificationReason || '', 120) || null,
@@ -1000,6 +1030,12 @@ function monoMatches(text, envName, fallback) {
     .filter(Boolean);
   return values.some(value => text.includes(value));
 }
+function monoMatchesAny(text, values = []) {
+  return values.some(value => text.includes(String(value).toLowerCase()));
+}
+function monoExpenseAmount(item) {
+  return Math.abs(asMoneyNumber(item?.amount) / 100);
+}
 function monoExtractTtn(text) {
   return String(text || '').match(/\b\d{14,15}\b/)?.[0] || '';
 }
@@ -1023,8 +1059,8 @@ function importMonobankStatementItem(item, orders = read(F.orders)) {
   const text = monoStatementText(item);
   const createdAt = new Date(Number(item.time || 0) * 1000).toISOString();
   if (!inFinancePeriod(createdAt, 'all')) return { imported: false, ignored: true, reason: 'before_finance_start' };
-  const isNova = monoMatches(text, 'MONOBANK_NP_KEYWORDS', 'нова пошта,nova poshta,novaposhta');
-  const isAds = monoMatches(text, 'MONOBANK_ADS_KEYWORDS', 'facebook,meta,instagram,google ads,tiktok,tik tok');
+  const isNova = monoMatches(text, 'MONOBANK_NP_KEYWORDS', 'нова пошта,новая почта,nova poshta,nova post,nova posta,novaposhta,novapost,nova pay,novapay,novaposta');
+  const isAds = monoMatches(text, 'MONOBANK_ADS_KEYWORDS', 'facebook,facebk,fb ads,fbpay,meta,meta platforms,instagram,google ads,tiktok,tik tok');
   const isBusiness = monoMatches(text, 'MONOBANK_BUSINESS_KEYWORDS', 'постачальник,supplier,упаковка,packaging');
   const isPersonal = monoMatches(text, 'MONOBANK_PERSONAL_KEYWORDS', 'таврія,таври,rozetka,temu,київстар,kyivstar,farm,medicap,into-sana,jet.ua');
   const bankAmount = asMoneyNumber(item.amount) / 100;
@@ -1033,6 +1069,7 @@ function importMonobankStatementItem(item, orders = read(F.orders)) {
   const order = match.order;
   const isCancellation = /(скасув|отмен|cancel|refund|reversal|повернен.*кошт)/i.test(text);
   const isReturnCharge = match.returnOperation || /(повернен.*посил|зворотн.*достав|return delivery|return shipment|возврат.*посыл)/i.test(text);
+  const likelyNovaReturnExpense = isReturnCharge || (isNova && bankAmount < 0 && monoExpenseAmount(item) >= 80 && monoExpenseAmount(item) <= 350);
   let entry = null;
 
   if (isNova && bankAmount > 0 && isCancellation && order) {
@@ -1048,6 +1085,22 @@ function importMonobankStatementItem(item, orders = read(F.orders)) {
       bankDescription: item.description,
       counterName: item.counterName,
       externalId: financeExternalId('monobank', isReturnCharge ? 'return-refund' : 'shipping-refund', order.id, item.id),
+      createdAt,
+    });
+  } else if (isNova && bankAmount > 0 && isCancellation) {
+    entry = addFinanceEntryOnce({
+      type: 'income',
+      title: 'Monobank: Nova Poshta charge reversal to review',
+      amount: bankAmount,
+      category: likelyNovaReturnExpense ? 'return_refund' : 'shipping_refund',
+      source: 'monobank',
+      verifiedBy: 'monobank',
+      bankTransactionId: item.id,
+      bankDescription: item.description,
+      counterName: item.counterName,
+      externalId: financeExternalId('monobank', likelyNovaReturnExpense ? 'return-refund-review' : 'shipping-refund-review', null, item.id),
+      classificationReason: 'nova_poshta_refund_without_linked_order',
+      reviewRequired: true,
       createdAt,
     });
   } else if (isNova && bankAmount > 0 && order) {
@@ -1106,30 +1159,30 @@ function importMonobankStatementItem(item, orders = read(F.orders)) {
       type: 'expense',
       title: `Monobank: Nova Poshta ${isReturnCharge ? 'return' : 'charge'}`,
       amount: Math.abs(bankAmount),
-      category: isReturnCharge ? 'return' : 'shipping',
+      category: likelyNovaReturnExpense ? 'return' : 'shipping',
       source: 'monobank',
       orderId: order?.id || null,
       verifiedBy: 'monobank',
       bankTransactionId: item.id,
       bankDescription: item.description,
       counterName: item.counterName,
-      externalId: financeExternalId('monobank', isReturnCharge ? 'return' : 'shipping', order.id, item.id),
+      externalId: financeExternalId('monobank', likelyNovaReturnExpense ? 'return' : 'shipping', order.id, item.id),
       classificationReason: 'linked_order_ttn',
       createdAt,
     });
   } else if (isNova && bankAmount < 0) {
     entry = addFinanceEntryOnce({
       type: 'expense',
-      title: 'Monobank: Nova Poshta expense to review',
+      title: 'Monobank: Nova Poshta unlinked expense',
       amount: Math.abs(bankAmount),
-      category: 'personal',
+      category: likelyNovaReturnExpense ? 'return' : 'shipping',
       source: 'monobank',
       verifiedBy: 'monobank',
       bankTransactionId: item.id,
       bankDescription: item.description,
       counterName: item.counterName,
       externalId: financeExternalId('monobank', 'np-review', null, item.id),
-      classificationReason: 'nova_poshta_without_linked_order',
+      classificationReason: 'nova_poshta_without_linked_order_auto_counted',
       reviewRequired: true,
       createdAt,
     });
@@ -2081,13 +2134,15 @@ if (npConfig.autoSync && npConfig.apiConfigured) {
 const monoConfig = monobank.configStatus();
 if (monoConfig.configured && process.env.MONOBANK_AUTO_SYNC !== 'false') {
   const monoIntervalMs = Math.max(2, Number(process.env.MONOBANK_SYNC_INTERVAL_MINUTES || 5)) * 60 * 1000;
-  syncMonobankFinance(3)
+  const startupSyncDays = Math.max(1, Math.min(31, Number(process.env.MONOBANK_STARTUP_SYNC_DAYS || 7)));
+  const intervalSyncDays = Math.max(1, Math.min(31, Number(process.env.MONOBANK_INTERVAL_SYNC_DAYS || 7)));
+  syncMonobankFinance(startupSyncDays)
     .then(result => {
       if (result.imported) console.log('[Monobank initial sync]', result);
     })
     .catch(error => console.error('[Monobank initial sync]', error.message));
   setInterval(() => {
-    syncMonobankFinance(3)
+    syncMonobankFinance(intervalSyncDays)
       .then(result => {
         if (result.imported) console.log('[Monobank sync]', result);
       })
