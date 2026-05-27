@@ -3,6 +3,6 @@
   "timezone": "Europe/Kyiv",
   "resetLabel": "26.05.2026",
   "resetKey": "finance-reset-2026-05-26",
-  "appliedResetKey": null,
-  "resetAppliedAt": null
+  "appliedResetKey": "finance-reset-2026-05-26",
+  "resetAppliedAt": "2026-05-26T00:00:00.000Z"
 }
