@@ -1155,7 +1155,7 @@ async function showCrmReview(chatId, period = 'today', page = 1, msgId = null) {
   if (!items.length) {
     text += '\n✅ Неперевірених операцій немає.';
   } else {
-    text += '\nЦі операції не впливають на прибуток бізнесу, доки ви не підтвердите категорію.\n';
+    text += '\nЦі операції вже враховані за автоматичною категорією. Підтвердьте її або змініть, якщо бот помилився. Повторно сума не додасться.\n';
     items.forEach(item => {
       const sign = item.type === 'expense' ? '−' : '+';
       text += `\n${sign}<b>${money(item.amount)}</b> · ${esc(item.bankDescription || item.title || 'Операція')}\n   ${fmtDate(item.createdAt)}\n`;
