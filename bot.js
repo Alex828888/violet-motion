@@ -494,22 +494,28 @@ async function showNpReturnTrack(chatId, id, msgId = null) {
   if (!returnTtn) {
     const requestNumber = returnOrderRequestValue(order);
     const oldTrack = order.ttn ? await serverGet(`/api/admin/np/track/${encodeURIComponent(order.ttn)}`) : null;
+    const discoveredReturnTtn = trackReturnTtn(oldTrack, order);
+    const completedByNova = discoveredReturnTtn && trackCompletedByNova(oldTrack);
     const mergedOrder = {
       ...order,
       ...(oldTrack && !oldTrack.error ? {
         npCanCreateReturn: oldTrack.possibilityCreateReturn,
         npStatus: oldTrack.status || order.npStatus,
+        npReturnStatus: oldTrack.status || order.npReturnStatus,
+        npReturnStatusCode: oldTrack.statusCode || order.npReturnStatusCode,
+        npReturnExpressWaybillNumber: discoveredReturnTtn || order.npReturnExpressWaybillNumber,
+        npReturnCompletedAt: completedByNova ? (oldTrack.receivedAt || new Date().toISOString()) : order.npReturnCompletedAt,
         npReturnOldTtnActive: trackLooksLikeReturnRoute(oldTrack, order) || order.npReturnOldTtnActive,
       } : {}),
     };
-    const canCreate = canCreateNpReturn(mergedOrder);
+    const canCreate = !discoveredReturnTtn && !completedByNova && canCreateNpReturn(mergedOrder);
     const oldLocation = trackCurrentLocation(oldTrack, order) || returnLocationLabel(order);
     return reply(chatId,
       `↩️ <b>Повернення замовлення #${esc(id)}</b>\n━━━━━━━━━━━━━━━\n` +
       `Клієнт: <b>${esc(order.name || order.fullName || '—')}</b>\n` +
       (order.product ? `Товар: <b>${esc(order.product)}</b>${order.size ? ` · р.${esc(order.size)}` : ''}\n` : '') +
       `Стара ТТН: <code>${esc(order.ttn || '—')}</code>\n` +
-      `Повернення: ${requestNumber ? `заявка <code>${esc(requestNumber)}</code>, ТТН ще не видана` : canCreate ? '<b>можна оформити</b>' : '<b>вже йде по старій ТТН / НП не дала окрему ТТН</b>'}\n\n` +
+      `Повернення: ${discoveredReturnTtn ? `<code>${esc(discoveredReturnTtn)}</code>${completedByNova ? ' · <b>отримано</b>' : ''}` : requestNumber ? `заявка <code>${esc(requestNumber)}</code>, ТТН ще не видана` : canCreate ? '<b>можна оформити</b>' : '<b>окрема ТТН ще не знайдена</b>'}\n\n` +
       `Статус старої ТТН: <b>${esc(oldTrack?.status || order.npStatus || deliveryLabel(order))}</b>\n` +
       `Де зараз: <b>${esc(oldLocation || 'оновіть НП')}</b>`,
       {
@@ -900,8 +906,28 @@ function isReturnPickedUp(order = {}) {
   return !!(order.npReturnPickedUpAt && order.npReturnPickedUpByManager);
 }
 
+function isReturnClosedByNova(order = {}) {
+  const hasReturn = !!returnTtnValue(order) || oldTtnHasReturnRoute(order);
+  if (!hasReturn) return false;
+  const code = String(order.npReturnStatusCode || order.npStatusCode || '').trim();
+  const text = returnStatusLabel(order).toLowerCase();
+  return !!(
+    order.npReturnCompletedAt ||
+    ['9', '10', '11'].includes(code) ||
+    text.includes('отримано') ||
+    text.includes('отриман') ||
+    text.includes('получен') ||
+    text.includes('receivedwarehouse')
+  );
+}
+
 function hasReturnForPanel(order = {}) {
-  return (!!returnTtnValue(order) || !!returnOrderRequestValue(order) || oldTtnHasReturnRoute(order) || canCreateNpReturn(order)) && !isReturnPickedUp(order);
+  return (
+    !!returnTtnValue(order) ||
+    !!returnOrderRequestValue(order) ||
+    oldTtnHasReturnRoute(order) ||
+    canCreateNpReturn(order)
+  ) && !isReturnPickedUp(order) && !isReturnClosedByNova(order);
 }
 
 function returnWaitBase(order = {}) {
@@ -978,6 +1004,45 @@ function trackLooksLikeReturnRoute(track = {}, order = {}) {
     text.includes('змінено адрес') ||
     text.includes('изменен') ||
     text.includes('return')
+  );
+}
+
+function trackReturnTtn(track = {}, order = {}) {
+  if (!track || track.error) return '';
+  const publicRoute = track.publicTracking && typeof track.publicTracking === 'object' ? track.publicTracking : {};
+  const currentNumber = String(publicRoute.currentNumber || '').trim();
+  const returnNumber = String(publicRoute.returnNumber || '').trim();
+  const relationType = String(publicRoute.currentRelationType || '');
+  if (
+    /^\d{14,15}$/.test(currentNumber) &&
+    currentNumber !== String(order?.ttn || '').trim() &&
+    /return|refusal|redirect|повер|возврат|відмов|отказ/i.test(relationType)
+  ) return currentNumber;
+  if (/^\d{14,15}$/.test(returnNumber)) return returnNumber;
+  const basisNumber = String(track.lastCreatedOnTheBasisNumber || '').trim();
+  if (/^\d{14,15}$/.test(basisNumber) && /return|повер|возврат|відмов|отказ/i.test(textFromTrack(track))) return basisNumber;
+  return '';
+}
+
+function textFromTrack(track = {}) {
+  return [
+    track.status,
+    track.lastCreatedOnTheBasisDocumentType,
+    track.publicTracking?.currentRelationType,
+  ].filter(Boolean).join(' ').toLowerCase();
+}
+
+function trackCompletedByNova(track = {}) {
+  if (!track || track.error) return false;
+  const code = String(track.statusCode || '').trim();
+  const text = textFromTrack(track);
+  return !!(
+    track.normalizedStatus === 'delivered' ||
+    ['9', '10', '11'].includes(code) ||
+    text.includes('отримано') ||
+    text.includes('отриман') ||
+    text.includes('получен') ||
+    text.includes('receivedwarehouse')
   );
 }
 

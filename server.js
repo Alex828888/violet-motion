@@ -1407,7 +1407,7 @@ function trackingText(track = {}) {
     track.lastCreatedOnTheBasisDocumentType,
     track.createdOnTheBasis,
     track.publicTracking?.currentStatus,
-    ...(Array.isArray(track.publicTracking?.relatedNumbers) ? track.publicTracking.relatedNumbers.map(item => item.name) : []),
+    track.publicTracking?.currentRelationType,
   ].filter(Boolean).join(' ').toLowerCase();
 }
 function trackingLooksLikeReturnRoute(track = {}, order = {}) {
@@ -1486,6 +1486,15 @@ function applyNovaTrackingToOrder(order, track) {
   if (trackingLooksLikeReturnRoute(track, order)) {
     const basisNumber = String(track.lastCreatedOnTheBasisNumber || '').trim();
     const publicRoute = track.publicTracking && typeof track.publicTracking === 'object' ? track.publicTracking : {};
+    const publicReturnNumber = String(publicRoute.returnNumber || '').trim();
+    const publicCurrentNumber = String(publicRoute.currentNumber || '').trim();
+    const publicRelationType = String(publicRoute.currentRelationType || '');
+    const publicCurrentRelatedTtn = (
+      /^\d{14,15}$/.test(publicCurrentNumber) &&
+      publicCurrentNumber !== String(order.ttn || '').trim() &&
+      /return|refusal|redirect|повер|возврат|відмов|отказ/i.test(publicRelationType)
+    ) ? publicCurrentNumber : '';
+    const publicReturnTtn = publicCurrentRelatedTtn || (/^\d{14,15}$/.test(publicReturnNumber) ? publicReturnNumber : '');
     const currentReturnCity = publicRoute.currentCity || track.city || track.senderCity || order.npReturnCity || null;
     const currentReturnWarehouse = publicRoute.currentWarehouse || track.warehouseAddress || track.warehouse || track.senderWarehouse || track.senderWarehouseAddress || order.npReturnWarehouse || null;
     patch.npReturnOldTtnActive = true;
@@ -1494,14 +1503,20 @@ function applyNovaTrackingToOrder(order, track) {
     patch.npReturnStatusCode = track.statusCode || order.npReturnStatusCode || null;
     patch.npReturnCity = currentReturnCity;
     patch.npReturnWarehouse = currentReturnWarehouse;
-    patch.npReturnSentAt = track.dateReturnCargo || track.lastCreatedOnTheBasisDateTime || track.dateMoving || publicRoute.currentDateText || order.npReturnSentAt || null;
-    patch.npReturnCandidateNumber = basisNumber || publicRoute.currentNumber || order.npReturnCandidateNumber || null;
+    patch.npReturnSentAt = track.dateReturnCargo || track.lastCreatedOnTheBasisDateTime || publicRoute.returnCreatedAt || track.dateMoving || publicRoute.currentDateText || order.npReturnSentAt || null;
+    patch.npReturnCandidateNumber = publicReturnTtn || basisNumber || publicRoute.currentNumber || order.npReturnCandidateNumber || null;
     patch.npReturnTrackingSyncedAt = now;
+    if (publicReturnTtn) {
+      patch.npReturnExpressWaybillNumber = order.npReturnExpressWaybillNumber || publicReturnTtn;
+    }
     if (basisNumber && /^\d{14,15}$/.test(basisNumber) && /return|повер|возврат|відмов|отказ/i.test(trackingText(track))) {
       patch.npReturnExpressWaybillNumber = order.npReturnExpressWaybillNumber || basisNumber;
     }
     if (trackingArrivedAtSender(track)) {
       patch.npReturnReceivedAt = order.npReturnReceivedAt || track.receivedAt || now;
+    }
+    if (track.normalizedStatus === 'delivered' && (publicReturnTtn || /return|refusal|повер|возврат|відмов|отказ/i.test(trackingText(track)))) {
+      patch.npReturnCompletedAt = order.npReturnCompletedAt || track.receivedAt || now;
     }
   }
 
@@ -1540,6 +1555,7 @@ function applyNovaReturnTrackingToOrder(order, track) {
     npReturnWarehouse: track.warehouse || order.npReturnWarehouse || null,
     npReturnSentAt: track.sentAt || order.npReturnSentAt || null,
     npReturnReceivedAt: track.receivedAt || order.npReturnReceivedAt || null,
+    ...(track.normalizedStatus === 'delivered' ? { npReturnCompletedAt: order.npReturnCompletedAt || track.receivedAt || now } : {}),
     npReturnTrackingSyncedAt: now,
     novaPoshta: {
       ...(order.novaPoshta && typeof order.novaPoshta === 'object' ? order.novaPoshta : {}),

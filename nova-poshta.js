@@ -793,12 +793,23 @@ function normalizePublicTracking(payload = {}) {
   const latest = latestEntry.item;
   const first = dated[0]?.item || latest;
   const relatedNumbers = collectPublicRelatedNumbers(payload);
-  const relatedText = relatedNumbers.map(item => item.name).join(' ').toLowerCase();
+  const isReturnRelation = item => /return|refusal|повер|возврат|відмов|отказ/i.test(String(item?.name || ''));
+  const returnRelations = relatedNumbers.filter(isReturnRelation);
   const currentNumber = String(latest.number || latest.parcel_number || payload.number || '').trim();
+  const currentRelation = relatedNumbers.find(item => item.number && item.number === currentNumber) || null;
+  const returnNumber = (
+    returnRelations.find(item => item.number && item.number === currentNumber) ||
+    returnRelations[returnRelations.length - 1] ||
+    null
+  );
   const divisionName = cleanDivisionName(latest.division_name || '');
   const status = latest.event_name || latest.event || '';
   const statusCode = String(latest.code || '');
-  const relatedReturn = /return|refusal|повер|возврат|відмов|отказ/i.test(relatedText);
+  const routeText = [status, latest.event, currentRelation?.name].filter(Boolean).join(' ');
+  const isReturnRoute = !!(returnNumber && (
+    returnNumber.number === currentNumber ||
+    /return|refusal|повер|возврат|відмов|отказ/i.test(routeText)
+  ));
 
   const normalizedStatus = normalizePublicTrackingStatus(latest);
   return {
@@ -813,14 +824,18 @@ function normalizePublicTracking(payload = {}) {
     sentAt: formatSiteTrackingDate(first.date),
     receivedAt: formatSiteTrackingDate(latest.date),
     dateMoving: formatSiteTrackingDate(latest.date),
-    cargoReturnRefusal: relatedReturn,
+    cargoReturnRefusal: isReturnRoute,
     received: normalizedStatus === 'delivered',
-    returned: normalizedStatus === 'returned' || relatedReturn,
+    returned: normalizedStatus === 'returned' || isReturnRoute,
     publicTrackingLatestMs: latestEntry.ms,
     publicTracking: {
       source: 'novaposhta_site_tracking',
       number: String(payload.number || '').trim(),
       currentNumber,
+      currentRelationType: currentRelation?.name || '',
+      returnNumber: returnNumber?.number || '',
+      returnType: returnNumber?.name || '',
+      returnCreatedAt: returnNumber?.date || '',
       currentCity: latest.settlement_name || '',
       currentWarehouse: divisionName,
       currentStatus: status,
