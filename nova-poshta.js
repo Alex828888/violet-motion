@@ -7,12 +7,18 @@ const NP_MIN_INTERVAL_MS = Math.max(0, Number(process.env.NP_MIN_INTERVAL_MS || 
 const NP_MAX_RETRIES = Math.max(0, Number(process.env.NP_MAX_RETRIES || 3));
 const NP_RETRY_BASE_MS = Math.max(250, Number(process.env.NP_RETRY_BASE_MS || 1200));
 const NP_CACHE_TTL_MS = Math.max(0, Number(process.env.NP_CACHE_TTL_MS || 6 * 60 * 60 * 1000));
+const NP_SITE_TRACKING_URL = process.env.NP_SITE_TRACKING_URL || 'https://api.novapost.com/site/v.1.0/shipments/tracking';
+const NP_SITE_TRACKING_ENABLED = process.env.NP_SITE_TRACKING_ENABLED !== 'false';
+const NP_SITE_TRACKING_TIMEOUT_MS = Math.max(1000, Number(process.env.NP_SITE_TRACKING_TIMEOUT_MS || 8000));
+const NP_SITE_TRACKING_CACHE_TTL_MS = Math.max(0, Number(process.env.NP_SITE_TRACKING_CACHE_TTL_MS || 45 * 1000));
+const NP_SITE_TRACKING_MAX_BATCH = Math.max(0, Number(process.env.NP_SITE_TRACKING_MAX_BATCH || 20));
 const NP_DEFAULT_PACK_REF = '6acae69a-e177-4732-9935-acecf090b158'; // Nova Poshta: Коробка (3 кг) пласка
 
 let novaQueue = Promise.resolve();
 let lastNovaCallAt = 0;
 const cityCache = new Map();
 const warehouseCache = new Map();
+const siteTrackingCache = new Map();
 
 class NovaPoshtaError extends Error {
   constructor(message, details = {}) {
@@ -42,6 +48,21 @@ function cacheGet(map, key) {
 
 function cacheSet(map, key, value) {
   if (value) map.set(key, { value, ts: Date.now() });
+  return value;
+}
+
+function siteCacheGet(key) {
+  const item = siteTrackingCache.get(key);
+  if (!item) return null;
+  if (NP_SITE_TRACKING_CACHE_TTL_MS && Date.now() - item.ts > NP_SITE_TRACKING_CACHE_TTL_MS) {
+    siteTrackingCache.delete(key);
+    return null;
+  }
+  return item.value;
+}
+
+function siteCacheSet(key, value) {
+  if (value) siteTrackingCache.set(key, { value, ts: Date.now() });
   return value;
 }
 
@@ -674,13 +695,238 @@ function normalizeTrackingStatus(item = {}) {
   return returned ? 'returned' : delivered ? 'delivered' : inTransit ? 'in_transit' : 'unknown';
 }
 
+function parseTrackingDateMs(value) {
+  if (!value) return 0;
+  const raw = String(value).trim();
+  if (!raw) return 0;
+  let ms = Date.parse(raw);
+  if (Number.isFinite(ms)) return ms;
+  const match = raw.match(/^(\d{2})[.\-\/](\d{2})[.\-\/](\d{4})(?:[,\s]+(\d{2}):(\d{2})(?::(\d{2}))?)?/);
+  if (!match) return 0;
+  const [, dd, mm, yyyy, hh = '00', mi = '00', ss = '00'] = match;
+  ms = Date.parse(`${yyyy}-${mm}-${dd}T${hh}:${mi}:${ss}+02:00`);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function maxTrackingDateMs(...values) {
+  return values.reduce((max, value) => Math.max(max, parseTrackingDateMs(value)), 0);
+}
+
+function formatSiteTrackingDate(value) {
+  const ms = parseTrackingDateMs(value);
+  if (!ms) return String(value || '');
+  try {
+    return new Intl.DateTimeFormat('uk-UA', {
+      timeZone: process.env.TZ || 'Europe/Kyiv',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    }).format(new Date(ms)).replace(',', '');
+  } catch {
+    return new Date(ms).toISOString();
+  }
+}
+
+function cleanDivisionName(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  return text.replace(/^\p{Ll}/u, ch => ch.toLocaleUpperCase('uk-UA'));
+}
+
+function collectPublicRelatedNumbers(payload = {}) {
+  const result = [];
+  const add = item => {
+    if (!item || typeof item !== 'object') return;
+    const number = String(item.number || item.Number || item.value || '').trim();
+    const name = String(item.name || item.Name || item.type || item.Type || '').trim();
+    const date = item.date || item.Date || item.createdAt || '';
+    if (number || name) result.push({ name, number, date });
+  };
+  const walk = value => {
+    if (!value) return;
+    if (Array.isArray(value)) {
+      value.forEach(walk);
+      return;
+    }
+    if (typeof value !== 'object') return;
+    if (Array.isArray(value.value)) {
+      value.value.forEach(add);
+      return;
+    }
+    add(value);
+  };
+  walk(payload.alternative_numbers);
+  walk(payload.alternativeNumbersGW);
+  walk(payload.alternativeNumbersGWNew);
+  const seen = new Set();
+  return result.filter(item => {
+    const key = `${item.name}|${item.number}|${item.date}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function normalizePublicTrackingStatus(event = {}) {
+  const code = String(event.code || '').trim();
+  const text = [event.event_name, event.event].filter(Boolean).join(' ').toLowerCase();
+  if (['9', '10', '11'].includes(code) || /(отриман|получен|доставлен)/i.test(text)) return 'delivered';
+  if (/(повер|возврат|відмов|отказ|return|refusal)/i.test(text)) return 'returned';
+  if (text || code) return 'in_transit';
+  return 'unknown';
+}
+
+function normalizePublicTracking(payload = {}) {
+  const events = Array.isArray(payload.tracking) ? payload.tracking : [];
+  const dated = events
+    .map(item => ({ item, ms: parseTrackingDateMs(item?.date) }))
+    .filter(entry => entry.item && entry.ms)
+    .sort((a, b) => a.ms - b.ms);
+  const nowEvent = dated.filter(entry => String(entry.item.event_status || '').toLowerCase() === 'now').pop();
+  const latestEntry = nowEvent || dated[dated.length - 1] || null;
+  if (!latestEntry) return null;
+
+  const latest = latestEntry.item;
+  const first = dated[0]?.item || latest;
+  const relatedNumbers = collectPublicRelatedNumbers(payload);
+  const relatedText = relatedNumbers.map(item => item.name).join(' ').toLowerCase();
+  const currentNumber = String(latest.number || latest.parcel_number || payload.number || '').trim();
+  const divisionName = cleanDivisionName(latest.division_name || '');
+  const status = latest.event_name || latest.event || '';
+  const statusCode = String(latest.code || '');
+  const relatedReturn = /return|refusal|повер|возврат|відмов|отказ/i.test(relatedText);
+
+  const normalizedStatus = normalizePublicTrackingStatus(latest);
+  return {
+    number: String(payload.number || currentNumber || '').trim(),
+    status,
+    statusCode,
+    normalizedStatus,
+    city: latest.settlement_name || payload.recipient?.settlement || payload.sender?.settlement || '',
+    warehouse: divisionName,
+    warehouseAddress: divisionName,
+    warehouseNumber: String(divisionName.match(/\d+/)?.[0] || ''),
+    sentAt: formatSiteTrackingDate(first.date),
+    receivedAt: formatSiteTrackingDate(latest.date),
+    dateMoving: formatSiteTrackingDate(latest.date),
+    cargoReturnRefusal: relatedReturn,
+    received: normalizedStatus === 'delivered',
+    returned: normalizedStatus === 'returned' || relatedReturn,
+    publicTrackingLatestMs: latestEntry.ms,
+    publicTracking: {
+      source: 'novaposhta_site_tracking',
+      number: String(payload.number || '').trim(),
+      currentNumber,
+      currentCity: latest.settlement_name || '',
+      currentWarehouse: divisionName,
+      currentStatus: status,
+      currentStatusCode: statusCode,
+      currentDate: latest.date || '',
+      currentDateText: formatSiteTrackingDate(latest.date),
+      currentEvent: latest.event || '',
+      currentEventStatus: latest.event_status || '',
+      relatedNumbers,
+      events: dated.slice(-30).map(entry => ({
+        number: entry.item.number || entry.item.parcel_number || '',
+        date: entry.item.date || '',
+        event: entry.item.event || '',
+        status: entry.item.event_name || '',
+        statusCode: String(entry.item.code || ''),
+        eventStatus: entry.item.event_status || '',
+        city: entry.item.settlement_name || '',
+        warehouse: cleanDivisionName(entry.item.division_name || ''),
+      })),
+    },
+    rawPublic: payload,
+  };
+}
+
+function shouldPreferPublicTracking(apiTrack = {}, publicTrack = {}) {
+  if (!publicTrack?.publicTrackingLatestMs) return false;
+  const apiMs = maxTrackingDateMs(
+    apiTrack.receivedAt,
+    apiTrack.dateMoving,
+    apiTrack.sentAt,
+    apiTrack.raw?.ActualDeliveryDate,
+    apiTrack.raw?.RecipientDateTime,
+    apiTrack.raw?.DateCreated
+  );
+  return !apiMs || publicTrack.publicTrackingLatestMs >= apiMs || publicTrack.publicTracking?.currentEventStatus === 'now';
+}
+
+function mergePublicTracking(apiTrack = {}, publicTrack = null) {
+  if (!publicTrack) return apiTrack;
+  const preferPublic = shouldPreferPublicTracking(apiTrack, publicTrack);
+  const merged = {
+    ...apiTrack,
+    publicTracking: publicTrack.publicTracking,
+    publicTrackingLatestMs: publicTrack.publicTrackingLatestMs,
+    publicTrackingSyncedAt: new Date().toISOString(),
+    cargoReturnRefusal: apiTrack.cargoReturnRefusal || publicTrack.cargoReturnRefusal,
+    rawPublic: publicTrack.rawPublic,
+  };
+  if (preferPublic) {
+    merged.status = publicTrack.status || merged.status;
+    merged.statusCode = publicTrack.statusCode || merged.statusCode;
+    merged.city = publicTrack.city || merged.city;
+    merged.warehouse = publicTrack.warehouse || merged.warehouse;
+    merged.warehouseAddress = publicTrack.warehouseAddress || merged.warehouseAddress;
+    merged.warehouseNumber = publicTrack.warehouseNumber || merged.warehouseNumber;
+    merged.receivedAt = publicTrack.receivedAt || merged.receivedAt;
+    merged.dateMoving = publicTrack.dateMoving || merged.dateMoving;
+    if (!['delivered', 'returned'].includes(merged.normalizedStatus || '')) {
+      merged.normalizedStatus = publicTrack.normalizedStatus || merged.normalizedStatus;
+    }
+  }
+  merged.received = merged.normalizedStatus === 'delivered';
+  merged.returned = merged.normalizedStatus === 'returned' || merged.cargoReturnRefusal === true;
+  return merged;
+}
+
+async function getPublicTracking(documentNumber) {
+  if (!NP_SITE_TRACKING_ENABLED) return null;
+  const ttn = String(documentNumber || '').replace(/\s+/g, '').trim();
+  if (!ttn) return null;
+  const cached = siteCacheGet(ttn);
+  if (cached) return cached;
+  const ctrl = new AbortController();
+  const timeout = setTimeout(() => ctrl.abort(), NP_SITE_TRACKING_TIMEOUT_MS);
+  try {
+    const url = `${NP_SITE_TRACKING_URL.replace(/\/+$/, '')}/${encodeURIComponent(ttn)}`;
+    const response = await fetch(url, {
+      headers: {
+        Accept: 'application/json',
+        'Accept-Language': 'uk',
+      },
+      signal: ctrl.signal,
+    });
+    const text = await response.text();
+    let payload = null;
+    try { payload = JSON.parse(text); } catch {}
+    if (response.status === 404 || response.status === 422) return siteCacheSet(ttn, null);
+    if (!response.ok || !payload) {
+      throw new NovaPoshtaError(`Nova Poshta site tracking HTTP ${response.status}`, {
+        status: response.status,
+        body: text.slice(0, 1000),
+      });
+    }
+    return siteCacheSet(ttn, normalizePublicTracking(payload));
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function trackDocuments(documents) {
   const docs = documents
     .map(item => typeof item === 'string' ? { DocumentNumber: item } : item)
     .filter(item => item?.DocumentNumber);
   if (!docs.length) return [];
   const result = await callNovaPoshta('TrackingDocument', 'getStatusDocuments', { Documents: docs.slice(0, 100) });
-  return (result.data || []).map(item => ({
+  const tracks = (result.data || []).map(item => ({
     number: item.Number || item.DocumentNumber || '',
     status: item.Status || '',
     statusCode: String(item.StatusCode || ''),
@@ -715,8 +961,23 @@ async function trackDocuments(documents) {
     announcedPrice: moneyNumber(item.AnnouncedPrice || item.Cost || 0),
     redeliverySum: moneyNumber(item.RedeliverySum || item.AfterpaymentOnGoodsCost || 0),
     redeliveryPaymentMethod: item.RedeliveryPaymentMethod || item.RedeliveryPaymentCardDescription || item.PaymentMethod || '',
+    received: normalizeTrackingStatus(item) === 'delivered',
+    returned: normalizeTrackingStatus(item) === 'returned',
     raw: item,
   }));
+  if (!NP_SITE_TRACKING_ENABLED || !NP_SITE_TRACKING_MAX_BATCH || tracks.length > NP_SITE_TRACKING_MAX_BATCH) return tracks;
+  const publicTracks = await Promise.allSettled(tracks.map(track => getPublicTracking(track.number)));
+  return tracks.map((track, index) => {
+    const publicResult = publicTracks[index];
+    if (publicResult?.status === 'fulfilled' && publicResult.value) return mergePublicTracking(track, publicResult.value);
+    if (publicResult?.status === 'rejected') {
+      return {
+        ...track,
+        publicTrackingError: publicResult.reason?.message || String(publicResult.reason || 'Nova Poshta site tracking failed'),
+      };
+    }
+    return track;
+  });
 }
 
 function documentPhoneText(doc = {}) {
@@ -913,6 +1174,7 @@ module.exports = {
   syncReturnOrderCost,
   getReturnOrdersList,
   trackDocuments,
+  getPublicTracking,
   getDocumentList,
   findDocumentsByRecipientPhone,
   configStatus,

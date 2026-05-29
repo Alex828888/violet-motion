@@ -1406,6 +1406,8 @@ function trackingText(track = {}) {
     track.status,
     track.lastCreatedOnTheBasisDocumentType,
     track.createdOnTheBasis,
+    track.publicTracking?.currentStatus,
+    ...(Array.isArray(track.publicTracking?.relatedNumbers) ? track.publicTracking.relatedNumbers.map(item => item.name) : []),
   ].filter(Boolean).join(' ').toLowerCase();
 }
 function trackingLooksLikeReturnRoute(track = {}, order = {}) {
@@ -1483,14 +1485,17 @@ function applyNovaTrackingToOrder(order, track) {
 
   if (trackingLooksLikeReturnRoute(track, order)) {
     const basisNumber = String(track.lastCreatedOnTheBasisNumber || '').trim();
+    const publicRoute = track.publicTracking && typeof track.publicTracking === 'object' ? track.publicTracking : {};
+    const currentReturnCity = publicRoute.currentCity || track.city || track.senderCity || order.npReturnCity || null;
+    const currentReturnWarehouse = publicRoute.currentWarehouse || track.warehouseAddress || track.warehouse || track.senderWarehouse || track.senderWarehouseAddress || order.npReturnWarehouse || null;
     patch.npReturnOldTtnActive = true;
     patch.npReturnPossible = track.possibilityCreateReturn === true;
     patch.npReturnStatus = track.status || order.npReturnStatus || null;
     patch.npReturnStatusCode = track.statusCode || order.npReturnStatusCode || null;
-    patch.npReturnCity = track.senderCity || order.npReturnCity || track.city || null;
-    patch.npReturnWarehouse = track.senderWarehouse || track.senderWarehouseAddress || order.npReturnWarehouse || null;
-    patch.npReturnSentAt = track.dateReturnCargo || track.lastCreatedOnTheBasisDateTime || track.dateMoving || order.npReturnSentAt || null;
-    patch.npReturnCandidateNumber = basisNumber || order.npReturnCandidateNumber || null;
+    patch.npReturnCity = currentReturnCity;
+    patch.npReturnWarehouse = currentReturnWarehouse;
+    patch.npReturnSentAt = track.dateReturnCargo || track.lastCreatedOnTheBasisDateTime || track.dateMoving || publicRoute.currentDateText || order.npReturnSentAt || null;
+    patch.npReturnCandidateNumber = basisNumber || publicRoute.currentNumber || order.npReturnCandidateNumber || null;
     patch.npReturnTrackingSyncedAt = now;
     if (basisNumber && /^\d{14,15}$/.test(basisNumber) && /return|повер|возврат|відмов|отказ/i.test(trackingText(track))) {
       patch.npReturnExpressWaybillNumber = order.npReturnExpressWaybillNumber || basisNumber;
@@ -2547,8 +2552,13 @@ app.post('/api/monobank/webhook/:secret', (req, res) => {
 });
 app.get('/api/admin/np/track/:ttn', authBot, async (req, res) => {
   try {
-    const [track] = await novaPoshta.trackDocuments([{ DocumentNumber: sanitizeStr(req.params.ttn, 40) }]);
-    if (!track) return res.status(404).json({ error: 'TTN not found' });
+    const ttn = sanitizeStr(req.params.ttn, 40);
+    const [track] = await novaPoshta.trackDocuments([{ DocumentNumber: ttn }]);
+    if (!track) {
+      const publicTrack = await novaPoshta.getPublicTracking(ttn);
+      if (!publicTrack) return res.status(404).json({ error: 'TTN not found' });
+      return res.json(publicTrack);
+    }
     res.json(track);
   } catch (error) {
     res.status(502).json(npErrorPayload(error));

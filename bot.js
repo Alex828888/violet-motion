@@ -983,6 +983,13 @@ function trackLooksLikeReturnRoute(track = {}, order = {}) {
 
 function trackCurrentLocation(track = {}, order = {}) {
   if (!track || track.error) return '';
+  if (track.publicTracking && typeof track.publicTracking === 'object') {
+    const publicLocation = [
+      track.publicTracking.currentCity || track.city,
+      track.publicTracking.currentWarehouse || track.warehouseAddress || track.warehouse,
+    ].filter(Boolean).join(' · ');
+    if (publicLocation) return publicLocation;
+  }
   if (trackLooksLikeReturnRoute(track, order)) {
     return [track.senderCity, track.senderWarehouse || track.senderWarehouseAddress].filter(Boolean).join(' · ');
   }
