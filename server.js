@@ -2628,6 +2628,15 @@ app.post('/api/admin/orders/:id/np/return', authBot, async (req, res) => {
     const result = await novaPoshta.createReturnOrder(orders[idx]);
     const now = new Date().toISOString();
     let updated = applyNovaReturnOrderToOrder(orders[idx], result.returnOrder);
+    const returnTtn = updated.npReturnExpressWaybillNumber || updated.npReturnOrderNumber;
+    if (returnTtn) {
+      try {
+        const [returnTrack] = await novaPoshta.trackDocuments([String(returnTtn)]);
+        if (returnTrack) updated = applyNovaReturnTrackingToOrder(updated, returnTrack);
+      } catch (error) {
+        updated.npReturnTrackingError = error.message;
+      }
+    }
     updated = {
       ...updated,
       status: 'returned',
