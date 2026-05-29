@@ -488,7 +488,7 @@ async function showNpTrack(chatId, id, msgId = null) {
 async function showNpReturnTrack(chatId, id, msgId = null) {
   const order = await serverGet(`/api/admin/orders/${id}`);
   if (!order || order.error) return reply(chatId, '❌ Замовлення не знайдено.', MAIN_KB, msgId);
-  const returnTtn = order.npReturnExpressWaybillNumber;
+  const returnTtn = returnTtnValue(order);
   if (!returnTtn) {
     return reply(chatId, 'ℹ️ Для цього повернення ще немає доступної ТТН. Оновіть дані Нової Пошти.', {
       inline_keyboard: [
@@ -497,21 +497,45 @@ async function showNpReturnTrack(chatId, id, msgId = null) {
       ],
     }, msgId);
   }
-  const track = await serverGet(`/api/admin/np/track/${encodeURIComponent(returnTtn)}`);
-  if (!track || track.error) return reply(chatId, '❌ Не вдалося отримати статус повернення Нової Пошти.', { inline_keyboard: [[{ text: '← До замовлення', callback_data: `od_${id}` }]] }, msgId);
+  const hasReturnWaybill = !!order.npReturnExpressWaybillNumber;
+  const track = hasReturnWaybill
+    ? await serverGet(`/api/admin/np/track/${encodeURIComponent(order.npReturnExpressWaybillNumber)}`)
+    : null;
+  if (hasReturnWaybill && (!track || track.error)) {
+    return reply(chatId, '❌ Не вдалося отримати статус повернення Нової Пошти.', { inline_keyboard: [[{ text: '← До замовлення', callback_data: `od_${id}` }]] }, msgId);
+  }
+  const returnStatus = track || {};
   const text =
     `↩️ <b>Повернення замовлення #${esc(id)}</b>\n━━━━━━━━━━━━━━━\n` +
-    `ТТН повернення: <code>${esc(returnTtn)}</code>\n` +
-    `Статус: <b>${esc(track.status || order.npReturnStatus || '—')}</b>\n` +
-    `Код: <b>${esc(track.statusCode || '—')}</b>\n` +
-    `Місто: <b>${esc(track.city || '—')}</b>\n` +
-    `Відділення: <b>${esc(track.warehouse || '—')}</b>\n` +
-    `Створено/відправлено: <b>${esc(track.sentAt || '—')}</b>\n` +
-    `Отримано: <b>${esc(track.receivedAt || '—')}</b>`;
+    `Клієнт: <b>${esc(order.name || order.fullName || '—')}</b>\n` +
+    (order.product ? `Товар: <b>${esc(order.product)}</b>${order.size ? ` · р.${esc(order.size)}` : ''}\n` : '') +
+    `Стара ТТН: <code>${esc(order.ttn || '—')}</code>\n` +
+    (order.npReturnExpressWaybillNumber
+      ? `ТТН повернення: <code>${esc(order.npReturnExpressWaybillNumber)}</code>\n`
+      : `Заявка повернення: <code>${esc(order.npReturnOrderNumber || '—')}</code>\n`) +
+    (order.npReturnOrderNumber && order.npReturnExpressWaybillNumber ? `Заявка повернення: <code>${esc(order.npReturnOrderNumber)}</code>\n` : '') +
+    `\nДе: <b>${esc(returnStatus.warehouse || order.npReturnWarehouse || returnStatus.city || order.npReturnCity || '—')}</b>\n` +
+    `Статус: <b>${esc(returnStatus.status || order.npReturnStatus || '—')}</b>\n` +
+    `Код: <b>${esc(returnStatus.statusCode || order.npReturnStatusCode || '—')}</b>\n` +
+    `Створено/відправлено: <b>${esc(returnStatus.sentAt || order.npReturnSentAt || order.npReturnCreatedAt || '—')}</b>\n` +
+    `Лежить: <b>${esc(returnWaitLabel({ ...order, npReturnSentAt: returnStatus.sentAt || order.npReturnSentAt }))}</b>\n` +
+    `Отримано: <b>${esc(returnStatus.receivedAt || order.npReturnReceivedAt || order.npReturnPickedUpAt || '—')}</b>`;
   return reply(chatId, text, { inline_keyboard: [
-    [{ text: '🔄 Оновити замовлення', callback_data: `npsync_${id}` }],
+    [{ text: '✅ Забрав', callback_data: `nprdone_${id}` }, { text: '🔄 Оновити НП', callback_data: `npsync_${id}` }],
+    [{ text: '← До повернень', callback_data: 'trk_returns' }],
     [{ text: '← До замовлення', callback_data: `od_${id}` }],
   ] }, msgId);
+}
+
+async function markNpReturnPickedUp(chatId, id, msgId = null) {
+  const updated = await serverPatch(`/api/admin/orders/${id}`, {
+    npReturnPickedUpAt: new Date().toISOString(),
+    npReturnPickedUpByManager: true,
+  });
+  if (!updated || updated.error) {
+    return reply(chatId, '❌ Не вдалося позначити повернення як забране.', trackingMenuKeyboard(), msgId);
+  }
+  return showReturnTrackingList(chatId, 1, msgId);
 }
 
 async function syncNpOrder(chatId, id, msgId = null) {
@@ -786,6 +810,50 @@ function isOrderActiveForTracking(o) {
   return !!o?.ttn && !['cancelled', 'returned', 'completed'].includes(o.status || 'new');
 }
 
+function returnTtnValue(order = {}) {
+  return order.npReturnExpressWaybillNumber || order.npReturnOrderNumber || '';
+}
+
+function isReturnPickedUp(order = {}) {
+  const text = [
+    order.npReturnTrackingStatus,
+    order.npReturnStatus,
+    order.npReturnExpressWaybillStatus,
+  ].filter(Boolean).join(' ').toLowerCase();
+  return !!(
+    order.npReturnPickedUpAt ||
+    order.npReturnReceivedAt ||
+    text.includes('delivered') ||
+    text.includes('отрим') ||
+    text.includes('получ') ||
+    text.includes('вруч')
+  );
+}
+
+function hasReturnForPanel(order = {}) {
+  return !!returnTtnValue(order) && !isReturnPickedUp(order);
+}
+
+function returnWaitBase(order = {}) {
+  return order.npReturnReceivedAt || order.npReturnSentAt || order.npReturnCreatedAt || order.returnedAt || order.updatedAt || order.createdAt;
+}
+
+function returnWaitLabel(order = {}) {
+  const base = new Date(returnWaitBase(order) || 0).getTime();
+  if (!base || Number.isNaN(base)) return '—';
+  return waitTime(Date.now() - base);
+}
+
+function returnLocationLabel(order = {}) {
+  const parts = [order.npReturnCity, order.npReturnWarehouse].filter(Boolean);
+  if (parts.length) return parts.join(' · ');
+  return order.npReturnStatus || order.npReturnExpressWaybillStatus || 'очікує оновлення НП';
+}
+
+function returnStatusLabel(order = {}) {
+  return order.npReturnStatus || order.npReturnExpressWaybillStatus || order.npReturnTrackingStatus || 'очікує оновлення';
+}
+
 function trackingMenuKeyboard() {
   return { inline_keyboard: [
     [{ text: '🚚 Активні ТТН', callback_data: 'trk_active' }, { text: '↩️ Повернення', callback_data: 'trk_returns' }],
@@ -812,11 +880,13 @@ async function showTrackingMenu(chatId, msgId = null) {
   const noTtn = orders.filter(o => !o.ttn && ['confirmed', 'shipped', 'paid'].includes(o.status || 'new'));
   const newOrders = orders.filter(o => (o.status || 'new') === 'new');
   const returnTtn = orders.filter(o => o.npReturnExpressWaybillNumber || o.npReturnOrderNumber);
+  const openReturns = orders.filter(hasReturnForPanel);
   const text =
     `🚚 <b>Відстеження</b>\n━━━━━━━━━━━━━━━\n` +
     `🆕 Нові заявки: <b>${newOrders.length}</b>\n` +
     `🚚 Активні ТТН: <b>${activeTtn.length}</b>\n` +
-    `↩️ Повернення з ТТН/заявкою: <b>${returnTtn.length}</b>\n` +
+    `↩️ Повернення до забрати: <b>${openReturns.length}</b>\n` +
+    `📦 Усі повернення з ТТН/заявкою: <b>${returnTtn.length}</b>\n` +
     `🧾 Підтверджені без ТТН: <b>${noTtn.length}</b>\n` +
     `━━━━━━━━━━━━━━━`;
   return reply(chatId, text, trackingMenuKeyboard(), msgId);
@@ -841,31 +911,53 @@ async function showTrackingList(chatId, msgId = null) {
   return reply(chatId, text, trackingListKeyboard(orders), msgId);
 }
 
-async function showReturnTrackingList(chatId, msgId = null) {
+function returnTrackingKeyboard(items, page, total) {
+  const rows = items.map(order => [{
+    text: `↩️ #${order.id} ${order.name || '—'} · ${returnWaitLabel(order)}`,
+    callback_data: `nprt_${order.id}`,
+  }]);
+  const nav = [];
+  if (page > 1) nav.push({ text: '← Назад', callback_data: `trk_returns_${page - 1}` });
+  nav.push({ text: `${page}/${total}`, callback_data: 'noop' });
+  if (page < total) nav.push({ text: 'Далі →', callback_data: `trk_returns_${page + 1}` });
+  rows.push(nav);
+  rows.push([{ text: '🔄 Оновити повернення', callback_data: 'np_sync_returns' }]);
+  rows.push([{ text: '← Відстеження', callback_data: 'track_menu' }]);
+  return { inline_keyboard: rows };
+}
+
+async function showReturnTrackingList(chatId, page = 1, msgId = null) {
   let orders = await serverGet('/api/admin/orders');
   if (!Array.isArray(orders)) return reply(chatId, '❌ Не вдалося завантажити повернення.', trackingMenuKeyboard(), msgId);
   orders = orders
-    .filter(order => order.npReturnExpressWaybillNumber || order.npReturnOrderNumber)
-    .sort((a, b) => new Date(b.npReturnCreatedAt || b.returnedAt || b.updatedAt || 0) - new Date(a.npReturnCreatedAt || a.returnedAt || a.updatedAt || 0));
-  if (!orders.length) return reply(chatId, '↩️ <b>Повернень з Нової Пошти ще немає</b>', trackingMenuKeyboard(), msgId);
-  let text = `↩️ <b>Повернення Нової Пошти</b> (${orders.length})\n━━━━━━━━━━━━━━━\n\n`;
-  orders.slice(0, 10).forEach(order => {
-    text += `#${esc(order.id)} ${esc(order.name || '—')}`;
+    .filter(hasReturnForPanel)
+    .sort((a, b) => new Date(returnWaitBase(a) || 0) - new Date(returnWaitBase(b) || 0));
+  if (!orders.length) {
+    return reply(chatId,
+      '↩️ <b>Повернення Нової Пошти</b>\n━━━━━━━━━━━━━━━\n\n✅ Немає незабраних повернень.',
+      { inline_keyboard: [[{ text: '🔄 Оновити повернення', callback_data: 'np_sync_returns' }], [{ text: '← Відстеження', callback_data: 'track_menu' }]] },
+      msgId);
+  }
+  const { items, page: current, total } = paginate(orders, page);
+  let text =
+    `↩️ <b>Повернення Нової Пошти</b>\n━━━━━━━━━━━━━━━\n` +
+    `До забрати: <b>${orders.length}</b>\n\n`;
+  items.forEach(order => {
+    const returnTtn = returnTtnValue(order);
+    text += `↩️ <b>#${esc(order.id)}</b> ${esc(order.name || order.fullName || '—')}`;
     if (order.product) text += ` · ${esc(order.product)}`;
+    if (order.size) text += ` · р.${esc(order.size)}`;
     text += '\n';
-    if (order.npReturnExpressWaybillNumber) text += `   ТТН: <code>${esc(order.npReturnExpressWaybillNumber)}</code>\n`;
-    else text += `   Заявка: <code>${esc(order.npReturnOrderNumber || '—')}</code>\n`;
-    text += `   ${esc(order.npReturnStatus || order.npReturnExpressWaybillStatus || 'очікує оновлення')}\n\n`;
+    text += `   Відправка: <code>${esc(order.ttn || '—')}</code>\n`;
+    text += `   Повернення: <code>${esc(returnTtn || '—')}</code>\n`;
+    text += `   Де: <b>${esc(returnLocationLabel(order))}</b>\n`;
+    text += `   Статус: ${esc(returnStatusLabel(order))}\n`;
+    text += `   Лежить: <b>${esc(returnWaitLabel(order))}</b>\n\n`;
   });
-  const rows = orders.slice(0, 10).map(order => [{
-    text: `↩️ #${order.id} ${order.name || '—'}`,
-    callback_data: order.npReturnExpressWaybillNumber ? `nprt_${order.id}` : `od_${order.id}`,
-  }]);
-  rows.push([{ text: '← Відстеження', callback_data: 'track_menu' }]);
-  return reply(chatId, text, { inline_keyboard: rows }, msgId);
+  return reply(chatId, text, returnTrackingKeyboard(items, current, total), msgId);
 }
 
-async function syncAllNpOrders(chatId, msgId = null) {
+async function syncAllNpOrders(chatId, msgId = null, nextView = 'menu') {
   const result = await serverPost('/api/admin/np/sync', { limit: 100 });
   if (!result || result.error) {
     await bot.sendMessage(chatId, '❌ Не вдалося оновити Нову Пошту.', { reply_markup: MAIN_KB });
@@ -874,7 +966,8 @@ async function syncAllNpOrders(chatId, msgId = null) {
   await bot.sendMessage(chatId,
     `🔄 НП оновлено. Перевірено: <b>${esc(result.checked || 0)}</b>, змінено: <b>${esc(result.changed || 0)}</b>.`,
     { parse_mode: 'HTML', reply_markup: MAIN_KB });
-  await showTrackingMenu(chatId, msgId);
+  if (nextView === 'returns') await showReturnTrackingList(chatId, 1, msgId);
+  else await showTrackingMenu(chatId, msgId);
 }
 
 async function showReviews(chatId, page = 1, msgId = null) {
@@ -1858,13 +1951,22 @@ bot.on('callback_query', async q => {
 
     if (data === 'trk_active') { await showTrackingList(chatId, msgId); return; }
 
-    if (data === 'trk_returns') { await showReturnTrackingList(chatId, msgId); return; }
+    if (data === 'trk_returns') { await showReturnTrackingList(chatId, 1, msgId); return; }
+
+    if (data.startsWith('trk_returns_')) {
+      await showReturnTrackingList(chatId, Number(data.slice('trk_returns_'.length)) || 1, msgId);
+      return;
+    }
 
     if (data === 'np_sync_all') { await syncAllNpOrders(chatId, msgId); return; }
+
+    if (data === 'np_sync_returns') { await syncAllNpOrders(chatId, msgId, 'returns'); return; }
 
     if (data.startsWith('nt_')) { await showNpTrack(chatId, Number(data.slice(3)), msgId); return; }
 
     if (data.startsWith('nprt_')) { await showNpReturnTrack(chatId, Number(data.slice(5)), msgId); return; }
+
+    if (data.startsWith('nprdone_')) { await markNpReturnPickedUp(chatId, Number(data.slice(8)), msgId); return; }
 
     if (data.startsWith('npsync_')) { await syncNpOrder(chatId, Number(data.slice(7)), msgId); return; }
 

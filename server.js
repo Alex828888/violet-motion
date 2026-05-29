@@ -1471,6 +1471,31 @@ function applyNovaReturnOrderToOrder(order, returnOrder) {
   }
   return { ...order, ...patch };
 }
+function applyNovaReturnTrackingToOrder(order, track) {
+  if (!track) return order;
+  const now = new Date().toISOString();
+  const patch = {
+    npReturnTrackingStatus: track.normalizedStatus || null,
+    npReturnStatusCode: track.statusCode || null,
+    npReturnStatus: track.status || order.npReturnStatus || null,
+    npReturnCity: track.city || order.npReturnCity || null,
+    npReturnWarehouse: track.warehouse || order.npReturnWarehouse || null,
+    npReturnSentAt: track.sentAt || order.npReturnSentAt || null,
+    npReturnReceivedAt: track.receivedAt || order.npReturnReceivedAt || null,
+    npReturnTrackingSyncedAt: now,
+    novaPoshta: {
+      ...(order.novaPoshta && typeof order.novaPoshta === 'object' ? order.novaPoshta : {}),
+      returnTracking: track,
+      returnTrackingSyncedAt: now,
+    },
+    updatedAt: now,
+  };
+  if (track.documentCost > 0) patch.npReturnDeliveryCost = order.npReturnDeliveryCost || track.documentCost;
+  if (track.normalizedStatus === 'delivered') {
+    patch.npReturnPickedUpAt = order.npReturnPickedUpAt || track.receivedAt || now;
+  }
+  return { ...order, ...patch };
+}
 async function syncOrderWithNovaPoshta(order) {
   if (!order?.ttn) throw new Error('Order has no TTN');
   const docs = [{ DocumentNumber: String(order.ttn), Phone: novaPoshta.normalizePhone(order.phone) }];
@@ -1483,6 +1508,15 @@ async function syncOrderWithNovaPoshta(order) {
       if (returnOrder) updated = applyNovaReturnOrderToOrder(updated, returnOrder);
     } catch (error) {
       updated.npReturnSyncError = error.message;
+    }
+  }
+  const returnTtn = updated.npReturnExpressWaybillNumber || updated.npReturnOrderNumber;
+  if (returnTtn) {
+    try {
+      const [returnTrack] = await novaPoshta.trackDocuments([String(returnTtn)]);
+      if (returnTrack) updated = applyNovaReturnTrackingToOrder(updated, returnTrack);
+    } catch (error) {
+      updated.npReturnTrackingError = error.message;
     }
   }
   return { updated, track };
