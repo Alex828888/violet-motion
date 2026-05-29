@@ -32,6 +32,10 @@ function env(name, fallback = '') {
   return String(process.env[name] || fallback || '').trim();
 }
 
+function envFlag(name, fallback = 'false') {
+  return !/^(false|0|no|off)$/i.test(env(name, fallback));
+}
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -619,6 +623,10 @@ function buildInternetDocumentDescription(order = {}) {
   return parts.join(' | ');
 }
 
+function buildInternetDocumentAdditionalInformation(description) {
+  return env('NP_ADDITIONAL_INFORMATION') || description;
+}
+
 async function createInternetDocument(order) {
   const baseSender = await resolveSenderConfig();
   const selectedSenderLocation = order?.npSenderLocation?.ref ? order.npSenderLocation : null;
@@ -634,13 +642,14 @@ async function createInternetDocument(order) {
   const recipient = await createRecipient(order);
   const price = Math.max(1, moneyNumber(order.price || process.env.PRODUCT_PRICE || 0));
   const description = buildInternetDocumentDescription(order);
+  const additionalInformation = buildInternetDocumentAdditionalInformation(description);
   const weight = moneyNumber(env('NP_WEIGHT_KG', '1')) || 1;
   const volume = moneyNumber(env('NP_VOLUME_GENERAL', '0.002')) || 0.002;
   const seats = Math.max(1, Math.round(moneyNumber(env('NP_SEATS_AMOUNT', '1')) || 1));
 
   const properties = {
-    PayerType: env('NP_PAYER_TYPE', 'Recipient'),
-    PaymentMethod: env('NP_PAYMENT_METHOD', 'Cash'),
+    PayerType: env('NP_PAYER_TYPE', 'Sender'),
+    PaymentMethod: env('NP_PAYMENT_METHOD', 'NonCash'),
     DateTime: todayNpDate(),
     CargoType: env('NP_CARGO_TYPE', 'Parcel'),
     VolumeGeneral: String(volume),
@@ -648,6 +657,7 @@ async function createInternetDocument(order) {
     ServiceType: env('NP_SERVICE_TYPE', 'WarehouseWarehouse'),
     SeatsAmount: String(seats),
     Description: description,
+    AdditionalInformation: additionalInformation,
     Cost: String(price),
     CitySender: sender.CitySender,
     Sender: sender.Sender,
@@ -662,7 +672,9 @@ async function createInternetDocument(order) {
   };
 
   properties.OptionsSeat = buildSeatsOptions();
-  if (env('NP_COD_ENABLED', 'true') !== 'false' && price > 0) {
+  if (envFlag('NP_PAYMENT_CONTROL_ENABLED', 'true') && price > 0) {
+    properties.AfterpaymentOnGoodsCost = String(price);
+  } else if (envFlag('NP_LEGACY_BACKWARD_DELIVERY_ENABLED', 'false') && price > 0) {
     properties.BackwardDeliveryData = [{
       PayerType: env('NP_COD_PAYER_TYPE', 'Recipient'),
       CargoType: 'Money',
@@ -1168,10 +1180,10 @@ function configStatus() {
   const missingSender = senderVars.filter(name => !env(name));
   return {
     apiConfigured: !!NP_API_KEY,
-    codEnabled: env('NP_COD_ENABLED', 'true') !== 'false',
-    payerType: env('NP_PAYER_TYPE', 'Recipient'),
-    paymentMethod: env('NP_PAYMENT_METHOD', 'Cash'),
-    codPayerType: env('NP_COD_PAYER_TYPE', 'Recipient'),
+    paymentControlEnabled: envFlag('NP_PAYMENT_CONTROL_ENABLED', 'true'),
+    legacyBackwardDeliveryEnabled: envFlag('NP_LEGACY_BACKWARD_DELIVERY_ENABLED', 'false'),
+    payerType: env('NP_PAYER_TYPE', 'Sender'),
+    paymentMethod: env('NP_PAYMENT_METHOD', 'NonCash'),
     serviceType: env('NP_SERVICE_TYPE', 'WarehouseWarehouse'),
     senderPhoneConfigured: !!env('NP_SENDER_PHONE'),
     senderConfigured: missingSender.length === 0,

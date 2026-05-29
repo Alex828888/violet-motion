@@ -1343,7 +1343,7 @@ function npDetailMessages(details = {}) {
     .filter(Boolean)
     .slice(0, 3);
 }
-function isNpCodUnavailable(details = {}) {
+function isNpPaymentServiceUnavailable(details = {}) {
   return /післяплат|послеплат|afterpayment|backwarddelivery|redelivery/i.test(npDetailsText(details)) &&
     /(недоступ|unavailable|not available)/i.test(npDetailsText(details));
 }
@@ -1370,8 +1370,8 @@ function npUserMessage(error, details = {}) {
   if (/recipient name or phone is incomplete/i.test(message)) {
     return 'Для ТТН Новій Пошті потрібні коректні ПІБ отримувача та телефон.';
   }
-  if (isNpCodUnavailable(details)) {
-    return 'Нова Пошта відхилила післяплату: для цього API-ключа/відправника послуга післяплати недоступна. У Render перевірте NOVA_POSHTA_API_KEY, NP_SENDER_PHONE та увімкнену послугу післяплати в кабінеті НП, або тимчасово поставте NP_COD_ENABLED=false.';
+  if (isNpPaymentServiceUnavailable(details)) {
+    return 'Нова Пошта відхилила контроль оплати/післяплату: для цього API-ключа або відправника фінансова послуга недоступна. У Render перевірте NOVA_POSHTA_API_KEY і NP_SENDER_PHONE, а в кабінеті НП/NovaPay - договір та доступ до контролю оплати.';
   }
   if (apiErrors.length) {
     return `Нова Пошта відхилила ТТН: ${apiErrors.join('; ')}`;
