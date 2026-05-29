@@ -1401,6 +1401,28 @@ function ttnAlreadyUsed(orders, ttn, exceptOrderId = null) {
   const value = String(ttn || '').trim();
   return !!value && orders.some(o => String(o.ttn || '').trim() === value && Number(o.id) !== Number(exceptOrderId));
 }
+function trackingText(track = {}) {
+  return [
+    track.status,
+    track.lastCreatedOnTheBasisDocumentType,
+    track.createdOnTheBasis,
+  ].filter(Boolean).join(' ').toLowerCase();
+}
+function trackingLooksLikeReturnRoute(track = {}, order = {}) {
+  const text = trackingText(track);
+  const orderReturn = ['returned'].includes(order?.status || '') || orderPaymentStatus(order) === 'returned';
+  return !!(
+    track.normalizedStatus === 'returned' ||
+    track.cargoReturnRefusal ||
+    /повер|возврат|відмов|отказ|змінено\s+адрес|измен[её]н.*адрес|return/i.test(text) ||
+    (orderReturn && (track.senderWarehouse || track.senderWarehouseAddress || track.lastCreatedOnTheBasisNumber))
+  );
+}
+function trackingArrivedAtSender(track = {}) {
+  const code = String(track.statusCode || '');
+  const text = trackingText(track);
+  return ['7', '8'].includes(code) || /прибул|прибыл|відділен|отдел|поштомат|почтомат|postomat/i.test(text);
+}
 function applyNovaTrackingToOrder(order, track) {
   const now = new Date().toISOString();
   const patch = {
@@ -1409,6 +1431,16 @@ function applyNovaTrackingToOrder(order, track) {
     npStatusCode: track.statusCode || null,
     npCity: track.city || order.npCity || null,
     npWarehouse: track.warehouse || order.npWarehouse || null,
+    npWarehouseAddress: track.warehouseAddress || order.npWarehouseAddress || null,
+    npWarehouseNumber: track.warehouseNumber || order.npWarehouseNumber || null,
+    npSenderCity: track.senderCity || order.npSenderCity || null,
+    npSenderWarehouse: track.senderWarehouse || order.npSenderWarehouse || null,
+    npSenderWarehouseAddress: track.senderWarehouseAddress || order.npSenderWarehouseAddress || null,
+    npCanCreateReturn: track.possibilityCreateReturn === true,
+    npCanCreateRefusal: track.possibilityCreateRefusal === true,
+    npCanCreateRedirecting: track.possibilityCreateRedirecting === true,
+    npLastCreatedOnTheBasisNumber: track.lastCreatedOnTheBasisNumber || order.npLastCreatedOnTheBasisNumber || null,
+    npLastCreatedOnTheBasisDocumentType: track.lastCreatedOnTheBasisDocumentType || order.npLastCreatedOnTheBasisDocumentType || null,
     npSyncedAt: now,
     novaPoshta: {
       ...(order.novaPoshta && typeof order.novaPoshta === 'object' ? order.novaPoshta : {}),
@@ -1447,6 +1479,25 @@ function applyNovaTrackingToOrder(order, track) {
     patch.paymentStatus = 'returned';
     patch.status = 'returned';
     patch.returnedAt = order.returnedAt || now;
+  }
+
+  if (trackingLooksLikeReturnRoute(track, order)) {
+    const basisNumber = String(track.lastCreatedOnTheBasisNumber || '').trim();
+    patch.npReturnOldTtnActive = true;
+    patch.npReturnPossible = track.possibilityCreateReturn === true;
+    patch.npReturnStatus = track.status || order.npReturnStatus || null;
+    patch.npReturnStatusCode = track.statusCode || order.npReturnStatusCode || null;
+    patch.npReturnCity = track.senderCity || order.npReturnCity || track.city || null;
+    patch.npReturnWarehouse = track.senderWarehouse || track.senderWarehouseAddress || order.npReturnWarehouse || null;
+    patch.npReturnSentAt = track.dateReturnCargo || track.lastCreatedOnTheBasisDateTime || track.dateMoving || order.npReturnSentAt || null;
+    patch.npReturnCandidateNumber = basisNumber || order.npReturnCandidateNumber || null;
+    patch.npReturnTrackingSyncedAt = now;
+    if (basisNumber && /^\d{14,15}$/.test(basisNumber) && /return|повер|возврат|відмов|отказ/i.test(trackingText(track))) {
+      patch.npReturnExpressWaybillNumber = order.npReturnExpressWaybillNumber || basisNumber;
+    }
+    if (trackingArrivedAtSender(track)) {
+      patch.npReturnReceivedAt = order.npReturnReceivedAt || track.receivedAt || now;
+    }
   }
 
   return { ...order, ...patch, updatedAt: now };

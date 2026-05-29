@@ -436,7 +436,7 @@ function orderDetailKeyboard(o) {
   }
   if (o.npReturnExpressWaybillNumber || o.npReturnOrderNumber) {
     rows.push([{ text: '↩️ Статус повернення', callback_data: `nprt_${id}` }]);
-  } else if (o.ttn && hasReturnForPanel(o)) {
+  } else if (canCreateNpReturn(o)) {
     rows.push([{ text: '↩️ Оформити повернення', callback_data: `nprcreate_${id}` }]);
   }
   rows.push([{ text: '🗑 Видалити', callback_data: `del_order_${id}` }]);
@@ -494,17 +494,27 @@ async function showNpReturnTrack(chatId, id, msgId = null) {
   if (!returnTtn) {
     const requestNumber = returnOrderRequestValue(order);
     const oldTrack = order.ttn ? await serverGet(`/api/admin/np/track/${encodeURIComponent(order.ttn)}`) : null;
+    const mergedOrder = {
+      ...order,
+      ...(oldTrack && !oldTrack.error ? {
+        npCanCreateReturn: oldTrack.possibilityCreateReturn,
+        npStatus: oldTrack.status || order.npStatus,
+        npReturnOldTtnActive: trackLooksLikeReturnRoute(oldTrack, order) || order.npReturnOldTtnActive,
+      } : {}),
+    };
+    const canCreate = canCreateNpReturn(mergedOrder);
+    const oldLocation = trackCurrentLocation(oldTrack, order) || returnLocationLabel(order);
     return reply(chatId,
       `↩️ <b>Повернення замовлення #${esc(id)}</b>\n━━━━━━━━━━━━━━━\n` +
       `Клієнт: <b>${esc(order.name || order.fullName || '—')}</b>\n` +
       (order.product ? `Товар: <b>${esc(order.product)}</b>${order.size ? ` · р.${esc(order.size)}` : ''}\n` : '') +
       `Стара ТТН: <code>${esc(order.ttn || '—')}</code>\n` +
-      `Повернення: ${requestNumber ? `заявка <code>${esc(requestNumber)}</code>, ТТН ще не видана` : '<b>ще не оформлено</b>'}\n\n` +
+      `Повернення: ${requestNumber ? `заявка <code>${esc(requestNumber)}</code>, ТТН ще не видана` : canCreate ? '<b>можна оформити</b>' : '<b>вже йде по старій ТТН / НП не дала окрему ТТН</b>'}\n\n` +
       `Статус старої ТТН: <b>${esc(oldTrack?.status || order.npStatus || deliveryLabel(order))}</b>\n` +
-      `Де зараз: <b>${esc(oldTrack?.warehouse || oldTrack?.city || order.npWarehouse || order.npCity || 'оновіть НП')}</b>`,
+      `Де зараз: <b>${esc(oldLocation || 'оновіть НП')}</b>`,
       {
       inline_keyboard: [
-        ...(requestNumber ? [] : [[{ text: '↩️ Оформити повернення', callback_data: `nprcreate_${id}` }]]),
+        ...(canCreate ? [[{ text: '↩️ Оформити повернення', callback_data: `nprcreate_${id}` }]] : []),
         [{ text: '🔄 Оновити НП', callback_data: `npsync_${id}` }],
         [{ text: '← До повернень', callback_data: 'trk_returns' }],
         [{ text: '← До замовлення', callback_data: `od_${id}` }],
@@ -848,21 +858,50 @@ function returnOrderRequestValue(order = {}) {
   return order.npReturnOrderNumber || '';
 }
 
-function isReturnPickedUp(order = {}) {
-  return !!(order.npReturnPickedUpAt && order.npReturnPickedUpByManager);
-}
-
-function hasReturnForPanel(order = {}) {
-  const statusText = [
+function returnStatusText(order = {}) {
+  return [
     order.status,
     order.paymentStatus,
     order.deliveryStatus,
     order.npStatus,
     order.npReturnStatus,
     order.npReturnExpressWaybillStatus,
+    order.npLastCreatedOnTheBasisDocumentType,
   ].filter(Boolean).join(' ').toLowerCase();
-  const looksReturned = statusText.includes('returned') || statusText.includes('повер') || statusText.includes('возврат') || statusText.includes('відмов');
-  return (!!returnTtnValue(order) || !!returnOrderRequestValue(order) || (!!order.ttn && looksReturned)) && !isReturnPickedUp(order);
+}
+
+function oldTtnHasReturnRoute(order = {}) {
+  const text = returnStatusText(order);
+  return !!(
+    order.npReturnOldTtnActive ||
+    order.npReturnCandidateNumber ||
+    text.includes('returned') ||
+    text.includes('повер') ||
+    text.includes('возврат') ||
+    text.includes('відмов') ||
+    text.includes('отказ') ||
+    text.includes('змінено адрес') ||
+    text.includes('изменен') ||
+    text.includes('return')
+  );
+}
+
+function canCreateNpReturn(order = {}) {
+  return !!(
+    order.ttn &&
+    order.npCanCreateReturn === true &&
+    !returnTtnValue(order) &&
+    !returnOrderRequestValue(order) &&
+    !oldTtnHasReturnRoute(order)
+  );
+}
+
+function isReturnPickedUp(order = {}) {
+  return !!(order.npReturnPickedUpAt && order.npReturnPickedUpByManager);
+}
+
+function hasReturnForPanel(order = {}) {
+  return (!!returnTtnValue(order) || !!returnOrderRequestValue(order) || oldTtnHasReturnRoute(order) || canCreateNpReturn(order)) && !isReturnPickedUp(order);
 }
 
 function returnWaitBase(order = {}) {
@@ -876,7 +915,10 @@ function returnWaitLabel(order = {}) {
 }
 
 function returnLocationLabel(order = {}) {
-  const parts = [order.npReturnCity || order.npCity, order.npReturnWarehouse || order.npWarehouse].filter(Boolean);
+  const useSenderPoint = oldTtnHasReturnRoute(order) && !returnTtnValue(order);
+  const city = order.npReturnCity || (useSenderPoint ? order.npSenderCity : order.npCity);
+  const warehouse = order.npReturnWarehouse || (useSenderPoint ? (order.npSenderWarehouse || order.npSenderWarehouseAddress) : (order.npWarehouseAddress || order.npWarehouse));
+  const parts = [city, warehouse].filter(Boolean);
   if (parts.length) return parts.join(' · ');
   return order.npReturnStatus || order.npReturnExpressWaybillStatus || order.npStatus || 'очікує оновлення НП';
 }
@@ -889,9 +931,11 @@ function returnFlowState(order = {}) {
   const statusText = returnStatusLabel(order).toLowerCase();
   const hasRequest = !!returnOrderRequestValue(order);
   const hasWaybill = !!returnTtnValue(order);
+  const canCreate = canCreateNpReturn(order);
   const arrived = !!(
     order.npReturnReceivedAt ||
     order.npReturnTrackingStatus === 'delivered' ||
+    (oldTtnHasReturnRoute(order) && ['7', '8'].includes(String(order.npReturnStatusCode || order.npStatusCode || ''))) ||
     statusText.includes('отрим') ||
     statusText.includes('получ') ||
     statusText.includes('прибув') ||
@@ -901,7 +945,7 @@ function returnFlowState(order = {}) {
     statusText.includes('поштомат') ||
     statusText.includes('почтомат')
   );
-  if (!hasRequest && !hasWaybill) return 'request';
+  if (canCreate && !hasRequest && !hasWaybill) return 'request';
   if (arrived) return 'arrived';
   return 'transit';
 }
@@ -919,6 +963,30 @@ function returnLocationType(order = {}) {
   if (text.includes('поштомат') || text.includes('почтомат') || text.includes('postomat')) return 'postomat';
   if (text.includes('відділ') || text.includes('отдел') || text.includes('branch')) return 'branch';
   return 'unknown';
+}
+
+function trackLooksLikeReturnRoute(track = {}, order = {}) {
+  const text = [track.status, track.lastCreatedOnTheBasisDocumentType].filter(Boolean).join(' ').toLowerCase();
+  return !!(
+    track.normalizedStatus === 'returned' ||
+    track.cargoReturnRefusal ||
+    oldTtnHasReturnRoute(order) ||
+    text.includes('повер') ||
+    text.includes('возврат') ||
+    text.includes('відмов') ||
+    text.includes('отказ') ||
+    text.includes('змінено адрес') ||
+    text.includes('изменен') ||
+    text.includes('return')
+  );
+}
+
+function trackCurrentLocation(track = {}, order = {}) {
+  if (!track || track.error) return '';
+  if (trackLooksLikeReturnRoute(track, order)) {
+    return [track.senderCity, track.senderWarehouse || track.senderWarehouseAddress].filter(Boolean).join(' · ');
+  }
+  return [track.city, track.warehouseAddress || track.warehouse].filter(Boolean).join(' · ');
 }
 
 function trackingMenuKeyboard() {
