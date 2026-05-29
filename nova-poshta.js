@@ -793,10 +793,10 @@ function normalizeReturnOrder(item = {}) {
     ref: item.Ref || item.OrderRef || '',
     number: item.Number || item.OrderNumber || '',
     status: item.OrderStatus || item.Status || '',
-    documentNumber: item.DocumentNumber || item.IntDocNumber || '',
+    documentNumber: item.DocumentNumber || item.IntDocNumber || item.OriginalDocumentNumber || item.OwnerDocumentNumber || item.EWNumber || '',
     deliveryCost: moneyNumber(item.DeliveryCost || item.Cost || 0),
     estimatedDeliveryDate: item.EstimatedDeliveryDate || '',
-    expressWaybillNumber: item.ExpressWaybillNumber || '',
+    expressWaybillNumber: item.ExpressWaybillNumber || item.ReturnExpressWaybillNumber || item.IntDocNumberReturn || '',
     expressWaybillStatus: item.ExpressWaybillStatus || '',
     raw: item,
   };

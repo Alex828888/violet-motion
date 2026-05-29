@@ -1407,6 +1407,8 @@ function applyNovaTrackingToOrder(order, track) {
     deliveryStatus: track.normalizedStatus,
     npStatus: track.status || null,
     npStatusCode: track.statusCode || null,
+    npCity: track.city || order.npCity || null,
+    npWarehouse: track.warehouse || order.npWarehouse || null,
     npSyncedAt: now,
     novaPoshta: {
       ...(order.novaPoshta && typeof order.novaPoshta === 'object' ? order.novaPoshta : {}),
@@ -1491,9 +1493,6 @@ function applyNovaReturnTrackingToOrder(order, track) {
     updatedAt: now,
   };
   if (track.documentCost > 0) patch.npReturnDeliveryCost = order.npReturnDeliveryCost || track.documentCost;
-  if (track.normalizedStatus === 'delivered') {
-    patch.npReturnPickedUpAt = order.npReturnPickedUpAt || track.receivedAt || now;
-  }
   return { ...order, ...patch };
 }
 async function syncOrderWithNovaPoshta(order) {
@@ -1520,6 +1519,69 @@ async function syncOrderWithNovaPoshta(order) {
     }
   }
   return { updated, track };
+}
+async function syncReturnOrdersFromNovaPoshta(orders, limit = 100) {
+  const daysBack = Math.max(7, Math.min(120, Number(process.env.NP_RETURN_SYNC_DAYS || 45)));
+  const pageLimit = Math.max(10, Math.min(100, Number(limit || 100)));
+  const maxPages = Math.max(1, Math.min(5, Math.ceil(pageLimit / 50)));
+  const fromDate = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000);
+  const dateFrom = [
+    String(fromDate.getDate()).padStart(2, '0'),
+    String(fromDate.getMonth() + 1).padStart(2, '0'),
+    fromDate.getFullYear(),
+  ].join('.');
+  let changed = 0;
+  let checked = 0;
+  const errors = [];
+  const returns = [];
+
+  for (let page = 1; page <= maxPages; page++) {
+    try {
+      const batch = await novaPoshta.getReturnOrdersList({
+        dateFrom,
+        page,
+        limit: 50,
+      });
+      returns.push(...batch);
+      if (batch.length < 50) break;
+    } catch (error) {
+      errors.push({ step: 'return-orders-list', error: error.message });
+      break;
+    }
+  }
+
+  for (const returnOrder of returns.slice(0, pageLimit)) {
+    checked++;
+    const candidates = [
+      returnOrder.ref,
+      returnOrder.documentNumber,
+      returnOrder.expressWaybillNumber,
+      returnOrder.number,
+    ].map(value => String(value || '').trim()).filter(Boolean);
+    const idx = orders.findIndex(order => candidates.some(value => (
+      String(order.ttn || '').trim() === value ||
+      String(order.npReturnExpressWaybillNumber || '').trim() === value ||
+      String(order.npReturnOrderNumber || '').trim() === value ||
+      String(order.npReturnOrderRef || '').trim() === value
+    )));
+    if (idx < 0) continue;
+    let updated = applyNovaReturnOrderToOrder(orders[idx], returnOrder);
+    const returnTtn = updated.npReturnExpressWaybillNumber || updated.npReturnOrderNumber;
+    if (returnTtn) {
+      try {
+        const [returnTrack] = await novaPoshta.trackDocuments([String(returnTtn)]);
+        if (returnTrack) updated = applyNovaReturnTrackingToOrder(updated, returnTrack);
+      } catch (error) {
+        updated.npReturnTrackingError = error.message;
+      }
+    }
+    if (JSON.stringify(updated) !== JSON.stringify(orders[idx])) {
+      orders[idx] = updated;
+      changed++;
+    }
+  }
+
+  return { checked, changed, errors, found: returns.length };
 }
 async function linkManualNovaPoshtaTtn(order, orders = read(F.orders)) {
   if (!canAutoLinkManualNpOrder(order)) return { linked: false, reason: 'not_eligible' };
@@ -1580,8 +1642,18 @@ async function syncOpenNovaPoshtaOrders(limit = 100) {
       errors.push({ orderId: order.id, ttn: order.ttn, error: error.message });
     }
   }
+  const returnSync = await syncReturnOrdersFromNovaPoshta(orders, limit);
+  changed += returnSync.changed;
+  errors.push(...returnSync.errors);
   if (changed) write(F.orders, orders);
-  return { checked: candidates.length, linkChecked: linkCandidates.length, changed, errors };
+  return {
+    checked: candidates.length,
+    linkChecked: linkCandidates.length,
+    returnChecked: returnSync.checked,
+    returnFound: returnSync.found,
+    changed,
+    errors,
+  };
 }
 
 function escapeHtml(val) {

@@ -815,23 +815,20 @@ function returnTtnValue(order = {}) {
 }
 
 function isReturnPickedUp(order = {}) {
-  const text = [
-    order.npReturnTrackingStatus,
-    order.npReturnStatus,
-    order.npReturnExpressWaybillStatus,
-  ].filter(Boolean).join(' ').toLowerCase();
-  return !!(
-    order.npReturnPickedUpAt ||
-    order.npReturnReceivedAt ||
-    text.includes('delivered') ||
-    text.includes('отрим') ||
-    text.includes('получ') ||
-    text.includes('вруч')
-  );
+  return !!(order.npReturnPickedUpAt && order.npReturnPickedUpByManager);
 }
 
 function hasReturnForPanel(order = {}) {
-  return !!returnTtnValue(order) && !isReturnPickedUp(order);
+  const statusText = [
+    order.status,
+    order.paymentStatus,
+    order.deliveryStatus,
+    order.npStatus,
+    order.npReturnStatus,
+    order.npReturnExpressWaybillStatus,
+  ].filter(Boolean).join(' ').toLowerCase();
+  const looksReturned = statusText.includes('returned') || statusText.includes('повер') || statusText.includes('возврат') || statusText.includes('відмов');
+  return (!!returnTtnValue(order) || (!!order.ttn && looksReturned)) && !isReturnPickedUp(order);
 }
 
 function returnWaitBase(order = {}) {
@@ -845,13 +842,20 @@ function returnWaitLabel(order = {}) {
 }
 
 function returnLocationLabel(order = {}) {
-  const parts = [order.npReturnCity, order.npReturnWarehouse].filter(Boolean);
+  const parts = [order.npReturnCity || order.npCity, order.npReturnWarehouse || order.npWarehouse].filter(Boolean);
   if (parts.length) return parts.join(' · ');
-  return order.npReturnStatus || order.npReturnExpressWaybillStatus || 'очікує оновлення НП';
+  return order.npReturnStatus || order.npReturnExpressWaybillStatus || order.npStatus || 'очікує оновлення НП';
 }
 
 function returnStatusLabel(order = {}) {
-  return order.npReturnStatus || order.npReturnExpressWaybillStatus || order.npReturnTrackingStatus || 'очікує оновлення';
+  return order.npReturnStatus || order.npReturnExpressWaybillStatus || order.npReturnTrackingStatus || order.npStatus || 'очікує оновлення';
+}
+
+function returnLocationType(order = {}) {
+  const text = returnLocationLabel(order).toLowerCase();
+  if (text.includes('поштомат') || text.includes('почтомат') || text.includes('postomat')) return 'postomat';
+  if (text.includes('відділ') || text.includes('отдел') || text.includes('branch')) return 'branch';
+  return 'unknown';
 }
 
 function trackingMenuKeyboard() {
@@ -939,9 +943,12 @@ async function showReturnTrackingList(chatId, page = 1, msgId = null) {
       msgId);
   }
   const { items, page: current, total } = paginate(orders, page);
+  const branchCount = orders.filter(order => returnLocationType(order) === 'branch').length;
+  const postomatCount = orders.filter(order => returnLocationType(order) === 'postomat').length;
   let text =
     `↩️ <b>Повернення Нової Пошти</b>\n━━━━━━━━━━━━━━━\n` +
-    `До забрати: <b>${orders.length}</b>\n\n`;
+    `До забрати: <b>${orders.length}</b>\n` +
+    `Відділення: <b>${branchCount}</b> · Поштомати: <b>${postomatCount}</b>\n\n`;
   items.forEach(order => {
     const returnTtn = returnTtnValue(order);
     text += `↩️ <b>#${esc(order.id)}</b> ${esc(order.name || order.fullName || '—')}`;
@@ -949,7 +956,7 @@ async function showReturnTrackingList(chatId, page = 1, msgId = null) {
     if (order.size) text += ` · р.${esc(order.size)}`;
     text += '\n';
     text += `   Відправка: <code>${esc(order.ttn || '—')}</code>\n`;
-    text += `   Повернення: <code>${esc(returnTtn || '—')}</code>\n`;
+    text += `   Повернення: ${returnTtn ? `<code>${esc(returnTtn)}</code>` : '<b>ТТН ще не привʼязана</b>'}\n`;
     text += `   Де: <b>${esc(returnLocationLabel(order))}</b>\n`;
     text += `   Статус: ${esc(returnStatusLabel(order))}\n`;
     text += `   Лежить: <b>${esc(returnWaitLabel(order))}</b>\n\n`;
