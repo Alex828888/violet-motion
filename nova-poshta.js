@@ -12,7 +12,7 @@ const NP_SITE_TRACKING_ENABLED = process.env.NP_SITE_TRACKING_ENABLED !== 'false
 const NP_SITE_TRACKING_TIMEOUT_MS = Math.max(1000, Number(process.env.NP_SITE_TRACKING_TIMEOUT_MS || 8000));
 const NP_SITE_TRACKING_CACHE_TTL_MS = Math.max(0, Number(process.env.NP_SITE_TRACKING_CACHE_TTL_MS || 45 * 1000));
 const NP_SITE_TRACKING_MAX_BATCH = Math.max(0, Number(process.env.NP_SITE_TRACKING_MAX_BATCH || 20));
-const NP_DEFAULT_PACK_REF = '6acae69a-e177-4732-9935-acecf090b158'; // Nova Poshta: Коробка (3 кг) пласка
+const NP_DEFAULT_PACK_REF = '';
 
 let novaQueue = Promise.resolve();
 let lastNovaCallAt = 0;
@@ -109,6 +109,11 @@ function moneyNumber(value) {
   if (value === null || value === undefined || value === '') return 0;
   const n = Number(String(value).replace(',', '.').replace(/[^\d.-]/g, ''));
   return Number.isFinite(n) ? n : 0;
+}
+
+function moneyRounded(value) {
+  const n = moneyNumber(value);
+  return Number.isFinite(n) ? Math.round(n) : 0;
 }
 
 function normalizePhone(phone) {
@@ -598,9 +603,9 @@ async function createRecipient(order) {
 function buildSeatsOptions() {
   const width = moneyNumber(env('NP_SEAT_WIDTH_CM', '24'));
   const length = moneyNumber(env('NP_SEAT_LENGTH_CM', '34'));
-  const height = moneyNumber(env('NP_SEAT_HEIGHT_CM', '14.7'));
-  const weight = moneyNumber(env('NP_WEIGHT_KG', '1'));
-  const volume = moneyNumber(env('NP_VOLUME_GENERAL', '0.002')) || Math.max(0.001, (width * length * height) / 1000000);
+  const height = moneyNumber(env('NP_SEAT_HEIGHT_CM', '12'));
+  const weight = moneyNumber(env('NP_WEIGHT_KG', '2'));
+  const volume = moneyNumber(env('NP_VOLUME_GENERAL', '0.01')) || Math.max(0.001, (width * length * height) / 1000000);
   const seat = {
     volumetricVolume: volume,
     volumetricWidth: width,
@@ -608,23 +613,42 @@ function buildSeatsOptions() {
     volumetricHeight: height,
     weight,
   };
-  if (env('NP_PACK_ENABLED', 'true') !== 'false') {
-    seat.packRef = env('NP_PACK_REF', NP_DEFAULT_PACK_REF);
+  const packRef = env('NP_PACK_REF', NP_DEFAULT_PACK_REF);
+  if (env('NP_PACK_ENABLED', 'true') !== 'false' && packRef) {
+    seat.packRef = packRef;
   }
   return [seat];
 }
 
+function cleanNpText(value) {
+  return String(value || '')
+    .replace(/[|]+/g, ', ')
+    .replace(/\s*[,;]\s*/g, ', ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function buildInternetDocumentDescription(order = {}) {
-  const description = env('NP_DESCRIPTION');
-  const product = String(order.product || process.env.PRODUCT_NAME || 'Order').trim();
-  const size = String(order.size || '').trim();
+  const description = cleanNpText(env('NP_DESCRIPTION'));
+  const product = cleanNpText(order.product || process.env.PRODUCT_NAME || 'Order');
+  const size = cleanNpText(order.size || '');
   const parts = [description, product].filter((part, index, items) => part && items.indexOf(part) === index);
   if (size) parts.push(`size ${size}`);
-  return parts.join(' | ');
+  return parts.join(', ');
 }
 
 function buildInternetDocumentAdditionalInformation(description) {
-  return env('NP_ADDITIONAL_INFORMATION') || description;
+  return cleanNpText(env('NP_ADDITIONAL_INFORMATION') || description);
+}
+
+function buildNovaPaymentAmount(order = {}) {
+  const basePrice = Math.max(1, moneyRounded(order.price || process.env.PRODUCT_PRICE || 0));
+  const extra = Math.max(0, moneyRounded(env('NP_PAYMENT_CONTROL_EXTRA_UAH', '140')));
+  return {
+    basePrice,
+    extra,
+    amount: basePrice + extra,
+  };
 }
 
 async function createInternetDocument(order) {
@@ -640,11 +664,11 @@ async function createInternetDocument(order) {
     : await resolveCity(order.city || order.delivery?.city);
   const warehouse = await resolveWarehouse(city.ref, order.postOffice || order.delivery?.postOffice);
   const recipient = await createRecipient(order);
-  const price = Math.max(1, moneyNumber(order.price || process.env.PRODUCT_PRICE || 0));
+  const payment = buildNovaPaymentAmount(order);
   const description = buildInternetDocumentDescription(order);
   const additionalInformation = buildInternetDocumentAdditionalInformation(description);
-  const weight = moneyNumber(env('NP_WEIGHT_KG', '1')) || 1;
-  const volume = moneyNumber(env('NP_VOLUME_GENERAL', '0.002')) || 0.002;
+  const weight = moneyNumber(env('NP_WEIGHT_KG', '2')) || 2;
+  const volume = moneyNumber(env('NP_VOLUME_GENERAL', '0.01')) || 0.01;
   const seats = Math.max(1, Math.round(moneyNumber(env('NP_SEATS_AMOUNT', '1')) || 1));
 
   const properties = {
@@ -658,7 +682,7 @@ async function createInternetDocument(order) {
     SeatsAmount: String(seats),
     Description: description,
     AdditionalInformation: additionalInformation,
-    Cost: String(price),
+    Cost: String(payment.amount),
     CitySender: sender.CitySender,
     Sender: sender.Sender,
     SenderAddress: sender.SenderAddress,
@@ -672,13 +696,13 @@ async function createInternetDocument(order) {
   };
 
   properties.OptionsSeat = buildSeatsOptions();
-  if (envFlag('NP_PAYMENT_CONTROL_ENABLED', 'true') && price > 0) {
-    properties.AfterpaymentOnGoodsCost = String(price);
-  } else if (envFlag('NP_LEGACY_BACKWARD_DELIVERY_ENABLED', 'false') && price > 0) {
+  if (envFlag('NP_PAYMENT_CONTROL_ENABLED', 'true') && payment.amount > 0) {
+    properties.AfterpaymentOnGoodsCost = String(payment.amount);
+  } else if (envFlag('NP_LEGACY_BACKWARD_DELIVERY_ENABLED', 'false') && payment.amount > 0) {
     properties.BackwardDeliveryData = [{
       PayerType: env('NP_COD_PAYER_TYPE', 'Recipient'),
       CargoType: 'Money',
-      RedeliveryString: String(price),
+      RedeliveryString: String(payment.amount),
     }];
   }
 
@@ -1181,10 +1205,19 @@ function configStatus() {
   return {
     apiConfigured: !!NP_API_KEY,
     paymentControlEnabled: envFlag('NP_PAYMENT_CONTROL_ENABLED', 'true'),
+    paymentControlExtraUah: moneyRounded(env('NP_PAYMENT_CONTROL_EXTRA_UAH', '140')),
     legacyBackwardDeliveryEnabled: envFlag('NP_LEGACY_BACKWARD_DELIVERY_ENABLED', 'false'),
     payerType: env('NP_PAYER_TYPE', 'Sender'),
     paymentMethod: env('NP_PAYMENT_METHOD', 'NonCash'),
     serviceType: env('NP_SERVICE_TYPE', 'WarehouseWarehouse'),
+    package: {
+      weightKg: moneyNumber(env('NP_WEIGHT_KG', '2')),
+      volumeGeneral: moneyNumber(env('NP_VOLUME_GENERAL', '0.01')),
+      widthCm: moneyNumber(env('NP_SEAT_WIDTH_CM', '24')),
+      lengthCm: moneyNumber(env('NP_SEAT_LENGTH_CM', '34')),
+      heightCm: moneyNumber(env('NP_SEAT_HEIGHT_CM', '12')),
+      packRefConfigured: !!env('NP_PACK_REF'),
+    },
     senderPhoneConfigured: !!env('NP_SENDER_PHONE'),
     senderConfigured: missingSender.length === 0,
     senderAutoDetect: !!NP_API_KEY,
