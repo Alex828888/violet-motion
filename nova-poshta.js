@@ -1168,6 +1168,12 @@ function configStatus() {
   const missingSender = senderVars.filter(name => !env(name));
   return {
     apiConfigured: !!NP_API_KEY,
+    codEnabled: env('NP_COD_ENABLED', 'true') !== 'false',
+    payerType: env('NP_PAYER_TYPE', 'Recipient'),
+    paymentMethod: env('NP_PAYMENT_METHOD', 'Cash'),
+    codPayerType: env('NP_COD_PAYER_TYPE', 'Recipient'),
+    serviceType: env('NP_SERVICE_TYPE', 'WarehouseWarehouse'),
+    senderPhoneConfigured: !!env('NP_SENDER_PHONE'),
     senderConfigured: missingSender.length === 0,
     senderAutoDetect: !!NP_API_KEY,
     missing: [

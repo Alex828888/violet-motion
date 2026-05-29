@@ -1343,6 +1343,10 @@ function npDetailMessages(details = {}) {
     .filter(Boolean)
     .slice(0, 3);
 }
+function isNpCodUnavailable(details = {}) {
+  return /післяплат|послеплат|afterpayment|backwarddelivery|redelivery/i.test(npDetailsText(details)) &&
+    /(недоступ|unavailable|not available)/i.test(npDetailsText(details));
+}
 function npUserMessage(error, details = {}) {
   const message = String(error?.message || '');
   const missing = Array.isArray(details.missing) ? details.missing : [];
@@ -1365,6 +1369,9 @@ function npUserMessage(error, details = {}) {
   }
   if (/recipient name or phone is incomplete/i.test(message)) {
     return 'Для ТТН Новій Пошті потрібні коректні ПІБ отримувача та телефон.';
+  }
+  if (isNpCodUnavailable(details)) {
+    return 'Нова Пошта відхилила післяплату: для цього API-ключа/відправника послуга післяплати недоступна. У Render перевірте NOVA_POSHTA_API_KEY, NP_SENDER_PHONE та увімкнену послугу післяплати в кабінеті НП, або тимчасово поставте NP_COD_ENABLED=false.';
   }
   if (apiErrors.length) {
     return `Нова Пошта відхилила ТТН: ${apiErrors.join('; ')}`;
