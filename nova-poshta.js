@@ -629,6 +629,30 @@ function buildNovaPaymentAmount(order = {}) {
   };
 }
 
+function positiveNumberEnv(name, fallback) {
+  const value = moneyNumber(env(name, fallback));
+  return value > 0 ? value : moneyNumber(fallback);
+}
+
+function buildInternetDocumentOptionsSeat(weight, seats) {
+  const width = Math.max(1, Math.round(positiveNumberEnv('NP_SEAT_WIDTH_CM', '25')));
+  const length = Math.max(1, Math.round(positiveNumberEnv('NP_SEAT_LENGTH_CM', '35')));
+  const height = Math.max(1, Math.round(positiveNumberEnv('NP_SEAT_HEIGHT_CM', '15')));
+  const volumeWeight = positiveNumberEnv(
+    'NP_SEAT_VOLUMETRIC_WEIGHT_KG',
+    (width * length * height / 4000).toFixed(2)
+  );
+  const seatWeight = Math.max(0.1, weight / Math.max(1, seats));
+
+  return Array.from({ length: Math.max(1, seats) }, () => ({
+    volumetricVolume: String(Number(volumeWeight.toFixed(2))),
+    volumetricWidth: String(width),
+    volumetricLength: String(length),
+    volumetricHeight: String(height),
+    weight: String(Number(seatWeight.toFixed(2))),
+  }));
+}
+
 async function createInternetDocument(order) {
   const baseSender = await resolveSenderConfig();
   const selectedSenderLocation = order?.npSenderLocation?.ref ? order.npSenderLocation : null;
@@ -656,6 +680,7 @@ async function createInternetDocument(order) {
     Weight: String(weight),
     ServiceType: env('NP_SERVICE_TYPE', 'WarehouseWarehouse'),
     SeatsAmount: String(seats),
+    OptionsSeat: buildInternetDocumentOptionsSeat(weight, seats),
     Description: description,
     AdditionalInformation: additionalInformation,
     Cost: String(payment.amount),
@@ -1188,6 +1213,15 @@ function configStatus() {
     shipment: {
       weightKg: moneyNumber(env('NP_WEIGHT_KG', '2')),
       seatsAmount: Math.max(1, Math.round(moneyNumber(env('NP_SEATS_AMOUNT', '1')) || 1)),
+      seatWidthCm: Math.max(1, Math.round(positiveNumberEnv('NP_SEAT_WIDTH_CM', '25'))),
+      seatLengthCm: Math.max(1, Math.round(positiveNumberEnv('NP_SEAT_LENGTH_CM', '35'))),
+      seatHeightCm: Math.max(1, Math.round(positiveNumberEnv('NP_SEAT_HEIGHT_CM', '15'))),
+      seatVolumetricWeightKg: positiveNumberEnv('NP_SEAT_VOLUMETRIC_WEIGHT_KG', (
+        Math.max(1, Math.round(positiveNumberEnv('NP_SEAT_WIDTH_CM', '25'))) *
+        Math.max(1, Math.round(positiveNumberEnv('NP_SEAT_LENGTH_CM', '35'))) *
+        Math.max(1, Math.round(positiveNumberEnv('NP_SEAT_HEIGHT_CM', '15'))) /
+        4000
+      ).toFixed(2)),
     },
     senderPhoneConfigured: !!env('NP_SENDER_PHONE'),
     senderConfigured: missingSender.length === 0,
