@@ -1592,7 +1592,12 @@ function cleanTtn(value) {
 function trackForDocument(tracks, docs, index) {
   const expected = cleanTtn(docs[index]?.DocumentNumber || docs[index]);
   if (!expected) return tracks[index] || null;
-  return tracks.find(track => cleanTtn(track.number) === expected) || tracks[index] || null;
+  const exact = tracks.find(track => cleanTtn(track.number) === expected);
+  if (exact) return exact;
+  const indexed = tracks[index] || null;
+  const indexedNumber = cleanTtn(indexed?.number);
+  if (indexedNumber && indexedNumber !== expected) return null;
+  return indexed;
 }
 function parseSyncLimit(value, fallback = 100) {
   const n = Number(value || fallback);
@@ -1600,6 +1605,59 @@ function parseSyncLimit(value, fallback = 100) {
 }
 function sameSerializedOrder(a, b) {
   return JSON.stringify(a) === JSON.stringify(b);
+}
+function dateMs(value) {
+  const ms = Date.parse(value || '');
+  return Number.isFinite(ms) ? ms : 0;
+}
+function orderActivityMs(order = {}) {
+  return Math.max(
+    dateMs(order.ttnCreatedAt),
+    dateMs(order.shippedAt),
+    dateMs(order.updatedAt),
+    dateMs(order.createdAt),
+    dateMs(order.paidAt),
+    dateMs(order.returnedAt)
+  );
+}
+function orderNpSyncedMs(order = {}) {
+  return Math.max(dateMs(order.npSyncedAt), dateMs(order.novaPoshta?.syncedAt));
+}
+function npSyncStage(order = {}) {
+  const status = order.status || 'new';
+  const deliveryStatus = order.deliveryStatus || '';
+  if (status === 'confirmed') {
+    if (!order.npSyncedAt || ['ttn_created', 'ttn_added', 'ready_for_np', 'unknown', ''].includes(deliveryStatus)) return 0;
+    return 1;
+  }
+  if (status === 'shipped') return 2;
+  if (status === 'returned') return 3;
+  if (status === 'paid') return 4;
+  return 5;
+}
+function sortNpSyncCandidates(a, b) {
+  const aSynced = orderNpSyncedMs(a.order);
+  const bSynced = orderNpSyncedMs(b.order);
+  const aUnsynced = aSynced ? 0 : 1;
+  const bUnsynced = bSynced ? 0 : 1;
+  if (aUnsynced !== bUnsynced) return bUnsynced - aUnsynced;
+
+  const stageDiff = npSyncStage(a.order) - npSyncStage(b.order);
+  if (stageDiff) return stageDiff;
+
+  const aActivity = orderActivityMs(a.order);
+  const bActivity = orderActivityMs(b.order);
+  if (!aSynced && !bSynced) return bActivity - aActivity || b.index - a.index;
+  if (aSynced !== bSynced) return aSynced - bSynced;
+  return bActivity - aActivity || b.index - a.index;
+}
+function selectNpSyncCandidates(orders, limit, predicate) {
+  return orders
+    .map((order, index) => ({ order, index }))
+    .filter(item => predicate(item.order))
+    .sort(sortNpSyncCandidates)
+    .slice(0, limit)
+    .map(item => item.order);
 }
 async function syncOrderWithNovaPoshta(order) {
   if (!order?.ttn) throw new Error('Order has no TTN');
@@ -1741,7 +1799,10 @@ async function syncOpenNovaPoshtaOrders(limit = 100, options = {}) {
   const safeLimit = parseSyncLimit(limit);
   const includeManualLink = options.includeManualLink !== false;
   const includeReturns = options.includeReturns !== false;
-  const linkCandidates = includeManualLink ? orders.filter(canAutoLinkManualNpOrder).slice(0, safeLimit) : [];
+  const linkCandidatePool = includeManualLink ? orders.filter(canAutoLinkManualNpOrder) : [];
+  const linkCandidates = includeManualLink
+    ? selectNpSyncCandidates(orders, safeLimit, canAutoLinkManualNpOrder)
+    : [];
 
   if (linkCandidates.length) {
     try {
@@ -1787,7 +1848,8 @@ async function syncOpenNovaPoshtaOrders(limit = 100, options = {}) {
     }
   }
 
-  const candidates = orders.filter(isOrderActiveForNpSync).slice(0, safeLimit);
+  const candidatePool = orders.filter(isOrderActiveForNpSync);
+  const candidates = selectNpSyncCandidates(orders, safeLimit, isOrderActiveForNpSync);
   const docs = candidates.map(order => ({
     DocumentNumber: String(order.ttn),
     Phone: novaPoshta.normalizePhone(order.phone),
@@ -1839,7 +1901,9 @@ async function syncOpenNovaPoshtaOrders(limit = 100, options = {}) {
   if (changed) write(F.orders, orders);
   return {
     checked: candidates.length,
+    candidatePool: candidatePool.length,
     linkChecked: linkCandidates.length,
+    linkCandidatePool: linkCandidatePool.length,
     returnChecked: returnSync.checked,
     returnFound: returnSync.found,
     changed,
