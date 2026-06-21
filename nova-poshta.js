@@ -1059,9 +1059,9 @@ function normalizeDocumentListItem(doc = {}) {
   };
 }
 
-async function getDocumentList({ dateFrom, dateTo, page = 1, getFullList = true } = {}) {
+async function getDocumentList({ dateFrom, dateTo, page = 1, getFullList = true, daysBack = 14 } = {}) {
   const response = await callNovaPoshta('InternetDocument', 'getDocumentList', {
-    DateTimeFrom: dateFrom || formatNpDate(dateDaysAgo(14)),
+    DateTimeFrom: dateFrom || formatNpDate(dateDaysAgo(daysBack)),
     DateTimeTo: dateTo || todayNpDate(),
     Page: String(page || 1),
     GetFullList: getFullList ? '1' : '0',

@@ -22,11 +22,14 @@ const EXTRA_ADMIN_IDS = [7996143460];
 
 const SERVER_URL = process.env.SERVER_URL || 'http://localhost:3000';
 const API_KEY    = process.env.API_KEY    || 'violet-secret';
+const BOT_USE_WEBHOOK = process.env.BOT_USE_WEBHOOK === 'true';
+const BOT_WEBHOOK_URL = String(process.env.BOT_WEBHOOK_URL || '').replace(/\/+$/, '');
+const BOT_WEBHOOK_SECRET = process.env.BOT_WEBHOOK_SECRET || API_KEY;
 
 if (!TOKEN) { console.error('❌ BOT_TOKEN not set'); process.exit(1); }
 
-const bot = new TelegramBot(TOKEN, { polling: true });
-console.log('🤖 Admin bot started…');
+const bot = new TelegramBot(TOKEN, { polling: !BOT_USE_WEBHOOK });
+console.log(`🤖 Admin bot started in ${BOT_USE_WEBHOOK ? 'webhook' : 'polling'} mode…`);
 
 /* ── Auth ─────────────────────────────────────────────────── */
 function isAdmin(id) { return ADMIN_IDS.length === 0 || ADMIN_IDS.includes(id) || EXTRA_ADMIN_IDS.includes(id); }
@@ -41,7 +44,7 @@ const pendingProductCost = {};
 const pendingCb      = new Set();
 
 /* ── HTTP helpers ─────────────────────────────────────────── */
-const FETCH_TIMEOUT = 12000;
+const FETCH_TIMEOUT = Math.max(5000, Number(process.env.BOT_API_TIMEOUT_MS || 35000));
 
 async function apiFetch(method, pathname, body = null) {
   const ctrl = new AbortController();
@@ -1196,14 +1199,27 @@ async function showReturnTrackingList(chatId, view = 'all', page = 1, msgId = nu
   return reply(chatId, text, returnTrackingKeyboard(items, current, total, safeView), msgId);
 }
 
+function npSyncStatusLine(result = {}) {
+  const status = result.syncStatus || result.status || {};
+  const current = status.current || {};
+  const queued = status.queued || {};
+  const last = status.last || {};
+  if (result.started) return `🔄 Синхронізацію НП запущено у фоні. Job #${esc(current.id || '—')}.`;
+  if (result.queued || queued.id) return `⏳ Синхронізація НП вже йде. Наступний запуск поставлено в чергу${queued.id ? ` (#${esc(queued.id)})` : ''}.`;
+  if (last.result) {
+    return `🔄 Останній синк НП: перевірено <b>${esc(last.result.checked || 0)}</b>, змінено <b>${esc(last.result.changed || 0)}</b>.`;
+  }
+  return '🔄 Синхронізацію НП поставлено в роботу.';
+}
+
 async function syncAllNpOrders(chatId, msgId = null, nextView = 'menu') {
-  const result = await serverPost('/api/admin/np/sync', { limit: 100 });
+  const result = await serverPost('/api/admin/np/sync', { limit: 100, background: true, source: `bot-${nextView}` });
   if (!result || result.error) {
-    await bot.sendMessage(chatId, '❌ Не вдалося оновити Нову Пошту.', { reply_markup: MAIN_KB });
+    await bot.sendMessage(chatId, `❌ Не вдалося запустити оновлення Нової Пошти: ${esc(result?.userMessage || result?.error || 'помилка')}`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
     return;
   }
   await bot.sendMessage(chatId,
-    `🔄 НП оновлено. Перевірено: <b>${esc(result.checked || 0)}</b>, змінено: <b>${esc(result.changed || 0)}</b>.`,
+    `${npSyncStatusLine(result)}\n\nСтатуси оновляться автоматично. Через хвилину відкрийте відстеження або CRM ще раз, щоб побачити свіжий результат.`,
     { parse_mode: 'HTML', reply_markup: MAIN_KB });
   if (nextView === 'returns') await showReturnTrackingList(chatId, 'all', 1, msgId);
   else await showTrackingMenu(chatId, msgId);
@@ -2121,6 +2137,19 @@ bot.on('callback_query', async q => {
       return;
     }
 
+    if (data.startsWith('crm_np_cash_sync_')) {
+      const period = data.slice('crm_np_cash_sync_'.length);
+      const safePeriod = ['today', 'week', 'month', 'all'].includes(period) ? period : 'today';
+      const result = await serverPost('/api/admin/np/afterpayments/sync', { limit: 100, period: safePeriod, background: true });
+      if (!result || result.error) {
+        await reply(chatId, `❌ Не вдалося запустити оновлення післяплат НП: ${esc(result?.userMessage || result?.error || 'помилка')}`, crmMenuKb(safePeriod), msgId);
+        return;
+      }
+      await bot.sendMessage(chatId, `${npSyncStatusLine(result)}\n\nПісля завершення синку відкрийте післяплати ще раз.`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
+      await showNpAfterpayments(chatId, safePeriod, msgId);
+      return;
+    }
+
     if (data === 'crm_products') {
       await showCrmProducts(chatId, msgId);
       return;
@@ -2387,12 +2416,43 @@ bot.on('callback_query', async q => {
   }
 });
 
-bot.on('polling_error', e => console.error('[poll]', e.message));
+bot.on('polling_error', e => {
+  console.error('[poll]', e.message);
+  if (/409 Conflict/i.test(e.message || '')) {
+    console.error('[poll] Telegram reports another getUpdates consumer. Run only one polling bot, or set BOT_USE_WEBHOOK=true with BOT_WEBHOOK_URL on Render.');
+    if (process.env.BOT_STOP_ON_POLLING_CONFLICT !== 'false') {
+      bot.stopPolling().catch(error => console.error('[poll stop]', error.message));
+    }
+  }
+});
 bot.on('error',         e => console.error('[bot]',  e.message));
 
 /* ── Tiny web server for Render health check ──────────────── */
 const express = require('express');
 const webApp  = express();
+webApp.use(express.json({ limit: '1mb' }));
 webApp.get('/', (_req, res) => res.send('🟣 Violet Motion Bot is running'));
+if (BOT_USE_WEBHOOK) {
+  if (!BOT_WEBHOOK_URL) {
+    console.error('❌ BOT_USE_WEBHOOK=true, but BOT_WEBHOOK_URL is not set.');
+    process.exit(1);
+  }
+  const webhookPath = `/telegram/webhook/${encodeURIComponent(BOT_WEBHOOK_SECRET)}`;
+  webApp.post(webhookPath, (req, res) => {
+    bot.processUpdate(req.body);
+    res.sendStatus(200);
+  });
+}
 const BOT_PORT = process.env.PORT || 10000;
-webApp.listen(BOT_PORT, () => console.log(`🌐 Health check → port ${BOT_PORT}`));
+webApp.listen(BOT_PORT, async () => {
+  console.log(`🌐 Health check → port ${BOT_PORT}`);
+  if (!BOT_USE_WEBHOOK) return;
+  try {
+    const webhookPath = `/telegram/webhook/${encodeURIComponent(BOT_WEBHOOK_SECRET)}`;
+    const webhookUrl = `${BOT_WEBHOOK_URL}${webhookPath}`;
+    await bot.setWebHook(webhookUrl);
+    console.log(`🔗 Telegram webhook set: ${webhookUrl}`);
+  } catch (error) {
+    console.error('[webhook]', error.message);
+  }
+});

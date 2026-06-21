@@ -49,6 +49,13 @@ const META_PIXEL_ID = process.env.META_PIXEL_ID || '2110562173060470';
 const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN || '';
 const META_TEST_EVENT_CODE = process.env.META_TEST_EVENT_CODE || '';
 const npCreateLocks = new Map();
+const npSyncState = {
+  current: null,
+  queued: null,
+  last: null,
+  timer: null,
+  nextJobId: 1,
+};
 
 app.set('trust proxy', 1);
 
@@ -1394,6 +1401,11 @@ function npErrorPayload(error) {
     retryAfterMs: details.retryAfterMs || null,
   };
 }
+function novaPoshtaMissingConfigPayload() {
+  const error = new Error('Nova Poshta API key is not configured');
+  error.details = { missing: ['NOVA_POSHTA_API_KEY'] };
+  return npErrorPayload(error);
+}
 function isOrderActiveForNpSync(order) {
   const status = order?.status || 'new';
   if (!order?.ttn || ['cancelled', 'completed'].includes(status)) return false;
@@ -1574,6 +1586,21 @@ function applyNovaReturnTrackingToOrder(order, track) {
   if (track.documentCost > 0) patch.npReturnDeliveryCost = order.npReturnDeliveryCost || track.documentCost;
   return { ...order, ...patch };
 }
+function cleanTtn(value) {
+  return String(value || '').replace(/\s+/g, '').trim();
+}
+function trackForDocument(tracks, docs, index) {
+  const expected = cleanTtn(docs[index]?.DocumentNumber || docs[index]);
+  if (!expected) return tracks[index] || null;
+  return tracks.find(track => cleanTtn(track.number) === expected) || tracks[index] || null;
+}
+function parseSyncLimit(value, fallback = 100) {
+  const n = Number(value || fallback);
+  return Math.max(1, Math.min(100, Number.isFinite(n) ? n : fallback));
+}
+function sameSerializedOrder(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
 async function syncOrderWithNovaPoshta(order) {
   if (!order?.ttn) throw new Error('Order has no TTN');
   const docs = [{ DocumentNumber: String(order.ttn), Phone: novaPoshta.normalizePhone(order.phone) }];
@@ -1613,6 +1640,8 @@ async function syncReturnOrdersFromNovaPoshta(orders, limit = 100) {
   let checked = 0;
   const errors = [];
   const returns = [];
+  const touched = new Map();
+  const trackRequests = [];
 
   for (let page = 1; page <= maxPages; page++) {
     try {
@@ -1644,20 +1673,33 @@ async function syncReturnOrdersFromNovaPoshta(orders, limit = 100) {
       String(order.npReturnOrderRef || '').trim() === value
     )));
     if (idx < 0) continue;
-    let updated = applyNovaReturnOrderToOrder(orders[idx], returnOrder);
-    const returnTtn = updated.npReturnExpressWaybillNumber || updated.npReturnOrderNumber;
+    if (!touched.has(idx)) touched.set(idx, JSON.stringify(orders[idx]));
+    orders[idx] = applyNovaReturnOrderToOrder(orders[idx], returnOrder);
+    const returnTtn = orders[idx].npReturnExpressWaybillNumber || orders[idx].npReturnOrderNumber;
     if (returnTtn) {
-      try {
-        const [returnTrack] = await novaPoshta.trackDocuments([String(returnTtn)]);
-        if (returnTrack) updated = applyNovaReturnTrackingToOrder(updated, returnTrack);
-      } catch (error) {
-        updated.npReturnTrackingError = error.message;
+      trackRequests.push({ idx, ttn: String(returnTtn) });
+    }
+  }
+
+  const uniqueDocs = [...new Map(trackRequests.map(item => [cleanTtn(item.ttn), item])).values()]
+    .map(item => ({ DocumentNumber: item.ttn }));
+  if (uniqueDocs.length) {
+    try {
+      const tracks = await novaPoshta.trackDocuments(uniqueDocs);
+      const byNumber = new Map(tracks.map(track => [cleanTtn(track.number), track]));
+      for (const item of trackRequests) {
+        const track = byNumber.get(cleanTtn(item.ttn));
+        if (!track) continue;
+        if (!touched.has(item.idx)) touched.set(item.idx, JSON.stringify(orders[item.idx]));
+        orders[item.idx] = applyNovaReturnTrackingToOrder(orders[item.idx], track);
       }
+    } catch (error) {
+      errors.push({ step: 'return-tracking-batch', error: error.message });
     }
-    if (JSON.stringify(updated) !== JSON.stringify(orders[idx])) {
-      orders[idx] = updated;
-      changed++;
-    }
+  }
+
+  for (const [idx, before] of touched.entries()) {
+    if (JSON.stringify(orders[idx]) !== before) changed++;
   }
 
   return { checked, changed, errors, found: returns.length };
@@ -1691,37 +1733,107 @@ async function linkManualNovaPoshtaTtn(order, orders = read(F.orders)) {
     document: picked,
   };
 }
-async function syncOpenNovaPoshtaOrders(limit = 100) {
+async function syncOpenNovaPoshtaOrders(limit = 100, options = {}) {
+  const startedAt = Date.now();
   const orders = read(F.orders);
   let changed = 0;
   const errors = [];
-  const linkCandidates = orders.filter(canAutoLinkManualNpOrder).slice(0, limit);
-  for (const order of linkCandidates) {
-    const idx = orders.findIndex(x => x.id === order.id);
-    if (idx < 0 || orders[idx].ttn) continue;
+  const safeLimit = parseSyncLimit(limit);
+  const includeManualLink = options.includeManualLink !== false;
+  const includeReturns = options.includeReturns !== false;
+  const linkCandidates = includeManualLink ? orders.filter(canAutoLinkManualNpOrder).slice(0, safeLimit) : [];
+
+  if (linkCandidates.length) {
     try {
-      const linked = await linkManualNovaPoshtaTtn(orders[idx], orders);
-      if (linked.linked) {
+      const daysBack = Math.max(1, Math.min(90, Number(process.env.NP_MANUAL_LOOKBACK_DAYS || 21)));
+      const docs = await novaPoshta.getDocumentList({ daysBack, getFullList: true });
+      const recentDocs = Array.isArray(docs) ? docs : [];
+      for (const order of linkCandidates) {
+        const idx = orders.findIndex(x => x.id === order.id);
+        if (idx < 0 || orders[idx].ttn) continue;
+        const target = novaPoshta.normalizePhone(orders[idx].phone);
+        if (!target) continue;
+        const picked = recentDocs.find(doc => {
+          const phone = novaPoshta.normalizePhone(doc.recipientPhone || doc.raw?.RecipientPhone || '');
+          if (!phone) return false;
+          return doc.ttn && phone && (phone === target || phone.endsWith(target) || target.endsWith(phone)) &&
+            !ttnAlreadyUsed(orders, doc.ttn, orders[idx].id);
+        });
+        if (!picked) continue;
+        const linked = {
+          linked: true,
+          ttn: picked.ttn,
+          order: {
+            ...orders[idx],
+            ttn: picked.ttn,
+            npRef: picked.ref || orders[idx].npRef || null,
+            npStatus: picked.status || orders[idx].npStatus || null,
+            deliveryStatus: orders[idx].deliveryStatus || 'ttn_added',
+            manualTtnAutoLinked: true,
+            manualTtnAutoLinkedAt: new Date().toISOString(),
+            novaPoshta: {
+              ...(orders[idx].novaPoshta && typeof orders[idx].novaPoshta === 'object' ? orders[idx].novaPoshta : {}),
+              manualDocument: picked,
+              linkedAt: new Date().toISOString(),
+            },
+            updatedAt: new Date().toISOString(),
+          },
+        };
         orders[idx] = linked.order;
         changed++;
       }
     } catch (error) {
-      errors.push({ orderId: order.id, phone: order.phone, error: error.message, step: 'manual-link' });
+      errors.push({ step: 'manual-link-batch', checked: linkCandidates.length, error: error.message });
     }
   }
-  const candidates = orders.filter(isOrderActiveForNpSync).slice(0, limit);
-  for (const order of candidates) {
-    const idx = orders.findIndex(x => x.id === order.id);
-    if (idx < 0) continue;
+
+  const candidates = orders.filter(isOrderActiveForNpSync).slice(0, safeLimit);
+  const docs = candidates.map(order => ({
+    DocumentNumber: String(order.ttn),
+    Phone: novaPoshta.normalizePhone(order.phone),
+  }));
+
+  if (docs.length) {
     try {
-      const { updated } = await syncOrderWithNovaPoshta(orders[idx]);
-      orders[idx] = updated;
-      changed++;
+      const tracks = await novaPoshta.trackDocuments(docs);
+      for (let i = 0; i < candidates.length; i++) {
+        const order = candidates[i];
+        const idx = orders.findIndex(x => x.id === order.id);
+        if (idx < 0) continue;
+        const track = trackForDocument(tracks, docs, i);
+        if (!track) {
+          errors.push({ orderId: order.id, ttn: order.ttn, error: 'Nova Poshta returned no tracking data' });
+          continue;
+        }
+        const before = orders[idx];
+        const updated = applyNovaTrackingToOrder(orders[idx], track);
+        if (!sameSerializedOrder(before, updated)) {
+          orders[idx] = updated;
+          changed++;
+        }
+      }
     } catch (error) {
-      errors.push({ orderId: order.id, ttn: order.ttn, error: error.message });
+      errors.push({ step: 'tracking-batch', checked: candidates.length, error: error.message });
+      const fallbackLimit = Math.max(0, Math.min(candidates.length, Number(process.env.NP_SYNC_BATCH_FALLBACK_LIMIT || 10)));
+      for (const order of candidates.slice(0, fallbackLimit)) {
+        const idx = orders.findIndex(x => x.id === order.id);
+        if (idx < 0) continue;
+        try {
+          const { updated } = await syncOrderWithNovaPoshta(orders[idx]);
+          if (!sameSerializedOrder(orders[idx], updated)) {
+            orders[idx] = updated;
+            changed++;
+          }
+        } catch (fallbackError) {
+          errors.push({ orderId: order.id, ttn: order.ttn, error: fallbackError.message, step: 'tracking-fallback' });
+        }
+      }
     }
   }
-  const returnSync = await syncReturnOrdersFromNovaPoshta(orders, limit);
+
+  const returnSync = includeReturns
+    ? await syncReturnOrdersFromNovaPoshta(orders, safeLimit)
+    : { checked: 0, changed: 0, errors: [], found: 0 };
   changed += returnSync.changed;
   errors.push(...returnSync.errors);
   if (changed) write(F.orders, orders);
@@ -1732,7 +1844,121 @@ async function syncOpenNovaPoshtaOrders(limit = 100) {
     returnFound: returnSync.found,
     changed,
     errors,
+    durationMs: Date.now() - startedAt,
   };
+}
+
+function normalizeNpSyncOptions(options = {}) {
+  return {
+    limit: parseSyncLimit(options.limit || process.env.NP_SYNC_LIMIT || 100),
+    source: sanitizeStr(options.source || 'manual', 40),
+    includeManualLink: options.includeManualLink !== false,
+    includeReturns: options.includeReturns !== false,
+  };
+}
+
+function serializeNpSyncJob(job) {
+  if (!job) return null;
+  return {
+    id: job.id,
+    status: job.status,
+    source: job.source,
+    limit: job.limit,
+    startedAt: job.startedAt || null,
+    finishedAt: job.finishedAt || null,
+    requestedAt: job.requestedAt || null,
+    durationMs: job.durationMs || job.result?.durationMs || null,
+    result: job.result || null,
+    error: job.error || null,
+    errorDetails: job.errorDetails || null,
+  };
+}
+
+function novaPoshtaSyncStatus() {
+  return {
+    running: !!npSyncState.current,
+    current: serializeNpSyncJob(npSyncState.current),
+    queued: serializeNpSyncJob(npSyncState.queued),
+    last: serializeNpSyncJob(npSyncState.last),
+    scheduled: !!npSyncState.timer,
+  };
+}
+
+function startNovaPoshtaSync(options = {}) {
+  const normalized = normalizeNpSyncOptions(options);
+  if (npSyncState.current) {
+    npSyncState.queued = {
+      id: npSyncState.nextJobId++,
+      ...normalized,
+      status: 'queued',
+      requestedAt: new Date().toISOString(),
+    };
+    return { started: false, queued: true, status: novaPoshtaSyncStatus() };
+  }
+
+  const job = {
+    id: npSyncState.nextJobId++,
+    ...normalized,
+    status: 'running',
+    startedAt: new Date().toISOString(),
+  };
+  npSyncState.current = job;
+  job.promise = (async () => {
+    try {
+      const result = await syncOpenNovaPoshtaOrders(job.limit, job);
+      job.status = 'finished';
+      job.finishedAt = new Date().toISOString();
+      job.durationMs = new Date(job.finishedAt).getTime() - new Date(job.startedAt).getTime();
+      job.result = result;
+      if (result.checked || result.linkChecked || result.returnChecked || result.errors.length) {
+        console.log('[NovaPoshta sync]', serializeNpSyncJob(job));
+      }
+      return result;
+    } catch (error) {
+      job.status = 'failed';
+      job.finishedAt = new Date().toISOString();
+      job.durationMs = new Date(job.finishedAt).getTime() - new Date(job.startedAt).getTime();
+      job.error = error.message;
+      job.errorDetails = error.details || {};
+      console.error('[NovaPoshta sync]', error.message);
+      return { checked: 0, linkChecked: 0, returnChecked: 0, returnFound: 0, changed: 0, errors: [{ error: error.message }], durationMs: job.durationMs };
+    } finally {
+      npSyncState.last = { ...job };
+      delete npSyncState.last.promise;
+      npSyncState.current = null;
+      const queued = npSyncState.queued;
+      npSyncState.queued = null;
+      if (queued) {
+        setTimeout(() => startNovaPoshtaSync(queued), 1000).unref?.();
+      }
+    }
+  })();
+  return { started: true, queued: false, status: novaPoshtaSyncStatus() };
+}
+
+async function runNovaPoshtaSyncNow(options = {}) {
+  const start = startNovaPoshtaSync(options);
+  if (!start.started) return { running: true, queued: start.queued, ...start.status };
+  const current = npSyncState.current;
+  const result = await current.promise;
+  if (current.status === 'failed') {
+    const error = new Error(current.error || 'Nova Poshta sync failed');
+    error.details = current.errorDetails || {};
+    throw error;
+  }
+  return { success: true, ...result };
+}
+
+function scheduleNovaPoshtaSync(options = {}, delayMs = 0) {
+  if (!novaPoshta.configStatus().apiConfigured) return null;
+  if (npSyncState.timer) return { scheduled: true, existing: true, status: novaPoshtaSyncStatus() };
+  const waitMs = Math.max(0, Number(delayMs || 0));
+  npSyncState.timer = setTimeout(() => {
+    npSyncState.timer = null;
+    startNovaPoshtaSync(options);
+  }, waitMs);
+  npSyncState.timer.unref?.();
+  return { scheduled: true, waitMs, status: novaPoshtaSyncStatus() };
 }
 
 function escapeHtml(val) {
@@ -2342,18 +2568,23 @@ app.patch('/api/admin/orders/:id', authBot, (req, res) => {
   arr[idx] = ensurePaidOrderFinance({ ...arr[idx], ...req.body, id: arr[idx].id, updatedAt: new Date().toISOString() });
   write(F.orders, arr);
   if (Object.prototype.hasOwnProperty.call(req.body || {}, 'status')) updateOrderQueueNotice(arr[idx]).catch(e => console.error('[order notice]', e.message));
+  if (arr[idx].ttn && (
+    Object.prototype.hasOwnProperty.call(req.body || {}, 'ttn') ||
+    Object.prototype.hasOwnProperty.call(req.body || {}, 'status') ||
+    Object.prototype.hasOwnProperty.call(req.body || {}, 'deliveryStatus')
+  )) {
+    scheduleNovaPoshtaSync({ source: 'order-patch', limit: 30 }, 5000);
+  }
   res.json(arr[idx]);
 });
 
 const npConfig = novaPoshta.configStatus();
 if (npConfig.autoSync && npConfig.apiConfigured) {
-  const intervalMs = Math.max(5, Number(process.env.NP_SYNC_INTERVAL_MINUTES || 30)) * 60 * 1000;
+  const intervalMs = Math.max(2, Number(process.env.NP_SYNC_INTERVAL_MINUTES || 10)) * 60 * 1000;
+  const startupDelayMs = Math.max(0, Number(process.env.NP_SYNC_STARTUP_DELAY_MS || 15000));
+  scheduleNovaPoshtaSync({ source: 'startup', limit: process.env.NP_SYNC_LIMIT || 100 }, startupDelayMs);
   setInterval(() => {
-    syncOpenNovaPoshtaOrders(100)
-      .then(result => {
-        if (result.checked || result.errors.length) console.log('[NovaPoshta sync]', result);
-      })
-      .catch(error => console.error('[NovaPoshta sync]', error.message));
+    scheduleNovaPoshtaSync({ source: 'interval', limit: process.env.NP_SYNC_LIMIT || 100 });
   }, intervalMs).unref();
 } else if (!npConfig.apiConfigured) {
   console.warn('[NovaPoshta] NOVA_POSHTA_API_KEY is not set; tracking and TTN creation are disabled.');
@@ -2525,12 +2756,28 @@ app.get('/api/admin/crm/problems', authBot, (_req, res) => {
 app.get('/api/admin/np/config', authBot, (_req, res) => {
   res.json(novaPoshta.configStatus());
 });
+app.get('/api/admin/np/sync/status', authBot, (_req, res) => {
+  res.json({ success: true, ...novaPoshtaSyncStatus() });
+});
 app.get('/api/admin/np/afterpayments', authBot, (req, res) => {
   res.json(buildAfterpaymentSummary(sanitizeStr(req.query.period || 'today', 20), read(F.orders)));
 });
 app.post('/api/admin/np/afterpayments/sync', authBot, async (req, res) => {
+  if (!novaPoshta.configStatus().apiConfigured) return res.status(400).json(novaPoshtaMissingConfigPayload());
   try {
-    const result = await syncOpenNovaPoshtaOrders(Math.max(1, Math.min(150, Number(req.body?.limit || 100))));
+    const limit = parseSyncLimit(req.body?.limit || 100);
+    if (req.body?.background === true) {
+      const job = startNovaPoshtaSync({ source: 'afterpayments', limit });
+      return res.status(job.started ? 202 : 200).json({
+        success: true,
+        background: true,
+        started: job.started,
+        queued: job.queued,
+        syncStatus: job.status,
+        afterpayments: buildAfterpaymentSummary(sanitizeStr(req.body?.period || 'all', 20), read(F.orders)),
+      });
+    }
+    const result = await runNovaPoshtaSyncNow({ source: 'afterpayments', limit });
     res.json({
       success: true,
       sync: result,
@@ -2679,6 +2926,11 @@ app.post('/api/admin/orders/:id/np/create', authBot, async (req, res) => {
     };
     write(F.orders, orders);
     updateOrderQueueNotice(orders[idx]).catch(e => console.error('[order notice]', e.message));
+    scheduleNovaPoshtaSync({
+      source: 'ttn-create',
+      limit: Number(process.env.NP_SYNC_AFTER_TTN_LIMIT || 30),
+      includeManualLink: false,
+    }, Math.max(0, Number(process.env.NP_SYNC_AFTER_TTN_DELAY_MS || 120000)));
     res.json({ success: true, order: orders[idx], novaPoshta: created, ttn: created.ttn });
   } catch (error) {
     res.status(502).json(npErrorPayload(error));
@@ -2763,9 +3015,21 @@ app.post('/api/admin/orders/:id/np/link-manual', authBot, async (req, res) => {
   }
 });
 app.post('/api/admin/np/sync', authBot, async (req, res) => {
+  if (!novaPoshta.configStatus().apiConfigured) return res.status(400).json(novaPoshtaMissingConfigPayload());
   try {
-    const limit = Math.max(1, Math.min(100, Number(req.body?.limit || 100)));
-    res.json({ success: true, ...(await syncOpenNovaPoshtaOrders(limit)) });
+    const limit = parseSyncLimit(req.body?.limit || 100);
+    const source = sanitizeStr(req.body?.source || 'manual', 40);
+    if (req.body?.background === true) {
+      const job = startNovaPoshtaSync({ source, limit });
+      return res.status(job.started ? 202 : 200).json({
+        success: true,
+        background: true,
+        started: job.started,
+        queued: job.queued,
+        syncStatus: job.status,
+      });
+    }
+    res.json({ success: true, ...(await runNovaPoshtaSyncNow({ source, limit })) });
   } catch (error) {
     res.status(502).json(npErrorPayload(error));
   }
