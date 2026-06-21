@@ -2411,6 +2411,9 @@ bot.on('callback_query', async q => {
       await bot.sendMessage(chatId, `✅ Запит #${id} — відповіли.`, { reply_markup: MAIN_KB });
     }
 
+  } catch (error) {
+    console.error('[callback]', data, error.message);
+    await bot.sendMessage(chatId, `❌ Помилка бота: ${esc(error.message || 'невідома помилка')}`, { parse_mode: 'HTML', reply_markup: MAIN_KB }).catch(() => {});
   } finally {
     setTimeout(() => pendingCb.delete(cbKey), 2000);
   }
@@ -2419,8 +2422,8 @@ bot.on('callback_query', async q => {
 bot.on('polling_error', e => {
   console.error('[poll]', e.message);
   if (/409 Conflict/i.test(e.message || '')) {
-    console.error('[poll] Telegram reports another getUpdates consumer. Run only one polling bot, or set BOT_USE_WEBHOOK=true with BOT_WEBHOOK_URL on Render.');
-    if (process.env.BOT_STOP_ON_POLLING_CONFLICT !== 'false') {
+    console.error('[poll] Telegram reports another getUpdates consumer. This is usually a short Render deploy overlap. Polling will keep retrying.');
+    if (process.env.BOT_STOP_ON_POLLING_CONFLICT === 'true') {
       bot.stopPolling().catch(error => console.error('[poll stop]', error.message));
     }
   }
