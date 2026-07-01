@@ -35,6 +35,9 @@ const ZVONOK_API_KEY = process.env.ZVONOK_API_KEY || '';
 const ZVONOK_CAMPAIGN_ID = process.env.ZVONOK_CAMPAIGN_ID || '';
 const ZVONOK_WEBHOOK_SECRET = process.env.ZVONOK_WEBHOOK_SECRET || '';
 const MONOBANK_WEBHOOK_SECRET = process.env.MONOBANK_WEBHOOK_SECRET || '';
+// Card statement data is intentionally excluded from CRM by default.
+// Final money/return facts are confirmed manually by TTN against Nova Poshta tracking.
+const MONOBANK_CRM_ENABLED = process.env.MONOBANK_CRM_ENABLED === 'true';
 const APP_PUBLIC_URL = String(process.env.APP_PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
 const ZVONOK_CALL_URL = 'https://zvonok.com/manager/cabapi_external/api/v1/phones/call/';
 const SHOP_NAME = process.env.SHOP_NAME || 'Violet Motion';
@@ -294,6 +297,7 @@ function splitMetaName(value) {
 }
 function metaContentId(order) {
   const product = String(order?.product || PRODUCT_NAME || '').toLowerCase();
+  if (product.includes('voltgo') || product.includes('powerbank') || product.includes('павербанк')) return 'voltgo-powerbank-10000-001';
   if (product.includes('black breeze') || product.includes('sandal')) return 'black-breeze-sandals-001';
   return 'violet-motion-001';
 }
@@ -435,6 +439,7 @@ function inPeriod(iso, period) {
 const PRODUCT_GROUPS = [
   { key: 'violet', label: 'Violet Motion', defaultCost: 420, aliases: ['violet motion', 'violet-motion', 'violet motion sneakers', 'violet sneakers'] },
   { key: 'black',  label: 'Black Breeze',  defaultCost: 380, aliases: ['black breeze', 'black-breeze', 'black breeze sandals'] },
+  { key: 'power',  label: 'VoltGo Powerbank', defaultCost: 450, aliases: ['voltgo', 'powerbank', 'павербанк', 'power bank'] },
 ];
 function normalizeProductName(value) {
   return String(value || '').toLowerCase().replace(/ё/g, 'е').replace(/[\s_-]+/g, ' ').trim();
@@ -630,6 +635,8 @@ function buildFinanceTransactions(period = 'today', orders = read(F.orders)) {
   const orderMap = new Map(orders.map(order => [Number(order.id), order]));
   return read(F.finance)
     .filter(item => !item.excludedAt)
+    .filter(item => MONOBANK_CRM_ENABLED || item.source !== 'monobank')
+    .filter(item => !item.orderId || orderMap.has(Number(item.orderId)))
     .filter(item => !isUnverifiedNovaFinanceEntry(item))
     .filter(item => inFinancePeriod(item.createdAt, period))
     .map(item => ({
@@ -675,8 +682,165 @@ function buildAfterpaymentSummary(period = 'today', orders = read(F.orders)) {
     items,
   };
 }
+
+function isPowerbankOrder(order) {
+  return orderProductKey(order) === 'power';
+}
+
+function moneyReceivedManually(order) {
+  return order?.moneyReceivedConfirmed === true && !!order?.moneyReceivedAt;
+}
+
+function returnReceivedManually(order) {
+  return order?.returnReceivedConfirmed === true && !!order?.returnReceivedAt;
+}
+
+function novaSuggestsReturn(order) {
+  const text = [
+    order?.npStatus,
+    order?.npReturnStatus,
+    order?.npReturnTrackingStatus,
+    order?.deliveryStatus,
+    order?.returnSettlementStatus,
+    order?.novaPoshta?.tracking?.status,
+    order?.novaPoshta?.returnTracking?.status,
+  ].filter(Boolean).join(' ').toLowerCase();
+  return !!(
+    order?.returnExpected || order?.npReturnExpressWaybillNumber || order?.npReturnOrderNumber ||
+    order?.npReturnOldTtnActive || order?.npReturnArrivedAt || order?.status === 'returned' ||
+    /повер|возврат|відмов|отказ|return|refusal/.test(text)
+  );
+}
+
+function novaSuggestsMoney(order) {
+  if (!order?.ttn || novaSuggestsReturn(order)) return false;
+  const text = [order?.npStatus, order?.deliveryStatus, order?.settlementStatus, order?.novaPoshta?.tracking?.status]
+    .filter(Boolean).join(' ').toLowerCase();
+  return !!(
+    order?.npMoneyExpected || order?.npDeliveredAt || asMoneyNumber(order?.npRedeliverySum) > 0 ||
+    ['paid', 'completed'].includes(order?.status || '') ||
+    /delivered|отриман|одержан|вручено|видано|awaiting_money/.test(text)
+  );
+}
+
+function reconciliationDate(order, kind) {
+  if (kind === 'money') return order.moneyReceivedAt || order.npDeliveredAt || order.paidAt || order.shippedAt || order.createdAt;
+  return order.returnReceivedAt || order.npReturnArrivedAt || order.npReturnExpectedAt || order.returnedAt || order.updatedAt || order.createdAt;
+}
+
+function privatePowerItem(order) {
+  return {
+    id: order.id,
+    name: order.name || order.fullName || '',
+    phone: order.phone || '',
+    product: order.product || '',
+    price: asMoneyNumber(order.price),
+    ttn: String(order.ttn || ''),
+    returnTtn: String(order.npReturnExpressWaybillNumber || order.npReturnOrderNumber || ''),
+    status: order.status || 'new',
+    npStatus: order.npStatus || '',
+    npReturnStatus: order.npReturnStatus || '',
+    settlementStatus: moneyReceivedManually(order) ? 'money_received' : novaSuggestsMoney(order) ? 'awaiting_money' : 'not_ready',
+    returnSettlementStatus: returnReceivedManually(order) ? 'return_received' : novaSuggestsReturn(order) ? 'awaiting_return' : 'not_expected',
+    moneyReceivedAt: order.moneyReceivedAt || null,
+    returnReceivedAt: order.returnReceivedAt || null,
+    createdAt: order.createdAt || null,
+  };
+}
+
+function buildPrivatePowerSummary(period = 'all', allOrders = read(F.orders)) {
+  const powerOrders = allOrders.filter(isPowerbankOrder);
+  const pendingMoney = powerOrders.filter(order => novaSuggestsMoney(order) && !moneyReceivedManually(order));
+  const moneyReceived = powerOrders.filter(moneyReceivedManually);
+  const pendingReturns = powerOrders.filter(order => novaSuggestsReturn(order) && !returnReceivedManually(order));
+  const returnsReceived = powerOrders.filter(returnReceivedManually);
+  const filterPeriod = (orders, kind) => orders.filter(order => inPeriod(reconciliationDate(order, kind), period));
+  const pendingMoneyPeriod = filterPeriod(pendingMoney, 'money');
+  const moneyReceivedPeriod = filterPeriod(moneyReceived, 'money');
+  const pendingReturnsPeriod = filterPeriod(pendingReturns, 'return');
+  const returnsReceivedPeriod = filterPeriod(returnsReceived, 'return');
+  const sortItems = items => items.map(privatePowerItem).sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+  return {
+    period,
+    product: 'VoltGo Powerbank',
+    orders: powerOrders.filter(order => inPeriod(order.createdAt, period)).length,
+    allOrders: powerOrders.length,
+    pendingMoney: sortItems(pendingMoneyPeriod),
+    moneyReceived: sortItems(moneyReceivedPeriod),
+    pendingReturns: sortItems(pendingReturnsPeriod),
+    returnsReceived: sortItems(returnsReceivedPeriod),
+    pendingMoneyAmount: pendingMoneyPeriod.reduce((sum, order) => sum + (asMoneyNumber(order.npRedeliverySum) || asMoneyNumber(order.price)), 0),
+    moneyReceivedAmount: moneyReceivedPeriod.reduce((sum, order) => sum + (asMoneyNumber(order.npRedeliverySum) || asMoneyNumber(order.price)), 0),
+  };
+}
+
+function reconciliationTtns(value) {
+  const raw = Array.isArray(value) ? value : String(value || '').split(/[\s,;]+/);
+  return [...new Set(raw.map(item => String(item || '').replace(/\D/g, '')).filter(item => /^\d{14,15}$/.test(item)))].slice(0, 200);
+}
+
+function reconcilePrivatePowerOrders(kind, values, managerId = null) {
+  const ttns = reconciliationTtns(values);
+  const orders = read(F.orders);
+  const now = new Date().toISOString();
+  const updated = [];
+  const alreadyClosed = [];
+  const wrongProduct = [];
+  const notFound = [];
+  for (const ttn of ttns) {
+    const index = orders.findIndex(order => kind === 'money'
+      ? String(order.ttn || '') === ttn
+      : [order.ttn, order.npReturnExpressWaybillNumber, order.npReturnOrderNumber].some(value => String(value || '') === ttn));
+    if (index < 0) { notFound.push(ttn); continue; }
+    if (!isPowerbankOrder(orders[index])) { wrongProduct.push(ttn); continue; }
+    const order = orders[index];
+    if (kind === 'money' && moneyReceivedManually(order)) { alreadyClosed.push(ttn); continue; }
+    if (kind === 'return' && returnReceivedManually(order)) { alreadyClosed.push(ttn); continue; }
+    const history = Array.isArray(order.reconciliationHistory) ? [...order.reconciliationHistory] : [];
+    history.push({ kind, ttn, at: now, by: managerId || 'private-panel' });
+    if (kind === 'money') {
+      const reconciled = ensurePaidOrderFinance({
+        ...order,
+        moneyReceivedConfirmed: true,
+        moneyReceivedAt: now,
+        moneyReceivedBy: managerId || 'private-panel',
+        settlementStatus: 'money_received',
+        paymentStatus: 'paid',
+        status: order.status === 'completed' ? 'completed' : 'paid',
+        paidAt: order.paidAt || now,
+        reconciliationHistory: history,
+        updatedAt: now,
+      }, {
+        verified: true,
+        at: now,
+        source: 'manual-ttn-reconciliation',
+        title: 'Післяплату отримано',
+        verifiedBy: managerId || 'private-panel',
+        extra: ttn,
+      });
+      orders[index] = reconciled;
+    } else {
+      orders[index] = {
+        ...order,
+        returnReceivedConfirmed: true,
+        returnReceivedAt: now,
+        returnReceivedBy: managerId || 'private-panel',
+        returnSettlementStatus: 'return_received',
+        paymentStatus: 'returned',
+        status: 'returned',
+        returnedAt: order.returnedAt || now,
+        reconciliationHistory: history,
+        updatedAt: now,
+      };
+    }
+    updated.push({ id: orders[index].id, ttn, name: orders[index].name || '', price: asMoneyNumber(orders[index].price) });
+  }
+  if (updated.length) write(F.orders, orders);
+  return { success: true, kind, submitted: ttns.length, updated, alreadyClosed, wrongProduct, notFound };
+}
+
 function buildCrmSummary(period = 'today') {
-  const allOrders = read(F.orders);
+  const allOrders = read(F.orders).filter(order => !isPowerbankOrder(order));
   const orders = allOrders.filter(o => orderBelongsToFinancePeriod(o, period));
   const finance = buildFinanceTransactions(period, allOrders);
   const reviewTransactions = finance.filter(x => x.reviewRequired === true);
@@ -848,7 +1012,7 @@ function oldestFirst(items, age) {
     .sort((a, b) => b.ageMs - a.ageMs);
 }
 function buildOrderCrmSummary(period = 'today') {
-  const allOrders = read(F.orders);
+  const allOrders = read(F.orders).filter(order => !isPowerbankOrder(order));
   const orders = allOrders.filter(order => inPeriod(order.createdAt, period));
   const waitingConfirmation = allOrders.filter(isOrderWaitingConfirmation);
   const missingDelivery = allOrders.filter(isOrderMissingDeliveryData);
@@ -1481,9 +1645,13 @@ function applyNovaTrackingToOrder(order, track) {
   }
 
   if (track.normalizedStatus === 'delivered') {
-    patch.paymentStatus = 'paid';
-    patch.status = ['completed', 'paid'].includes(order.status) ? order.status : 'paid';
-    patch.paidAt = order.paidAt || now;
+    patch.npDeliveredAt = order.npDeliveredAt || track.receivedAt || now;
+    patch.npMoneyExpected = true;
+    patch.settlementStatus = order.moneyReceivedConfirmed ? 'money_received' : 'awaiting_money';
+    if (!order.moneyReceivedConfirmed) {
+      patch.status = ['cancelled', 'returned'].includes(order.status) ? order.status : 'shipped';
+      patch.paymentStatus = 'awaiting_money';
+    }
   }
 
   if (track.documentCost > 0) {
@@ -1497,9 +1665,11 @@ function applyNovaTrackingToOrder(order, track) {
   }
 
   if (track.normalizedStatus === 'returned') {
-    patch.paymentStatus = 'returned';
+    patch.returnExpected = true;
+    patch.returnSettlementStatus = order.returnReceivedConfirmed ? 'return_received' : 'awaiting_return';
+    patch.paymentStatus = order.returnReceivedConfirmed ? 'returned' : 'awaiting_return';
     patch.status = 'returned';
-    patch.returnedAt = order.returnedAt || now;
+    patch.npReturnExpectedAt = order.npReturnExpectedAt || now;
   }
 
   if (trackingLooksLikeReturnRoute(track, order)) {
@@ -1532,10 +1702,12 @@ function applyNovaTrackingToOrder(order, track) {
       patch.npReturnExpressWaybillNumber = order.npReturnExpressWaybillNumber || basisNumber;
     }
     if (trackingArrivedAtSender(track)) {
-      patch.npReturnReceivedAt = order.npReturnReceivedAt || track.receivedAt || now;
+      patch.npReturnArrivedAt = order.npReturnArrivedAt || track.receivedAt || now;
+      patch.returnSettlementStatus = order.returnReceivedConfirmed ? 'return_received' : 'awaiting_return';
     }
     if (track.normalizedStatus === 'delivered' && (publicReturnTtn || /return|refusal|повер|возврат|відмов|отказ/i.test(trackingText(track)))) {
-      patch.npReturnCompletedAt = order.npReturnCompletedAt || track.receivedAt || now;
+      patch.npReturnArrivedAt = order.npReturnArrivedAt || track.receivedAt || now;
+      patch.returnSettlementStatus = order.returnReceivedConfirmed ? 'return_received' : 'awaiting_return';
     }
   }
 
@@ -1573,8 +1745,11 @@ function applyNovaReturnTrackingToOrder(order, track) {
     npReturnCity: track.city || order.npReturnCity || null,
     npReturnWarehouse: track.warehouse || order.npReturnWarehouse || null,
     npReturnSentAt: track.sentAt || order.npReturnSentAt || null,
-    npReturnReceivedAt: track.receivedAt || order.npReturnReceivedAt || null,
-    ...(track.normalizedStatus === 'delivered' ? { npReturnCompletedAt: order.npReturnCompletedAt || track.receivedAt || now } : {}),
+    npReturnArrivedAt: track.receivedAt || order.npReturnArrivedAt || null,
+    ...(track.normalizedStatus === 'delivered' ? {
+      returnExpected: true,
+      returnSettlementStatus: order.returnReceivedConfirmed ? 'return_received' : 'awaiting_return',
+    } : {}),
     npReturnTrackingSyncedAt: now,
     novaPoshta: {
       ...(order.novaPoshta && typeof order.novaPoshta === 'object' ? order.novaPoshta : {}),
@@ -2654,7 +2829,7 @@ if (npConfig.autoSync && npConfig.apiConfigured) {
   console.warn('[NovaPoshta] NOVA_POSHTA_API_KEY is not set; tracking and TTN creation are disabled.');
 }
 const monoConfig = monobank.configStatus();
-if (monoConfig.configured && process.env.MONOBANK_AUTO_SYNC !== 'false') {
+if (MONOBANK_CRM_ENABLED && monoConfig.configured && process.env.MONOBANK_AUTO_SYNC !== 'false') {
   const monoIntervalMs = Math.max(2, Number(process.env.MONOBANK_SYNC_INTERVAL_MINUTES || 5)) * 60 * 1000;
   const startupSyncDays = Math.max(1, Math.min(31, Number(process.env.MONOBANK_STARTUP_SYNC_DAYS || 7)));
   const intervalSyncDays = Math.max(1, Math.min(31, Number(process.env.MONOBANK_INTERVAL_SYNC_DAYS || 7)));
@@ -2793,6 +2968,23 @@ app.get('/api/admin/crm/summary', authBot, (req, res) => {
 app.get('/api/admin/crm/orders/summary', authBot, (req, res) => {
   res.json(buildOrderCrmSummary(sanitizeStr(req.query.period || 'today', 20)));
 });
+app.get('/api/admin/private/power/summary', authBot, (req, res) => {
+  res.json(buildPrivatePowerSummary(sanitizeStr(req.query.period || 'all', 20)));
+});
+app.post('/api/admin/private/power/reconcile/money', authBot, (req, res) => {
+  const ttns = reconciliationTtns(req.body?.ttns || req.body?.text);
+  if (!ttns.length) return res.status(400).json({ error: 'No valid TTNs', userMessage: 'Не знайдено ТТН із 14–15 цифр.' });
+  const result = reconcilePrivatePowerOrders('money', ttns, sanitizeStr(req.body?.managerId || '', 80));
+  updateOrderQueueNotice().catch(error => console.error('[order notice]', error.message));
+  res.json(result);
+});
+app.post('/api/admin/private/power/reconcile/returns', authBot, (req, res) => {
+  const ttns = reconciliationTtns(req.body?.ttns || req.body?.text);
+  if (!ttns.length) return res.status(400).json({ error: 'No valid TTNs', userMessage: 'Не знайдено ТТН із 14–15 цифр.' });
+  const result = reconcilePrivatePowerOrders('return', ttns, sanitizeStr(req.body?.managerId || '', 80));
+  updateOrderQueueNotice().catch(error => console.error('[order notice]', error.message));
+  res.json(result);
+});
 app.get('/api/admin/crm/products', authBot, (_req, res) => {
   res.json({ products: readCrmProducts() });
 });
@@ -2852,9 +3044,11 @@ app.post('/api/admin/np/afterpayments/sync', authBot, async (req, res) => {
   }
 });
 app.get('/api/admin/monobank/config', authBot, (_req, res) => {
+  if (!MONOBANK_CRM_ENABLED) return res.json({ configured: false, disabled: true, reason: 'CRM uses Nova Poshta API plus manual TTN reconciliation' });
   res.json({ ...monobank.configStatus(), webhookAvailable: !!(APP_PUBLIC_URL && MONOBANK_WEBHOOK_SECRET) });
 });
 app.post('/api/admin/monobank/sync', authBot, async (req, res) => {
+  if (!MONOBANK_CRM_ENABLED) return res.status(410).json({ error: 'Monobank CRM sync is disabled' });
   try {
     res.json({ success: true, ...(await syncMonobankFinance(req.body?.daysBack || 3)) });
   } catch (error) {
@@ -2862,6 +3056,7 @@ app.post('/api/admin/monobank/sync', authBot, async (req, res) => {
   }
 });
 app.post('/api/admin/monobank/webhook/setup', authBot, async (_req, res) => {
+  if (!MONOBANK_CRM_ENABLED) return res.status(410).json({ error: 'Monobank CRM sync is disabled' });
   if (!APP_PUBLIC_URL || !MONOBANK_WEBHOOK_SECRET) {
     return res.status(400).json({ error: 'APP_PUBLIC_URL and MONOBANK_WEBHOOK_SECRET are required' });
   }
@@ -2879,6 +3074,7 @@ app.get('/api/monobank/webhook/:secret', (req, res) => {
 });
 app.post('/api/monobank/webhook/:secret', (req, res) => {
   if (!MONOBANK_WEBHOOK_SECRET || req.params.secret !== MONOBANK_WEBHOOK_SECRET) return res.sendStatus(403);
+  if (!MONOBANK_CRM_ENABLED) return res.sendStatus(204);
   if (req.body?.type === 'StatementItem' && req.body?.data?.statementItem) {
     importMonobankStatementItem(req.body.data.statementItem);
   }
@@ -3315,11 +3511,12 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
 
   const ts = new Date(o.createdAt).toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' });
   const isInstant = o.orderMode === 'instant';
+  const isPowerbank = /voltgo|powerbank|павербанк/i.test(o.product || '');
   await tg(
     `🛒 <b>${isInstant ? 'ПОВНЕ ЗАМОВЛЕННЯ' : 'НОВА ЗАЯВКА'} #${o.id}</b>\n━━━━━━━━━━━━━━━━━━\n` +
     (o.product ? `🛍 Товар: <b>${o.product}</b>\n` : '') +
     `👤 Ім'я: <b>${o.name}</b>\n📱 Телефон: <b>${o.phone}</b>\n` +
-    `👟 Розмір: <b>${o.size}</b>\n` +
+    `${isPowerbank ? '🔋 Ємність' : '👟 Розмір'}: <b>${o.size}</b>\n` +
     (o.fullName ? `🧾 Ім'я та прізвище: <b>${o.fullName}</b>\n` : '') +
     (o.city ? `🏙 Місто: <b>${o.city}</b>\n` : '') +
     (o.district ? `📍 Район: <b>${o.district}</b>\n` : '') +

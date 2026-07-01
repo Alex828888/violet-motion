@@ -25,6 +25,8 @@ const API_KEY    = process.env.API_KEY    || 'violet-secret';
 const BOT_USE_WEBHOOK = process.env.BOT_USE_WEBHOOK === 'true';
 const BOT_WEBHOOK_URL = String(process.env.BOT_WEBHOOK_URL || '').replace(/\/+$/, '');
 const BOT_WEBHOOK_SECRET = process.env.BOT_WEBHOOK_SECRET || API_KEY;
+const POWERBANK_PANEL_PASSWORD = process.env.POWERBANK_PANEL_PASSWORD || '12345loha54321';
+const POWERBANK_SESSION_MS = Math.max(15 * 60 * 1000, Number(process.env.POWERBANK_SESSION_MS || 12 * 60 * 60 * 1000));
 
 if (!TOKEN) { console.error('❌ BOT_TOKEN not set'); process.exit(1); }
 
@@ -41,6 +43,9 @@ const pendingDelivery = {};
 const pendingTtn     = {};
 const pendingNpSender = {};
 const pendingProductCost = {};
+const pendingPowerAuth = {};
+const powerPanelSessions = {};
+const pendingPrivateReconcile = {};
 const pendingCb      = new Set();
 
 /* ── HTTP helpers ─────────────────────────────────────────── */
@@ -79,6 +84,7 @@ const MAIN_KB = {
     ['📈 Аналітика'],
     ['🔍 Пошук'],
     ['❓ Допомога'],
+    ['🔒 Private'],
   ],
   resize_keyboard: true,
   persistent: true,
@@ -268,6 +274,7 @@ const ORDER_LIST_MODELS = {
   all: 'Усі моделі',
   violet: 'Violet Motion',
   black: 'Black Breeze',
+  power: 'VoltGo Powerbank',
 };
 const ORDER_LIST_STATUSES = {
   active: 'Замовлення',
@@ -296,8 +303,15 @@ function orderListState(state = {}, fallbackStatus = 'active') {
 
 function orderModelKey(o) {
   const product = String(o?.product || '').toLowerCase();
+  if (product.includes('voltgo') || product.includes('powerbank') || product.includes('павербанк')) return 'power';
   if (product.includes('black') || product.includes('breeze') || product.includes('sandal')) return 'black';
   return 'violet';
+}
+
+function orderVariantLine(o) {
+  return orderModelKey(o) === 'power'
+    ? `🔋 ${esc(o.size || '—')}`
+    : `👟 р.${esc(o.size || '—')}`;
 }
 
 function orderStatusMatches(o, status) {
@@ -344,12 +358,15 @@ function orderFilterButton(text, active, callbackData) {
 }
 
 function ordersKeyboard(items, page, total, filter, state = orderListState()) {
-  const rows = [
+  const modelRows = state.model === 'power' ? [] : [
     [
       orderFilterButton('Усі моделі', state.model === 'all', orderFilterCallback(1, { ...state, model: 'all' })),
       orderFilterButton('Violet Motion', state.model === 'violet', orderFilterCallback(1, { ...state, model: 'violet' })),
       orderFilterButton('Black Breeze', state.model === 'black', orderFilterCallback(1, { ...state, model: 'black' })),
     ],
+  ];
+  const rows = [
+    ...modelRows,
     [
       orderFilterButton('Замовлення', state.status === 'active', orderFilterCallback(1, { ...state, status: 'active' })),
       orderFilterButton('Підтверджені', state.status === 'confirmed', orderFilterCallback(1, { ...state, status: 'confirmed' })),
@@ -369,6 +386,7 @@ function ordersKeyboard(items, page, total, filter, state = orderListState()) {
   nav.push({ text: `${page}/${total}`, callback_data: 'noop' });
   if (page < total) nav.push({ text: 'Далі →', callback_data: filter ? `op_${page + 1}_f_${filter}` : orderFilterCallback(page + 1, state) });
   if (nav.length) rows.push(nav);
+  if (state.model === 'power') rows.push([{ text: '← Private', callback_data: 'power_panel' }]);
   return { inline_keyboard: rows };
 }
 
@@ -383,6 +401,7 @@ async function showOrders(chatId, page = 1, filter = null, msgId = null, state =
       o.product, o.color, o.city, o.postOffice, o.npStatus,
     ].some(v => String(v || '').toLowerCase().includes(q)));
   }
+  if (listState.model !== 'power') orders = orders.filter(o => orderModelKey(o) !== 'power');
   if (listState.model !== 'all') orders = orders.filter(o => orderModelKey(o) === listState.model);
   orders = sortOrdersForList(orders.filter(o => orderStatusMatches(o, listState.status)), listState.status);
   if (!orders.length) {
@@ -400,7 +419,7 @@ async function showOrders(chatId, page = 1, filter = null, msgId = null, state =
   items.forEach(o => {
     text += `${statusEmoji(o.status)} <b>#${esc(o.id)}</b> ${esc(o.name || '—')}\n`;
     if (o.product) text += `   🛍 ${esc(o.product)}\n`;
-    text += `   📱 ${esc(o.phone || '—')}  👟 р.${esc(o.size || '—')}`;
+    text += `   📱 ${esc(o.phone || '—')}  ${orderVariantLine(o)}`;
     if (o.color) text += `  🎨 ${esc(o.color)}`;
     if (o.contactViaTelegram) text += '  💬 TG';
     text += `\n   🏷 ${esc(o.status || 'new')} · 💳 ${esc(paymentLabel(o))}`;
@@ -413,6 +432,116 @@ async function showOrders(chatId, page = 1, filter = null, msgId = null, state =
     text += `\n   ${fmtDate(o.createdAt)}\n\n`;
   });
   reply(chatId, text, ordersKeyboard(items, p, total, q, listState), msgId);
+}
+
+function isPowerPanelAuthorized(chatId) {
+  const expiresAt = Number(powerPanelSessions[chatId] || 0);
+  if (expiresAt > Date.now()) return true;
+  delete powerPanelSessions[chatId];
+  return false;
+}
+
+async function requestPowerPanelPassword(chatId) {
+  const auth = pendingPowerAuth[chatId] || { attempts: 0, lockedUntil: 0 };
+  if (auth.lockedUntil > Date.now()) {
+    const minutes = Math.max(1, Math.ceil((auth.lockedUntil - Date.now()) / 60000));
+    await bot.sendMessage(chatId, `🔒 Забагато невдалих спроб. Спробуйте ще раз через ${minutes} хв.`, { reply_markup: MAIN_KB });
+    return;
+  }
+  pendingPowerAuth[chatId] = auth;
+  await bot.sendMessage(chatId, '🔒 <b>Private</b>\n\nДля початку введіть ваш пароль:', {
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: [[{ text: '← Скасувати', callback_data: 'power_cancel_auth' }]] },
+  });
+}
+
+function powerPanelKeyboard() {
+  return { inline_keyboard: [
+    [{ text: '🆕 Нові', callback_data: 'power_orders_pending' }, { text: '✅ Підтверджені', callback_data: 'power_orders_confirmed' }],
+    [{ text: '📦 В роботі', callback_data: 'power_orders_active' }, { text: '📚 Усі замовлення', callback_data: 'power_orders_all' }],
+    [{ text: '💰 Провести гроші', callback_data: 'power_reconcile_money' }, { text: '↩️ Провести повернення', callback_data: 'power_reconcile_returns' }],
+    [{ text: '⏳ Очікуємо гроші', callback_data: 'power_list_pending_money' }, { text: '📥 Очікуємо повернення', callback_data: 'power_list_pending_returns' }],
+    [{ text: '✅ Гроші отримано', callback_data: 'power_list_money_received' }, { text: '✅ Повернення отримано', callback_data: 'power_list_returns_received' }],
+    [{ text: '🔄 Звірити з API НП', callback_data: 'power_np_sync' }],
+    [{ text: '🔐 Вийти з Private', callback_data: 'power_logout' }],
+  ] };
+}
+
+async function showPowerPanel(chatId, msgId = null) {
+  if (!isPowerPanelAuthorized(chatId)) {
+    await requestPowerPanelPassword(chatId);
+    return;
+  }
+  const [allOrders, reconciliation] = await Promise.all([
+    serverGet('/api/admin/orders'),
+    serverGet('/api/admin/private/power/summary?period=all'),
+  ]);
+  if (!Array.isArray(allOrders) || !reconciliation || reconciliation.error) return reply(chatId, '❌ Не вдалося завантажити Private CRM.', powerPanelKeyboard(), msgId);
+  const orders = allOrders.filter(order => orderModelKey(order) === 'power');
+  const count = status => orders.filter(order => orderStatusMatches(order, status)).length;
+  const pipeline = orders
+    .filter(order => !['cancelled', 'returned', 'paid', 'completed'].includes(order.status || 'new'))
+    .reduce((sum, order) => sum + Number(order.price || 0), 0);
+  const todayKey = new Date().toLocaleDateString('uk-UA', { timeZone: 'Europe/Kyiv' });
+  const today = orders.filter(order => new Date(order.createdAt || 0).toLocaleDateString('uk-UA', { timeZone: 'Europe/Kyiv' }) === todayKey).length;
+  const latest = [...orders].sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0)).slice(0, 3);
+  let text =
+    `🔒 <b>Private · VoltGo Powerbank</b>\n━━━━━━━━━━━━━━━\n` +
+    `📦 Усього замовлень: <b>${orders.length}</b>\n` +
+    `📅 Сьогодні: <b>${today}</b>\n` +
+    `🆕 Нові / не підтверджені: <b>${count('pending')}</b>\n` +
+    `✅ Підтверджені: <b>${count('confirmed')}</b>\n` +
+    `❌ Відхилені: <b>${count('cancelled')}</b>\n` +
+    `\n<b>Звірка вручну за ТТН</b>\n` +
+    `⏳ Очікуємо гроші: <b>${reconciliation.pendingMoney.length}</b> · ${money(reconciliation.pendingMoneyAmount)}\n` +
+    `✅ Гроші отримано: <b>${reconciliation.moneyReceived.length}</b> · ${money(reconciliation.moneyReceivedAmount)}\n` +
+    `📥 Очікуємо повернення: <b>${reconciliation.pendingReturns.length}</b>\n` +
+    `✅ Повернення отримано: <b>${reconciliation.returnsReceived.length}</b>\n\n` +
+    `🧮 Активний портфель: <b>${money(pipeline)}</b>\n` +
+    `<i>Нова Пошта лише оновлює «очікуємо». Фінальний статус закривається тільки кнопками «Провести».</i>`;
+  if (latest.length) {
+    text += '\n\n<b>Останні заявки:</b>\n' + latest.map(order =>
+      `${statusEmoji(order.status)} #${esc(order.id)} ${esc(order.name || '—')} · ${esc(order.phone || '—')}`
+    ).join('\n');
+  }
+  await reply(chatId, text, powerPanelKeyboard(), msgId);
+}
+
+function privateListKeyboard() {
+  return { inline_keyboard: [[{ text: '← Private', callback_data: 'power_panel' }]] };
+}
+
+async function showPrivateReconciliationList(chatId, view, msgId = null) {
+  if (!isPowerPanelAuthorized(chatId)) return requestPowerPanelPassword(chatId);
+  const data = await serverGet('/api/admin/private/power/summary?period=all');
+  if (!data || data.error) return reply(chatId, '❌ Не вдалося завантажити звірку.', privateListKeyboard(), msgId);
+  const config = {
+    pending_money: ['⏳ Очікуємо гроші', data.pendingMoney],
+    money_received: ['✅ Гроші отримано', data.moneyReceived],
+    pending_returns: ['📥 Очікуємо повернення', data.pendingReturns],
+    returns_received: ['✅ Повернення отримано', data.returnsReceived],
+  }[view] || ['Звірка', []];
+  const items = Array.isArray(config[1]) ? config[1].slice(0, 30) : [];
+  let text = `${config[0]} · <b>VoltGo</b> (${config[1]?.length || 0})\n━━━━━━━━━━━━━━━\n`;
+  if (!items.length) text += '\nТут зараз порожньо.';
+  else text += '\n' + items.map(item => {
+    const ttn = view.includes('return') ? (item.returnTtn || item.ttn) : item.ttn;
+    const amount = view.includes('money') ? ` · ${money(item.price)}` : '';
+    const closedAt = view === 'money_received' ? item.moneyReceivedAt : view === 'returns_received' ? item.returnReceivedAt : null;
+    return `${view.startsWith('pending') ? '⏳' : '✅'} #${esc(item.id)} ${esc(item.name || '—')}${amount}\n   ТТН: <code>${esc(ttn || '—')}</code>${closedAt ? `\n   Проведено: ${fmtDate(closedAt)}` : ''}`;
+  }).join('\n\n');
+  if ((config[1]?.length || 0) > items.length) text += `\n\n…ще ${config[1].length - items.length}`;
+  return reply(chatId, text, privateListKeyboard(), msgId);
+}
+
+function privateReconcileResultText(result, kind) {
+  if (!result || result.error) return `❌ ${esc(result?.userMessage || result?.error || 'Не вдалося провести ТТН.')}`;
+  let text = `${kind === 'money' ? '💰 Гроші проведено' : '↩️ Повернення проведено'}: <b>${result.updated?.length || 0}</b>\n`;
+  if (result.updated?.length) text += result.updated.map(item => `✅ #${item.id} · <code>${esc(item.ttn)}</code>`).join('\n') + '\n';
+  if (result.alreadyClosed?.length) text += `\nВже були закриті: ${result.alreadyClosed.map(ttn => `<code>${esc(ttn)}</code>`).join(', ')}`;
+  if (result.notFound?.length) text += `\nНе знайдено: ${result.notFound.map(ttn => `<code>${esc(ttn)}</code>`).join(', ')}`;
+  if (result.wrongProduct?.length) text += `\nНе VoltGo — пропущено: ${result.wrongProduct.map(ttn => `<code>${esc(ttn)}</code>`).join(', ')}`;
+  return text;
 }
 
 function orderDetailKeyboard(o) {
@@ -456,12 +585,16 @@ async function showOrderDetail(chatId, id, msgId = null) {
     `👤 Ім'я: <b>${esc(o.name || '—')}</b>\n` +
     `📱 Телефон: <b>${esc(o.phone || '—')}</b>\n` +
     `🛍 Товар: <b>${esc(o.product || '—')}</b>\n` +
-    `👟 Розмір: <b>${esc(o.size || '—')}</b>\n` +
+    `${orderModelKey(o) === 'power' ? '🔋 Ємність' : '👟 Розмір'}: <b>${esc(o.size || '—')}</b>\n` +
     `🎨 Колір: <b>${esc(o.color || '—')}</b>\n` +
     `💵 Ціна: <b>${esc(o.price || '—')} грн</b>\n` +
     (o.contactViaTelegram ? `💬 Зв'язок: Telegram\n` : `📞 Зв'язок: Дзвінок\n`) +
     `🏷 Статус замовлення: ${statusEmoji(o.status)} <b>${esc(o.status || 'new')}</b>\n` +
     `💳 Статус оплати: <b>${esc(paymentLabel(o))}</b>\n` +
+    (orderModelKey(o) === 'power'
+      ? `💰 Факт грошей: <b>${o.moneyReceivedConfirmed ? `отримано · ${fmtDate(o.moneyReceivedAt)}` : o.npMoneyExpected || o.settlementStatus === 'awaiting_money' ? 'очікуємо підтвердження' : 'ще не очікуються'}</b>\n` +
+        `↩️ Факт повернення: <b>${o.returnReceivedConfirmed ? `отримано · ${fmtDate(o.returnReceivedAt)}` : o.returnExpected || o.returnSettlementStatus === 'awaiting_return' ? 'очікуємо підтвердження' : 'немає'}</b>\n`
+      : '') +
     `🚚 ТТН: <code>${esc(o.ttn || '—')}</code>\n` +
     `📦 Статус доставки: <b>${esc(deliveryLabel(o))}</b>\n` +
     `📅 Дата: <b>${fmtDate(o.createdAt)}</b>\n` +
@@ -507,7 +640,7 @@ async function showNpReturnTrack(chatId, id, msgId = null) {
         npReturnStatus: oldTrack.status || order.npReturnStatus,
         npReturnStatusCode: oldTrack.statusCode || order.npReturnStatusCode,
         npReturnExpressWaybillNumber: discoveredReturnTtn || order.npReturnExpressWaybillNumber,
-        npReturnCompletedAt: completedByNova ? (oldTrack.receivedAt || new Date().toISOString()) : order.npReturnCompletedAt,
+        npReturnArrivedAt: completedByNova ? (oldTrack.receivedAt || new Date().toISOString()) : order.npReturnArrivedAt,
         npReturnOldTtnActive: trackLooksLikeReturnRoute(oldTrack, order) || order.npReturnOldTtnActive,
       } : {}),
     };
@@ -518,7 +651,7 @@ async function showNpReturnTrack(chatId, id, msgId = null) {
       `Клієнт: <b>${esc(order.name || order.fullName || '—')}</b>\n` +
       (order.product ? `Товар: <b>${esc(order.product)}</b>${order.size ? ` · р.${esc(order.size)}` : ''}\n` : '') +
       `Стара ТТН: <code>${esc(order.ttn || '—')}</code>\n` +
-      `Повернення: ${discoveredReturnTtn ? `<code>${esc(discoveredReturnTtn)}</code>${completedByNova ? ' · <b>отримано</b>' : ''}` : requestNumber ? `заявка <code>${esc(requestNumber)}</code>, ТТН ще не видана` : canCreate ? '<b>можна оформити</b>' : '<b>окрема ТТН ще не знайдена</b>'}\n\n` +
+      `Повернення: ${discoveredReturnTtn ? `<code>${esc(discoveredReturnTtn)}</code>${completedByNova ? ' · <b>прибуло за даними НП, очікує ручного проведення</b>' : ''}` : requestNumber ? `заявка <code>${esc(requestNumber)}</code>, ТТН ще не видана` : canCreate ? '<b>можна оформити</b>' : '<b>окрема ТТН ще не знайдена</b>'}\n\n` +
       `Статус старої ТТН: <b>${esc(oldTrack?.status || order.npStatus || deliveryLabel(order))}</b>\n` +
       `Де зараз: <b>${esc(oldLocation || 'оновіть НП')}</b>`,
       {
@@ -552,7 +685,8 @@ async function showNpReturnTrack(chatId, id, msgId = null) {
     `Код: <b>${esc(returnStatus.statusCode || order.npReturnStatusCode || '—')}</b>\n` +
     `Створено/відправлено: <b>${esc(returnStatus.sentAt || order.npReturnSentAt || order.npReturnCreatedAt || '—')}</b>\n` +
     `Лежить: <b>${esc(returnWaitLabel({ ...order, npReturnSentAt: returnStatus.sentAt || order.npReturnSentAt }))}</b>\n` +
-    `Отримано: <b>${esc(returnStatus.receivedAt || order.npReturnReceivedAt || order.npReturnPickedUpAt || '—')}</b>`;
+    `API НП повідомляє про прибуття: <b>${esc(returnStatus.receivedAt || order.npReturnArrivedAt || '—')}</b>\n` +
+    `Факт отримання менеджером: <b>${order.returnReceivedConfirmed ? fmtDate(order.returnReceivedAt) : 'не проведено'}</b>`;
   return reply(chatId, text, { inline_keyboard: [
     [{ text: '✅ Забрав', callback_data: `nprdone_${id}` }, { text: '🔄 Оновити НП', callback_data: `npsync_${id}` }],
     [{ text: '← До повернень', callback_data: 'trk_returns' }],
@@ -577,9 +711,25 @@ async function createNpReturn(chatId, id, msgId = null) {
 }
 
 async function markNpReturnPickedUp(chatId, id, msgId = null) {
+  const order = await serverGet(`/api/admin/orders/${id}`);
+  if (!order || order.error) return reply(chatId, '❌ Замовлення не знайдено.', MAIN_KB, msgId);
+  if (orderModelKey(order) === 'power') {
+    const ttn = order.npReturnExpressWaybillNumber || order.npReturnOrderNumber || order.ttn;
+    const result = await serverPost('/api/admin/private/power/reconcile/returns', { text: ttn, managerId: String(chatId) });
+    if (!result || result.error || !result.updated?.length) {
+      return reply(chatId, privateReconcileResultText(result, 'return'), powerPanelKeyboard(), msgId);
+    }
+    await bot.sendMessage(chatId, privateReconcileResultText(result, 'return'), { parse_mode: 'HTML', reply_markup: powerPanelKeyboard() });
+    return showPowerPanel(chatId, msgId);
+  }
+  const now = new Date().toISOString();
   const updated = await serverPatch(`/api/admin/orders/${id}`, {
-    npReturnPickedUpAt: new Date().toISOString(),
+    npReturnPickedUpAt: now,
     npReturnPickedUpByManager: true,
+    returnReceivedConfirmed: true,
+    returnReceivedAt: now,
+    returnReceivedBy: String(chatId),
+    returnSettlementStatus: 'return_received',
   });
   if (!updated || updated.error) {
     return reply(chatId, '❌ Не вдалося позначити повернення як забране.', trackingMenuKeyboard(), msgId);
@@ -1083,8 +1233,9 @@ function trackingListKeyboard(orders) {
 }
 
 async function showTrackingMenu(chatId, msgId = null) {
-  const orders = await serverGet('/api/admin/orders');
+  let orders = await serverGet('/api/admin/orders');
   if (!Array.isArray(orders)) return reply(chatId, '❌ Не вдалося завантажити відстеження.', MAIN_KB, msgId);
+  orders = orders.filter(order => orderModelKey(order) !== 'power');
 
   const activeTtn = orders.filter(isOrderActiveForTracking);
   const noTtn = orders.filter(o => !o.ttn && ['confirmed', 'shipped', 'paid'].includes(o.status || 'new'));
@@ -1105,7 +1256,7 @@ async function showTrackingMenu(chatId, msgId = null) {
 async function showTrackingList(chatId, msgId = null) {
   let orders = await serverGet('/api/admin/orders');
   if (!Array.isArray(orders)) return reply(chatId, '❌ Не вдалося завантажити відстеження.', trackingMenuKeyboard(), msgId);
-  orders = orders.filter(isOrderActiveForTracking).reverse();
+  orders = orders.filter(order => orderModelKey(order) !== 'power').filter(isOrderActiveForTracking).reverse();
   if (!orders.length) return reply(chatId, '🚚 <b>Активних ТТН немає</b>', trackingMenuKeyboard(), msgId);
 
   let text = `🚚 <b>Активні ТТН</b> (${orders.length})\n━━━━━━━━━━━━━━━\n\n`;
@@ -1161,6 +1312,7 @@ async function showReturnTrackingList(chatId, view = 'all', page = 1, msgId = nu
   let orders = await serverGet('/api/admin/orders');
   if (!Array.isArray(orders)) return reply(chatId, '❌ Не вдалося завантажити повернення.', trackingMenuKeyboard(), msgId);
   const allActive = orders
+    .filter(order => orderModelKey(order) !== 'power')
     .filter(hasReturnForPanel)
     .sort((a, b) => new Date(returnWaitBase(a) || 0) - new Date(returnWaitBase(b) || 0));
   const safeView = Object.prototype.hasOwnProperty.call(RETURN_VIEW_LABELS, view) ? view : 'all';
@@ -1283,6 +1435,7 @@ async function showStats(chatId, msgId = null) {
   ]);
   if (!Array.isArray(orders) || !Array.isArray(reviews))
     return reply(chatId, '❌ Не вдалося завантажити статистику.', MAIN_KB, msgId);
+  orders = orders.filter(order => orderModelKey(order) !== 'power');
 
   const avg = reviews.length
     ? (reviews.reduce((s, r) => s + Number(r.rating || 0), 0) / reviews.length).toFixed(1) : '—';
@@ -1341,12 +1494,8 @@ function crmMenuKb(period = 'today') {
         { text: `${period === 'all' ? '• ' : ''}∞ Увесь час`, callback_data: 'crm_period_all' },
       ],
       [
-        { text: '🧾 Операції', callback_data: `crm_tx_${period}_1` },
-        { text: '⚠️ Перевірити', callback_data: `crm_review_${period}_1` },
-      ],
-      [
         { text: '🏷 Собівартість', callback_data: 'crm_products' },
-        { text: '🔄 Оновити', callback_data: `crm_sync_${period}` },
+        { text: '🔄 Оновити НП', callback_data: `crm_np_refresh_${period}` },
       ],
       [{ text: '← CRM', callback_data: 'crm_menu' }],
     ],
@@ -1371,16 +1520,10 @@ async function showCrmReport(chatId, period = 'today', msgId = null) {
     return reply(chatId, '❌ CRM-звіт зараз недоступний.', crmMenuKb(period), msgId);
   }
 
-  const refundLine = Number(data.refundIncome || 0) > 0
-    ? `↩️ Повернення списань: <b>+${money(data.refundIncome)}</b>\n`
-    : '';
   const businessIncomeLine = Number(data.manualIncome || 0) > 0
     ? `➕ Інші бізнес-надходження: <b>+${money(data.manualIncome)}</b>\n`
     : '';
   const afterpayments = data.afterpayments || {};
-  const reviewLine = Number(data.reviewCount || 0) > 0
-    ? `⚠️ Потрібно перевірити: <b>${data.reviewCount}</b> операц.\n`
-    : `✅ Неперевірених операцій немає\n`;
 
   const text =
     `💼 <b>CRM Violet Motion — ${CRM_PERIOD_LABELS[period] || period}</b>\n━━━━━━━━━━━━━━━\n` +
@@ -1388,18 +1531,13 @@ async function showCrmReport(chatId, period = 'today', msgId = null) {
     `<b>Бізнес</b>\n` +
     `✅ Викуплено: <b>${data.paidOrders || 0}</b> · виручка <b>+${money(data.revenue)}</b>\n` +
     `🏷 Собівартість: <b>−${money(data.cost)}</b>\n` +
-    `📣 Реклама: <b>−${money(data.adsExpense)}</b>\n` +
-    `🚚 Нова Пошта: <b>−${money(Number(data.shippingExpense || 0) + Number(data.returnsExpense || 0))}</b>\n` +
-    `🧾 Інші бізнес-витрати: <b>−${money(data.otherExpense)}</b>\n` +
-    refundLine +
+    `🧾 Витрати, внесені вручну: <b>−${money(data.expense)}</b>\n` +
     businessIncomeLine +
     `💰 Прибуток: <b>${money(data.profit)}</b>\n` +
-    `   ${money(data.netOrders)} + ${money(data.manualIncome)} + ${money(data.refundIncome)} − ${money(data.expense)} = ${money(data.profit)}\n\n` +
-    `<b>Гроші та контроль</b>\n` +
-    `💵 Післяплати в актуальних ТТН: <b>${money(afterpayments.cashAmount || afterpayments.amount)}</b>\n` +
-    `👤 Особисті витрати: <b>−${money(data.personalExpense)}</b> (не в прибутку)\n` +
-    reviewLine +
-    `\n<i>Продажі — за статусом викупу НП. Витрати — з monobank. Невідомі списання не входять у бізнес без підтвердження.</i>`;
+    `   ${money(data.netOrders)} + ${money(data.manualIncome)} − ${money(data.expense)} = ${money(data.profit)}\n\n` +
+    `<b>Контроль Нової Пошти</b>\n` +
+    `💵 Післяплати, які бачить API НП: <b>${money(afterpayments.cashAmount || afterpayments.amount)}</b>\n` +
+    `\n<i>Дані банківської картки відключені. API Нової Пошти показує очікування, а факт отримання грошей і повернень закривається вручну за ТТН у Private.</i>`;
 
   reply(chatId, text, crmMenuKb(period), msgId);
 }
@@ -1908,6 +2046,8 @@ bot.onText(/\/reviews/, msg => { if (!isAdmin(msg.from.id)) return; showReviews(
 bot.onText(/\/support/, msg => { if (!isAdmin(msg.from.id)) return; showSupport(msg.chat.id); });
 bot.onText(/\/crm/,     msg => { if (!isAdmin(msg.from.id)) return; showCrmPicker(msg.chat.id); });
 bot.onText(/\/stats/,   msg => { if (!isAdmin(msg.from.id)) return; showStats(msg.chat.id); });
+bot.onText(/\/power/,   msg => { if (!isAdmin(msg.from.id)) return; isPowerPanelAuthorized(msg.chat.id) ? showPowerPanel(msg.chat.id) : requestPowerPanelPassword(msg.chat.id); });
+bot.onText(/\/private/, msg => { if (!isAdmin(msg.from.id)) return; isPowerPanelAuthorized(msg.chat.id) ? showPowerPanel(msg.chat.id) : requestPowerPanelPassword(msg.chat.id); });
 
 /* ═══════════════════════════════════════════════════════════
    TEXT MESSAGES
@@ -1939,6 +2079,58 @@ bot.on('message', async msg => {
 
   if (inDialog) {
     await bot.sendMessage(chatId, 'ℹ️ Спочатку завершіть активний діалог — 🔚 Завершити діалог', { reply_markup: DIALOG_KB });
+    return;
+  }
+
+  if (pendingPowerAuth[chatId]) {
+    const auth = pendingPowerAuth[chatId];
+    try { await bot.deleteMessage(chatId, msg.message_id); } catch {}
+    if (auth.lockedUntil > Date.now()) {
+      await requestPowerPanelPassword(chatId);
+      return;
+    }
+    if (text === POWERBANK_PANEL_PASSWORD) {
+      delete pendingPowerAuth[chatId];
+      powerPanelSessions[chatId] = Date.now() + POWERBANK_SESSION_MS;
+      await bot.sendMessage(chatId, '✅ Доступ до Private відкрито.', { reply_markup: MAIN_KB });
+      await showPowerPanel(chatId);
+      return;
+    }
+    auth.attempts = Number(auth.attempts || 0) + 1;
+    if (auth.attempts >= 5) {
+      auth.attempts = 0;
+      auth.lockedUntil = Date.now() + 15 * 60 * 1000;
+      await bot.sendMessage(chatId, '🔒 Невірний пароль. Доступ заблоковано на 15 хвилин.', { reply_markup: MAIN_KB });
+      return;
+    }
+    await bot.sendMessage(chatId, `❌ Невірний пароль. Залишилось спроб: ${5 - auth.attempts}.`, {
+      reply_markup: { inline_keyboard: [[{ text: '← Скасувати', callback_data: 'power_cancel_auth' }]] },
+    });
+    return;
+  }
+
+  if (pendingPrivateReconcile[chatId]) {
+    if (!isPowerPanelAuthorized(chatId)) {
+      delete pendingPrivateReconcile[chatId];
+      await requestPowerPanelPassword(chatId);
+      return;
+    }
+    const pending = pendingPrivateReconcile[chatId];
+    if (text === '-' || text.toLowerCase() === 'cancel') {
+      delete pendingPrivateReconcile[chatId];
+      await showPowerPanel(chatId);
+      return;
+    }
+    const endpoint = pending.kind === 'money'
+      ? '/api/admin/private/power/reconcile/money'
+      : '/api/admin/private/power/reconcile/returns';
+    const result = await serverPost(endpoint, { text, managerId: String(msg.from.id) });
+    if (result && !result.error) delete pendingPrivateReconcile[chatId];
+    await bot.sendMessage(chatId, privateReconcileResultText(result, pending.kind), {
+      parse_mode: 'HTML',
+      reply_markup: privateListKeyboard(),
+    });
+    if (result && !result.error) await showPowerPanel(chatId);
     return;
   }
 
@@ -2019,6 +2211,10 @@ bot.on('message', async msg => {
     case '💼 CRM':         showCrmPicker(chatId);    break;
     case '📊 Статистика':  showStats(chatId);         break;
     case '📈 Аналітика':   showAnalyticsMenu(chatId); break;
+    case '🔒 Private':
+      if (isPowerPanelAuthorized(chatId)) await showPowerPanel(chatId);
+      else await requestPowerPanelPassword(chatId);
+      break;
 
     case '🔍 Пошук':
       pendingSearch[chatId] = true;
@@ -2029,7 +2225,7 @@ bot.on('message', async msg => {
 
     case '❓ Допомога':
       await bot.sendMessage(chatId,
-        `<b>Команди:</b>\n/orders — замовлення\n/crm — CRM та гроші\n/reviews — відгуки\n/support — підтримка\n/stats — статистика\n/analytics — аналітика\n/search Ім'я — пошук\n\n` +
+        `<b>Команди:</b>\n/orders — замовлення\n/crm — CRM\n/private — захищена панель VoltGo\n/reviews — відгуки\n/support — підтримка\n/stats — статистика\n/analytics — аналітика\n/search Ім'я — пошук\n\n` +
         `💼 <b>CRM:</b> окремо замовлення з чергами дій і фінанси з фактом/прогнозом прибутку.\n\n` +
         `📈 <b>Аналітика:</b> кнопка в меню або /analytics\nПоказує: сесії, скрол, кліки, воронку, останні дії.\n\n` +
         `💬 <b>Підтримка:</b> коли приймаєте діалог — всі ваші повідомлення йдуть клієнту у реальному часі. Для завершення — 🔚 Завершити діалог`,
@@ -2048,6 +2244,11 @@ bot.on('message', async msg => {
 /* ═══════════════════════════════════════════════════════════
    CALLBACK QUERIES
 ═══════════════════════════════════════════════════════════ */
+function callbackOrderId(data = '') {
+  const match = String(data).match(/^(?:od|os|confirm|cancel|del_order|fill|npdata|npcreate|npcreate_force|oi|nt|nprt|nprcreate|nprdone|npsync|delivery_cancel)_(\d+)/);
+  return match ? Number(match[1]) : null;
+}
+
 bot.on('callback_query', async q => {
   const chatId = q.message.chat.id;
   const msgId  = q.message.message_id;
@@ -2057,6 +2258,16 @@ bot.on('callback_query', async q => {
   if (!isAdmin(q.from.id)) { await ack(q.id, '🚫 Доступ заборонено.'); return; }
   if (data === 'noop')      { await ack(q.id); return; }
 
+  const protectedOrderId = callbackOrderId(data);
+  if (protectedOrderId && !isPowerPanelAuthorized(chatId)) {
+    const protectedOrder = await serverGet(`/api/admin/orders/${protectedOrderId}`);
+    if (protectedOrder && !protectedOrder.error && orderModelKey(protectedOrder) === 'power') {
+      await ack(q.id, '🔒 Потрібен пароль Private.');
+      await requestPowerPanelPassword(chatId);
+      return;
+    }
+  }
+
   if (pendingCb.has(cbKey)) { await ack(q.id, '⏳ Зачекайте…'); return; }
   pendingCb.add(cbKey);
   await ack(q.id);
@@ -2064,6 +2275,71 @@ bot.on('callback_query', async q => {
   try {
     if (data === 'main') {
       await reply(chatId, '🟣 <b>Violet Motion — Адмін панель</b>\n\nОберіть розділ кнопками нижче:', MAIN_KB, msgId);
+      return;
+    }
+
+    if (data === 'power_cancel_auth') {
+      delete pendingPowerAuth[chatId];
+      delete pendingPrivateReconcile[chatId];
+      await reply(chatId, '🔒 Вхід до Private скасовано.', MAIN_KB, msgId);
+      return;
+    }
+
+    if (data === 'power_logout') {
+      delete pendingPowerAuth[chatId];
+      delete powerPanelSessions[chatId];
+      delete pendingPrivateReconcile[chatId];
+      await reply(chatId, '🔐 Ви вийшли з Private.', MAIN_KB, msgId);
+      return;
+    }
+
+    if (data === 'power_panel') {
+      await showPowerPanel(chatId, msgId);
+      return;
+    }
+
+    if (data === 'power_reconcile_money' || data === 'power_reconcile_returns') {
+      if (!isPowerPanelAuthorized(chatId)) {
+        await requestPowerPanelPassword(chatId);
+        return;
+      }
+      const kind = data === 'power_reconcile_money' ? 'money' : 'return';
+      pendingPrivateReconcile[chatId] = { kind };
+      await bot.sendMessage(chatId,
+        kind === 'money'
+          ? '💰 <b>Провести гроші</b>\n\nНадішліть ТТН, за які гроші фактично вже отримані. Можна одразу декілька — кожну з нового рядка або через пробіл.\n\nДля скасування надішліть «-».'
+          : '↩️ <b>Провести повернення</b>\n\nНадішліть ТТН повернень, які ви фізично вже отримали. Можна одразу декілька — кожну з нового рядка або через пробіл.\n\nДля скасування надішліть «-».',
+        { parse_mode: 'HTML', reply_markup: privateListKeyboard() });
+      return;
+    }
+
+    if (data.startsWith('power_list_')) {
+      await showPrivateReconciliationList(chatId, data.slice('power_list_'.length), msgId);
+      return;
+    }
+
+    if (data === 'power_np_sync') {
+      if (!isPowerPanelAuthorized(chatId)) {
+        await requestPowerPanelPassword(chatId);
+        return;
+      }
+      const sync = await serverPost('/api/admin/np/sync', { limit: 100, background: true, source: 'private-power' });
+      if (!sync || sync.error) {
+        await reply(chatId, `❌ Нова Пошта не синхронізувалась: ${esc(sync?.userMessage || sync?.error || 'помилка')}`, powerPanelKeyboard(), msgId);
+        return;
+      }
+      await reply(chatId, `${npSyncStatusLine(sync)}\n\nAPI НП оновить лише очікувані стани. Отримання грошей і повернень автоматично не закривається.`, powerPanelKeyboard(), msgId);
+      return;
+    }
+
+    if (data.startsWith('power_orders_')) {
+      if (!isPowerPanelAuthorized(chatId)) {
+        await requestPowerPanelPassword(chatId);
+        return;
+      }
+      const requestedStatus = data.slice('power_orders_'.length);
+      const status = Object.prototype.hasOwnProperty.call(ORDER_LIST_STATUSES, requestedStatus) ? requestedStatus : 'active';
+      await showOrders(chatId, 1, null, msgId, { model: 'power', status });
       return;
     }
 
@@ -2080,15 +2356,15 @@ bot.on('callback_query', async q => {
       return;
     }
 
-    if (data.startsWith('crm_sync_')) {
-      const period = data.slice('crm_sync_'.length);
+    if (data.startsWith('crm_np_refresh_')) {
+      const period = data.slice('crm_np_refresh_'.length);
       const safePeriod = ['today', 'week', 'month', 'all'].includes(period) ? period : 'today';
-      const sync = await serverPost('/api/admin/monobank/sync', { daysBack: 7 });
+      const sync = await serverPost('/api/admin/np/sync', { limit: 100, background: true, source: 'bot-crm' });
       if (!sync || sync.error) {
-        await reply(chatId, `❌ Monobank не синхронізувався: ${esc(sync?.error || 'помилка')}`, crmMenuKb(safePeriod), msgId);
+        await reply(chatId, `❌ Нова Пошта не синхронізувалась: ${esc(sync?.userMessage || sync?.error || 'помилка')}`, crmMenuKb(safePeriod), msgId);
         return;
       }
-      await showCrmReport(chatId, safePeriod, msgId);
+      await reply(chatId, `${npSyncStatusLine(sync)}\n\nОновлення йде у фоні. Відкрийте CRM через хвилину.`, crmMenuKb(safePeriod), msgId);
       return;
     }
 
@@ -2199,6 +2475,10 @@ bot.on('callback_query', async q => {
 
     if (data.startsWith('of_')) {
       const [, pageStr, model, status] = data.split('_');
+      if (model === 'power' && !isPowerPanelAuthorized(chatId)) {
+        await requestPowerPanelPassword(chatId);
+        return;
+      }
       showOrders(chatId, Number(pageStr), null, msgId, { model, status });
       return;
     }
@@ -2211,7 +2491,13 @@ bot.on('callback_query', async q => {
 
     if (data.startsWith('od_')) {
       delete pendingNpSender[chatId];
-      showOrderDetail(chatId, Number(data.slice(3)), msgId);
+      const orderId = Number(data.slice(3));
+      const order = await serverGet(`/api/admin/orders/${orderId}`);
+      if (order && !order.error && orderModelKey(order) === 'power' && !isPowerPanelAuthorized(chatId)) {
+        await requestPowerPanelPassword(chatId);
+        return;
+      }
+      showOrderDetail(chatId, orderId, msgId);
       return;
     }
 
