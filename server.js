@@ -774,12 +774,38 @@ function buildPrivatePowerSummary(period = 'all', allOrders = read(F.orders)) {
   };
 }
 
+function buildManagerReconciliationSummary(period = 'all', allOrders = read(F.orders)) {
+  const managerOrders = allOrders.filter(order => !isPowerbankOrder(order));
+  const pendingMoney = managerOrders.filter(order => novaSuggestsMoney(order) && !moneyReceivedManually(order));
+  const moneyReceived = managerOrders.filter(moneyReceivedManually);
+  const pendingReturns = managerOrders.filter(order => novaSuggestsReturn(order) && !returnReceivedManually(order));
+  const returnsReceived = managerOrders.filter(returnReceivedManually);
+  const filterPeriod = (orders, kind) => orders.filter(order => inPeriod(reconciliationDate(order, kind), period));
+  const pendingMoneyPeriod = filterPeriod(pendingMoney, 'money');
+  const moneyReceivedPeriod = filterPeriod(moneyReceived, 'money');
+  const pendingReturnsPeriod = filterPeriod(pendingReturns, 'return');
+  const returnsReceivedPeriod = filterPeriod(returnsReceived, 'return');
+  const sortItems = items => items.map(privatePowerItem).sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+  return {
+    period,
+    product: 'Violet Motion',
+    orders: managerOrders.filter(order => inPeriod(order.createdAt, period)).length,
+    allOrders: managerOrders.length,
+    pendingMoney: sortItems(pendingMoneyPeriod),
+    moneyReceived: sortItems(moneyReceivedPeriod),
+    pendingReturns: sortItems(pendingReturnsPeriod),
+    returnsReceived: sortItems(returnsReceivedPeriod),
+    pendingMoneyAmount: pendingMoneyPeriod.reduce((sum, order) => sum + (asMoneyNumber(order.npRedeliverySum) || asMoneyNumber(order.price)), 0),
+    moneyReceivedAmount: moneyReceivedPeriod.reduce((sum, order) => sum + (asMoneyNumber(order.npRedeliverySum) || asMoneyNumber(order.price)), 0),
+  };
+}
+
 function reconciliationTtns(value) {
   const raw = Array.isArray(value) ? value : String(value || '').split(/[\s,;]+/);
   return [...new Set(raw.map(item => String(item || '').replace(/\D/g, '')).filter(item => /^\d{14,15}$/.test(item)))].slice(0, 200);
 }
 
-function reconcilePrivatePowerOrders(kind, values, managerId = null) {
+function reconcileOrdersByTtn(kind, values, managerId = null, scope = 'power') {
   const ttns = reconciliationTtns(values);
   const orders = read(F.orders);
   const now = new Date().toISOString();
@@ -792,18 +818,20 @@ function reconcilePrivatePowerOrders(kind, values, managerId = null) {
       ? String(order.ttn || '') === ttn
       : [order.ttn, order.npReturnExpressWaybillNumber, order.npReturnOrderNumber].some(value => String(value || '') === ttn));
     if (index < 0) { notFound.push(ttn); continue; }
-    if (!isPowerbankOrder(orders[index])) { wrongProduct.push(ttn); continue; }
+    const isPower = isPowerbankOrder(orders[index]);
+    if ((scope === 'power' && !isPower) || (scope === 'manager' && isPower)) { wrongProduct.push(ttn); continue; }
     const order = orders[index];
     if (kind === 'money' && moneyReceivedManually(order)) { alreadyClosed.push(ttn); continue; }
     if (kind === 'return' && returnReceivedManually(order)) { alreadyClosed.push(ttn); continue; }
     const history = Array.isArray(order.reconciliationHistory) ? [...order.reconciliationHistory] : [];
-    history.push({ kind, ttn, at: now, by: managerId || 'private-panel' });
+    const source = scope === 'power' ? 'private-panel' : 'manager-panel';
+    history.push({ kind, ttn, at: now, by: managerId || source, scope });
     if (kind === 'money') {
       const reconciled = ensurePaidOrderFinance({
         ...order,
         moneyReceivedConfirmed: true,
         moneyReceivedAt: now,
-        moneyReceivedBy: managerId || 'private-panel',
+        moneyReceivedBy: managerId || source,
         settlementStatus: 'money_received',
         paymentStatus: 'paid',
         status: order.status === 'completed' ? 'completed' : 'paid',
@@ -815,7 +843,7 @@ function reconcilePrivatePowerOrders(kind, values, managerId = null) {
         at: now,
         source: 'manual-ttn-reconciliation',
         title: 'Післяплату отримано',
-        verifiedBy: managerId || 'private-panel',
+        verifiedBy: managerId || source,
         extra: ttn,
       });
       orders[index] = reconciled;
@@ -824,7 +852,7 @@ function reconcilePrivatePowerOrders(kind, values, managerId = null) {
         ...order,
         returnReceivedConfirmed: true,
         returnReceivedAt: now,
-        returnReceivedBy: managerId || 'private-panel',
+        returnReceivedBy: managerId || source,
         returnSettlementStatus: 'return_received',
         paymentStatus: 'returned',
         status: 'returned',
@@ -836,7 +864,15 @@ function reconcilePrivatePowerOrders(kind, values, managerId = null) {
     updated.push({ id: orders[index].id, ttn, name: orders[index].name || '', price: asMoneyNumber(orders[index].price) });
   }
   if (updated.length) write(F.orders, orders);
-  return { success: true, kind, submitted: ttns.length, updated, alreadyClosed, wrongProduct, notFound };
+  return { success: true, kind, scope, submitted: ttns.length, updated, alreadyClosed, wrongProduct, notFound };
+}
+
+function reconcilePrivatePowerOrders(kind, values, managerId = null) {
+  return reconcileOrdersByTtn(kind, values, managerId, 'power');
+}
+
+function reconcileManagerOrders(kind, values, managerId = null) {
+  return reconcileOrdersByTtn(kind, values, managerId, 'manager');
 }
 
 function buildCrmSummary(period = 'today') {
@@ -2970,6 +3006,23 @@ app.get('/api/admin/crm/orders/summary', authBot, (req, res) => {
 });
 app.get('/api/admin/private/power/summary', authBot, (req, res) => {
   res.json(buildPrivatePowerSummary(sanitizeStr(req.query.period || 'all', 20)));
+});
+app.get('/api/admin/reconciliation/summary', authBot, (req, res) => {
+  res.json(buildManagerReconciliationSummary(sanitizeStr(req.query.period || 'all', 20)));
+});
+app.post('/api/admin/reconciliation/money', authBot, (req, res) => {
+  const ttns = reconciliationTtns(req.body?.ttns || req.body?.text);
+  if (!ttns.length) return res.status(400).json({ error: 'No valid TTNs', userMessage: 'Не знайдено ТТН із 14–15 цифр.' });
+  const result = reconcileManagerOrders('money', ttns, sanitizeStr(req.body?.managerId || '', 80));
+  updateOrderQueueNotice().catch(error => console.error('[order notice]', error.message));
+  res.json(result);
+});
+app.post('/api/admin/reconciliation/returns', authBot, (req, res) => {
+  const ttns = reconciliationTtns(req.body?.ttns || req.body?.text);
+  if (!ttns.length) return res.status(400).json({ error: 'No valid TTNs', userMessage: 'Не знайдено ТТН із 14–15 цифр.' });
+  const result = reconcileManagerOrders('return', ttns, sanitizeStr(req.body?.managerId || '', 80));
+  updateOrderQueueNotice().catch(error => console.error('[order notice]', error.message));
+  res.json(result);
 });
 app.post('/api/admin/private/power/reconcile/money', authBot, (req, res) => {
   const ttns = reconciliationTtns(req.body?.ttns || req.body?.text);

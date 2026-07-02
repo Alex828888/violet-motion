@@ -26,7 +26,8 @@ const BOT_USE_WEBHOOK = process.env.BOT_USE_WEBHOOK === 'true';
 const BOT_WEBHOOK_URL = String(process.env.BOT_WEBHOOK_URL || '').replace(/\/+$/, '');
 const BOT_WEBHOOK_SECRET = process.env.BOT_WEBHOOK_SECRET || API_KEY;
 const POWERBANK_PANEL_PASSWORD = process.env.POWERBANK_PANEL_PASSWORD || '12345loha54321';
-const POWERBANK_SESSION_MS = Math.max(15 * 60 * 1000, Number(process.env.POWERBANK_SESSION_MS || 12 * 60 * 60 * 1000));
+// Private mode intentionally stays active until the manager explicitly exits it.
+// The in-memory session is also cleared naturally on a bot restart/deploy.
 
 if (!TOKEN) { console.error('❌ BOT_TOKEN not set'); process.exit(1); }
 
@@ -45,7 +46,7 @@ const pendingNpSender = {};
 const pendingProductCost = {};
 const pendingPowerAuth = {};
 const powerPanelSessions = {};
-const pendingPrivateReconcile = {};
+const pendingReconcile = {};
 const pendingCb      = new Set();
 
 /* ── HTTP helpers ─────────────────────────────────────────── */
@@ -79,6 +80,8 @@ const serverDelete = p    => apiFetch('DELETE', p);
 const MAIN_KB = {
   keyboard: [
     ['📦 Замовлення', '🚚 Відстеження'],
+    ['💰 Провести гроші', '↩️ Провести повернення'],
+    ['📋 Звірка ТТН'],
     ['💬 Відгуки',    '🎧 Підтримка'],
     ['💼 CRM',        '📊 Статистика'],
     ['📈 Аналітика'],
@@ -95,6 +98,25 @@ const DIALOG_KB = {
   resize_keyboard: true,
   persistent: true,
 };
+
+const PRIVATE_KB = {
+  keyboard: [
+    ['📦 VoltGo замовлення'],
+    ['💰 Провести гроші', '↩️ Провести повернення'],
+    ['⏳ Очікуємо гроші', '📥 Очікуємо повернення'],
+    ['✅ Гроші отримано', '✅ Повернення отримано'],
+    ['🔄 Звірити з API НП'],
+    ['🔐 Вийти з Private'],
+  ],
+  resize_keyboard: true,
+  persistent: true,
+};
+
+const CONTROL_BUTTONS = new Set([
+  ...MAIN_KB.keyboard.flat(),
+  ...PRIVATE_KB.keyboard.flat(),
+  ...DIALOG_KB.keyboard.flat(),
+]);
 
 /* ── Formatting helpers ───────────────────────────────────── */
 function stars(n)     { return '★'.repeat(n) + '☆'.repeat(5 - n); }
@@ -392,7 +414,7 @@ function ordersKeyboard(items, page, total, filter, state = orderListState()) {
 
 async function showOrders(chatId, page = 1, filter = null, msgId = null, state = {}) {
   let orders = await serverGet('/api/admin/orders');
-  if (!Array.isArray(orders)) return reply(chatId, '❌ Не вдалося завантажити замовлення.', MAIN_KB, msgId);
+  if (!Array.isArray(orders)) return reply(chatId, '❌ Не вдалося завантажити замовлення.', keyboardFor(chatId), msgId);
   const q = filter ? String(filter).trim().toLowerCase() : '';
   const listState = orderListState(state, q ? 'all' : 'active');
   if (q) {
@@ -435,13 +457,42 @@ async function showOrders(chatId, page = 1, filter = null, msgId = null, state =
 }
 
 function isPowerPanelAuthorized(chatId) {
-  const expiresAt = Number(powerPanelSessions[chatId] || 0);
+  if (powerPanelSessions[chatId] === true) return true;
+  const expiresAt = Number(powerPanelSessions[chatId] || 0); // backwards compatibility during a rolling deploy
   if (expiresAt > Date.now()) return true;
   delete powerPanelSessions[chatId];
   return false;
 }
 
+function keyboardFor(chatId) {
+  return isPowerPanelAuthorized(chatId) ? PRIVATE_KB : MAIN_KB;
+}
+
+function clearTransientManagerState(chatId) {
+  delete pendingSearch[chatId];
+  delete pendingDelivery[chatId];
+  delete pendingTtn[chatId];
+  delete pendingNpSender[chatId];
+  delete pendingProductCost[chatId];
+  delete pendingReconcile[chatId];
+}
+
+function enterPowerPanel(chatId) {
+  clearTransientManagerState(chatId);
+  powerPanelSessions[chatId] = true;
+}
+
+function leavePowerPanel(chatId) {
+  clearTransientManagerState(chatId);
+  delete pendingPowerAuth[chatId];
+  delete powerPanelSessions[chatId];
+}
+
 async function requestPowerPanelPassword(chatId) {
+  if (managerDialogs[chatId]) {
+    await bot.sendMessage(chatId, 'ℹ️ Спочатку завершіть активний діалог із клієнтом, а потім відкрийте Private.', { reply_markup: DIALOG_KB });
+    return;
+  }
   const auth = pendingPowerAuth[chatId] || { attempts: 0, lockedUntil: 0 };
   if (auth.lockedUntil > Date.now()) {
     const minutes = Math.max(1, Math.ceil((auth.lockedUntil - Date.now()) / 60000));
@@ -511,6 +562,69 @@ function privateListKeyboard() {
   return { inline_keyboard: [[{ text: '← Private', callback_data: 'power_panel' }]] };
 }
 
+function managerReconciliationKeyboard() {
+  return { inline_keyboard: [
+    [{ text: '💰 Провести гроші', callback_data: 'reconcile_money' }, { text: '↩️ Провести повернення', callback_data: 'reconcile_returns' }],
+    [{ text: '⏳ Очікуємо гроші', callback_data: 'reconcile_list_pending_money' }, { text: '📥 Очікуємо повернення', callback_data: 'reconcile_list_pending_returns' }],
+    [{ text: '✅ Гроші отримано', callback_data: 'reconcile_list_money_received' }, { text: '✅ Повернення отримано', callback_data: 'reconcile_list_returns_received' }],
+    [{ text: '🔄 Звірити з API НП', callback_data: 'reconcile_np_sync' }],
+    [{ text: '← CRM', callback_data: 'crm_menu' }],
+  ] };
+}
+
+function managerReconciliationBackKeyboard() {
+  return { inline_keyboard: [[{ text: '← Звірка ТТН', callback_data: 'reconcile_panel' }]] };
+}
+
+async function showManagerReconciliationPanel(chatId, msgId = null) {
+  const data = await serverGet('/api/admin/reconciliation/summary?period=all');
+  if (!data || data.error) return reply(chatId, '❌ Не вдалося завантажити звірку ТТН.', managerReconciliationKeyboard(), msgId);
+  const text =
+    `📋 <b>Звірка грошей і повернень</b>\n━━━━━━━━━━━━━━━\n` +
+    `⏳ Очікуємо гроші: <b>${data.pendingMoney?.length || 0}</b> · ${money(data.pendingMoneyAmount)}\n` +
+    `✅ Гроші отримано: <b>${data.moneyReceived?.length || 0}</b> · ${money(data.moneyReceivedAmount)}\n` +
+    `📥 Очікуємо повернення: <b>${data.pendingReturns?.length || 0}</b>\n` +
+    `✅ Повернення отримано: <b>${data.returnsReceived?.length || 0}</b>\n\n` +
+    `<i>Тут лише звичайні замовлення менеджерів. VoltGo залишається ізольованим у Private. API Нової Пошти формує очікування, а факт отримання закривається менеджером за ТТН.</i>`;
+  return reply(chatId, text, managerReconciliationKeyboard(), msgId);
+}
+
+async function showManagerReconciliationList(chatId, view, msgId = null) {
+  const data = await serverGet('/api/admin/reconciliation/summary?period=all');
+  if (!data || data.error) return reply(chatId, '❌ Не вдалося завантажити звірку.', managerReconciliationBackKeyboard(), msgId);
+  const config = {
+    pending_money: ['⏳ Очікуємо гроші', data.pendingMoney],
+    money_received: ['✅ Гроші отримано', data.moneyReceived],
+    pending_returns: ['📥 Очікуємо повернення', data.pendingReturns],
+    returns_received: ['✅ Повернення отримано', data.returnsReceived],
+  }[view] || ['Звірка', []];
+  const allItems = Array.isArray(config[1]) ? config[1] : [];
+  const items = allItems.slice(0, 30);
+  let text = `${config[0]} · <b>менеджери</b> (${allItems.length})\n━━━━━━━━━━━━━━━\n`;
+  if (!items.length) text += '\nТут зараз порожньо.';
+  else text += '\n' + items.map(item => {
+    const ttn = view.includes('return') ? (item.returnTtn || item.ttn) : item.ttn;
+    const amount = view.includes('money') ? ` · ${money(item.price)}` : '';
+    const closedAt = view === 'money_received' ? item.moneyReceivedAt : view === 'returns_received' ? item.returnReceivedAt : null;
+    return `${view.startsWith('pending') ? '⏳' : '✅'} #${esc(item.id)} ${esc(item.name || '—')}${amount}\n   ${esc(item.product || '—')}\n   ТТН: <code>${esc(ttn || '—')}</code>${closedAt ? `\n   Проведено: ${fmtDate(closedAt)}` : ''}`;
+  }).join('\n\n');
+  if (allItems.length > items.length) text += `\n\n…ще ${allItems.length - items.length}`;
+  return reply(chatId, text, managerReconciliationBackKeyboard(), msgId);
+}
+
+async function startReconciliationInput(chatId, kind, scope = 'manager') {
+  pendingReconcile[chatId] = { kind, scope };
+  const isPrivate = scope === 'power';
+  const backKeyboard = isPrivate ? privateListKeyboard() : managerReconciliationBackKeyboard();
+  const title = kind === 'money' ? '💰 <b>Провести гроші</b>' : '↩️ <b>Провести повернення</b>';
+  const description = kind === 'money'
+    ? 'Надішліть ТТН, за які гроші фактично вже отримані.'
+    : 'Надішліть ТТН повернень, які ви фізично вже отримали.';
+  await bot.sendMessage(chatId,
+    `${title}\n\n${description} Можна одразу декілька — кожну з нового рядка або через пробіл.\n\nДля скасування надішліть «-».`,
+    { parse_mode: 'HTML', reply_markup: backKeyboard });
+}
+
 async function showPrivateReconciliationList(chatId, view, msgId = null) {
   if (!isPowerPanelAuthorized(chatId)) return requestPowerPanelPassword(chatId);
   const data = await serverGet('/api/admin/private/power/summary?period=all');
@@ -534,13 +648,16 @@ async function showPrivateReconciliationList(chatId, view, msgId = null) {
   return reply(chatId, text, privateListKeyboard(), msgId);
 }
 
-function privateReconcileResultText(result, kind) {
+function reconcileResultText(result, kind, scope = 'power') {
   if (!result || result.error) return `❌ ${esc(result?.userMessage || result?.error || 'Не вдалося провести ТТН.')}`;
   let text = `${kind === 'money' ? '💰 Гроші проведено' : '↩️ Повернення проведено'}: <b>${result.updated?.length || 0}</b>\n`;
   if (result.updated?.length) text += result.updated.map(item => `✅ #${item.id} · <code>${esc(item.ttn)}</code>`).join('\n') + '\n';
   if (result.alreadyClosed?.length) text += `\nВже були закриті: ${result.alreadyClosed.map(ttn => `<code>${esc(ttn)}</code>`).join(', ')}`;
   if (result.notFound?.length) text += `\nНе знайдено: ${result.notFound.map(ttn => `<code>${esc(ttn)}</code>`).join(', ')}`;
-  if (result.wrongProduct?.length) text += `\nНе VoltGo — пропущено: ${result.wrongProduct.map(ttn => `<code>${esc(ttn)}</code>`).join(', ')}`;
+  if (result.wrongProduct?.length) {
+    const label = scope === 'power' ? 'Не VoltGo — пропущено' : 'VoltGo захищено Private-режимом — пропущено';
+    text += `\n${label}: ${result.wrongProduct.map(ttn => `<code>${esc(ttn)}</code>`).join(', ')}`;
+  }
   return text;
 }
 
@@ -572,13 +689,13 @@ function orderDetailKeyboard(o) {
     rows.push([{ text: '↩️ Оформити повернення', callback_data: `nprcreate_${id}` }]);
   }
   rows.push([{ text: '🗑 Видалити', callback_data: `del_order_${id}` }]);
-  rows.push([{ text: '← До списку', callback_data: 'orders' }]);
+  rows.push([{ text: '← До списку', callback_data: orderModelKey(o) === 'power' ? 'power_orders_active' : 'orders' }]);
   return { inline_keyboard: rows };
 }
 
 async function showOrderDetail(chatId, id, msgId = null) {
   const o = await serverGet(`/api/admin/orders/${id}`);
-  if (!o || o.error) return bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB });
+  if (!o || o.error) return bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: keyboardFor(chatId) });
   const text =
     `📋 <b>Замовлення #${esc(o.id)}</b>\n━━━━━━━━━━━━━━━\n` +
     `🆔 ID: <b>${esc(o.id)}</b>\n` +
@@ -606,10 +723,10 @@ async function showOrderDetail(chatId, id, msgId = null) {
 
 async function showNpTrack(chatId, id, msgId = null) {
   const order = await serverGet(`/api/admin/orders/${id}`);
-  if (!order || order.error) return bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB });
-  if (!order.ttn) return bot.sendMessage(chatId, '❌ У замовленні немає ТТН.', { reply_markup: MAIN_KB });
+  if (!order || order.error) return bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: keyboardFor(chatId) });
+  if (!order.ttn) return bot.sendMessage(chatId, '❌ У замовленні немає ТТН.', { reply_markup: keyboardFor(chatId) });
   const track = await serverGet(`/api/admin/np/track/${encodeURIComponent(order.ttn)}`);
-  if (!track || track.error) return bot.sendMessage(chatId, '❌ Не вдалося отримати статус Нової Пошти.', { reply_markup: MAIN_KB });
+  if (!track || track.error) return bot.sendMessage(chatId, '❌ Не вдалося отримати статус Нової Пошти.', { reply_markup: keyboardFor(chatId) });
   const text =
     `🔍 <b>ТТН ${esc(order.ttn)}</b>\n━━━━━━━━━━━━━━━\n` +
     `Статус: <b>${esc(track.status || '—')}</b>\n` +
@@ -625,7 +742,8 @@ async function showNpTrack(chatId, id, msgId = null) {
 
 async function showNpReturnTrack(chatId, id, msgId = null) {
   const order = await serverGet(`/api/admin/orders/${id}`);
-  if (!order || order.error) return reply(chatId, '❌ Замовлення не знайдено.', MAIN_KB, msgId);
+  if (!order || order.error) return reply(chatId, '❌ Замовлення не знайдено.', keyboardFor(chatId), msgId);
+  const returnListCallback = orderModelKey(order) === 'power' ? 'power_orders_active' : 'trk_returns';
   const returnTtn = returnTtnValue(order);
   if (!returnTtn) {
     const requestNumber = returnOrderRequestValue(order);
@@ -658,7 +776,7 @@ async function showNpReturnTrack(chatId, id, msgId = null) {
       inline_keyboard: [
         ...(canCreate ? [[{ text: '↩️ Оформити повернення', callback_data: `nprcreate_${id}` }]] : []),
         [{ text: '🔄 Оновити НП', callback_data: `npsync_${id}` }],
-        [{ text: '← До повернень', callback_data: 'trk_returns' }],
+        [{ text: '← До повернень', callback_data: returnListCallback }],
         [{ text: '← До замовлення', callback_data: `od_${id}` }],
       ],
     }, msgId);
@@ -689,7 +807,7 @@ async function showNpReturnTrack(chatId, id, msgId = null) {
     `Факт отримання менеджером: <b>${order.returnReceivedConfirmed ? fmtDate(order.returnReceivedAt) : 'не проведено'}</b>`;
   return reply(chatId, text, { inline_keyboard: [
     [{ text: '✅ Забрав', callback_data: `nprdone_${id}` }, { text: '🔄 Оновити НП', callback_data: `npsync_${id}` }],
-    [{ text: '← До повернень', callback_data: 'trk_returns' }],
+    [{ text: '← До повернень', callback_data: returnListCallback }],
     [{ text: '← До замовлення', callback_data: `od_${id}` }],
   ] }, msgId);
 }
@@ -706,48 +824,42 @@ async function createNpReturn(chatId, id, msgId = null) {
     `✅ Повернення оформлено для #${esc(id)}\n` +
     `Стара ТТН: <code>${esc(order.ttn || '—')}</code>\n` +
     `ТТН/заявка повернення: <code>${esc(returnTtn)}</code>`,
-    { parse_mode: 'HTML', reply_markup: MAIN_KB });
+    { parse_mode: 'HTML', reply_markup: keyboardFor(chatId) });
   return showNpReturnTrack(chatId, id, msgId);
 }
 
 async function markNpReturnPickedUp(chatId, id, msgId = null) {
   const order = await serverGet(`/api/admin/orders/${id}`);
-  if (!order || order.error) return reply(chatId, '❌ Замовлення не знайдено.', MAIN_KB, msgId);
+  if (!order || order.error) return reply(chatId, '❌ Замовлення не знайдено.', keyboardFor(chatId), msgId);
   if (orderModelKey(order) === 'power') {
     const ttn = order.npReturnExpressWaybillNumber || order.npReturnOrderNumber || order.ttn;
     const result = await serverPost('/api/admin/private/power/reconcile/returns', { text: ttn, managerId: String(chatId) });
     if (!result || result.error || !result.updated?.length) {
-      return reply(chatId, privateReconcileResultText(result, 'return'), powerPanelKeyboard(), msgId);
+      return reply(chatId, reconcileResultText(result, 'return', 'power'), powerPanelKeyboard(), msgId);
     }
-    await bot.sendMessage(chatId, privateReconcileResultText(result, 'return'), { parse_mode: 'HTML', reply_markup: powerPanelKeyboard() });
+    await bot.sendMessage(chatId, reconcileResultText(result, 'return', 'power'), { parse_mode: 'HTML', reply_markup: PRIVATE_KB });
     return showPowerPanel(chatId, msgId);
   }
-  const now = new Date().toISOString();
-  const updated = await serverPatch(`/api/admin/orders/${id}`, {
-    npReturnPickedUpAt: now,
-    npReturnPickedUpByManager: true,
-    returnReceivedConfirmed: true,
-    returnReceivedAt: now,
-    returnReceivedBy: String(chatId),
-    returnSettlementStatus: 'return_received',
-  });
-  if (!updated || updated.error) {
-    return reply(chatId, '❌ Не вдалося позначити повернення як забране.', trackingMenuKeyboard(), msgId);
+  const ttn = order.npReturnExpressWaybillNumber || order.npReturnOrderNumber || order.ttn;
+  const result = await serverPost('/api/admin/reconciliation/returns', { text: ttn, managerId: String(chatId) });
+  if (!result || result.error || !result.updated?.length) {
+    return reply(chatId, reconcileResultText(result, 'return', 'manager'), managerReconciliationKeyboard(), msgId);
   }
-  return showReturnTrackingList(chatId, 'all', 1, msgId);
+  await bot.sendMessage(chatId, reconcileResultText(result, 'return', 'manager'), { parse_mode: 'HTML', reply_markup: MAIN_KB });
+  return showManagerReconciliationPanel(chatId, msgId);
 }
 
 async function syncNpOrder(chatId, id, msgId = null) {
   const result = await serverPost(`/api/admin/orders/${id}/np/sync`, {});
-  if (!result || result.error) return bot.sendMessage(chatId, '❌ Не вдалося оновити Нову Пошту.', { reply_markup: MAIN_KB });
-  await bot.sendMessage(chatId, `🔄 НП оновлено: <b>${esc(result.track?.status || result.order?.npStatus || 'ok')}</b>`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
+  if (!result || result.error) return bot.sendMessage(chatId, '❌ Не вдалося оновити Нову Пошту.', { reply_markup: keyboardFor(chatId) });
+  await bot.sendMessage(chatId, `🔄 НП оновлено: <b>${esc(result.track?.status || result.order?.npStatus || 'ok')}</b>`, { parse_mode: 'HTML', reply_markup: keyboardFor(chatId) });
   await showOrderDetail(chatId, id, msgId);
 }
 
 async function askManagerDeliveryStep(chatId, id, stepIndex = 0, data = {}) {
   const order = await serverGet(`/api/admin/orders/${id}`);
   if (!order || order.error) {
-    await bot.sendMessage(chatId, '❌ Замовлення не знайдено.', { reply_markup: MAIN_KB });
+    await bot.sendMessage(chatId, '❌ Замовлення не знайдено.', { reply_markup: keyboardFor(chatId) });
     return;
   }
   const step = MANAGER_DELIVERY_STEPS[stepIndex];
@@ -767,7 +879,7 @@ async function saveManagerDeliveryInput(chatId, text) {
   const order = await serverGet(`/api/admin/orders/${pending.id}`);
   if (!order || order.error) {
     delete pendingDelivery[chatId];
-    await bot.sendMessage(chatId, '❌ Замовлення не знайдено.', { reply_markup: MAIN_KB });
+    await bot.sendMessage(chatId, '❌ Замовлення не знайдено.', { reply_markup: keyboardFor(chatId) });
     return true;
   }
 
@@ -840,7 +952,7 @@ async function saveManagerDeliveryInput(chatId, text) {
   });
   delete pendingDelivery[chatId];
   if (!updated || updated.error) {
-    await bot.sendMessage(chatId, '❌ Не вдалося зберегти дані доставки.', { reply_markup: MAIN_KB });
+    await bot.sendMessage(chatId, '❌ Не вдалося зберегти дані доставки.', { reply_markup: keyboardFor(chatId) });
     return true;
   }
 
@@ -865,7 +977,7 @@ async function confirmOrderByManager(chatId, id, msgId = null, managerId = null)
   if (managerId) patch.managerConfirmedBy = managerId;
   const updated = await serverPatch(`/api/admin/orders/${id}`, patch);
   if (!updated || updated.error) {
-    await bot.sendMessage(chatId, '❌ Не вдалося підтвердити замовлення.', { reply_markup: MAIN_KB });
+    await bot.sendMessage(chatId, '❌ Не вдалося підтвердити замовлення.', { reply_markup: keyboardFor(chatId) });
     return;
   }
   await bot.sendMessage(chatId, `✅ Замовлення #${id} підтверджено менеджером. Тепер заповнимо дані для Нової Пошти.`);
@@ -903,7 +1015,7 @@ function senderLocationPatch(location = {}) {
 async function startNpSenderLocation(chatId, id, force = false, msgId = null) {
   const order = await serverGet(`/api/admin/orders/${id}`);
   if (!order || order.error) {
-    await bot.sendMessage(chatId, '❌ Замовлення не знайдено.', { reply_markup: MAIN_KB });
+    await bot.sendMessage(chatId, '❌ Замовлення не знайдено.', { reply_markup: keyboardFor(chatId) });
     return;
   }
 
@@ -937,7 +1049,7 @@ async function resolveNpSenderInput(chatId, text) {
   if (!pending) return false;
   const query = text.trim();
   if (!query) {
-    await bot.sendMessage(chatId, '❌ Введіть номер або адресу місця відправки текстом.', { reply_markup: MAIN_KB });
+    await bot.sendMessage(chatId, '❌ Введіть номер або адресу місця відправки текстом.', { reply_markup: keyboardFor(chatId) });
     return true;
   }
 
@@ -972,7 +1084,7 @@ async function resolveNpSenderInput(chatId, text) {
 async function createNpTtn(chatId, id, force = false, msgId = null, senderLocation = null) {
   const order = await serverGet(`/api/admin/orders/${id}`);
   if (!order || order.error) {
-    await bot.sendMessage(chatId, '❌ Замовлення не знайдено.', { reply_markup: MAIN_KB });
+    await bot.sendMessage(chatId, '❌ Замовлення не знайдено.', { reply_markup: keyboardFor(chatId) });
     return;
   }
   const missing = missingRecipientDeliveryFields(order).filter(x => x !== 'ПІБ' || !order.name);
@@ -994,14 +1106,14 @@ async function createNpTtn(chatId, id, force = false, msgId = null, senderLocati
       ? `\n<b>НП:</b> ${esc(errors.join('; '))}`
       : '';
     const reason = esc(result?.userMessage || result?.error || 'Не вдалося створити ТТН.');
-    await bot.sendMessage(chatId, `❌ ${reason}${extra}`, { parse_mode: 'HTML', reply_markup: MAIN_KB });
+    await bot.sendMessage(chatId, `❌ ${reason}${extra}`, { parse_mode: 'HTML', reply_markup: keyboardFor(chatId) });
     return;
   }
 
   const ttn = result.ttn || result.order?.ttn || order.ttn || '—';
   await bot.sendMessage(chatId,
     `${force ? '♻️ ТТН пересоздано' : result.duplicate ? 'ℹ️ ТТН вже існує' : '✅ ТТН створено'} для замовлення #${id}: <code>${esc(ttn)}</code>`,
-    { parse_mode: 'HTML', reply_markup: MAIN_KB });
+    { parse_mode: 'HTML', reply_markup: keyboardFor(chatId) });
   await showOrderDetail(chatId, id, msgId);
 }
 
@@ -1428,7 +1540,7 @@ async function showSupport(chatId, page = 1, msgId = null) {
    STATISTICS (orders / reviews / support summary)
 ═══════════════════════════════════════════════════════════ */
 async function showStats(chatId, msgId = null) {
-  const [orders, reviews, support] = await Promise.all([
+  let [orders, reviews, support] = await Promise.all([
     serverGet('/api/admin/orders'),
     serverGet('/api/admin/reviews'),
     serverGet('/api/admin/support'),
@@ -1471,6 +1583,7 @@ function crmPickerKb() {
         { text: '📦 Замовлення', callback_data: 'crm_orders' },
         { text: '💰 Фінанси', callback_data: 'crm_finance' },
       ],
+      [{ text: '📋 Звірка грошей і повернень', callback_data: 'reconcile_panel' }],
     ],
   };
 }
@@ -1478,7 +1591,7 @@ function crmPickerKb() {
 async function showCrmPicker(chatId, msgId = null) {
   const text =
     `💼 <b>CRM Violet Motion</b>\n━━━━━━━━━━━━━━━\n` +
-    `Оберіть розділ для відстеження:`;
+    `Оберіть розділ для відстеження. Факт отримання грошей і повернень проводиться у «Звірці» за ТТН:`;
   reply(chatId, text, crmPickerKb(), msgId);
 }
 
@@ -1537,7 +1650,7 @@ async function showCrmReport(chatId, period = 'today', msgId = null) {
     `   ${money(data.netOrders)} + ${money(data.manualIncome)} − ${money(data.expense)} = ${money(data.profit)}\n\n` +
     `<b>Контроль Нової Пошти</b>\n` +
     `💵 Післяплати, які бачить API НП: <b>${money(afterpayments.cashAmount || afterpayments.amount)}</b>\n` +
-    `\n<i>Дані банківської картки відключені. API Нової Пошти показує очікування, а факт отримання грошей і повернень закривається вручну за ТТН у Private.</i>`;
+    `\n<i>Дані банківської картки відключені. API Нової Пошти показує очікування, а факт отримання грошей і повернень менеджери закривають вручну за ТТН у розділі «Звірка». VoltGo ведеться окремо у Private.</i>`;
 
   reply(chatId, text, crmMenuKb(period), msgId);
 }
@@ -2033,19 +2146,32 @@ async function showAnalyticsReport(chatId, period, view = 'overview', msgId = nu
 ═══════════════════════════════════════════════════════════ */
 bot.onText(/\/start/, async msg => {
   if (!isAdmin(msg.from.id)) return;
+  if (managerDialogs[msg.chat.id]) {
+    return bot.sendMessage(msg.chat.id, 'ℹ️ Спочатку завершіть активний діалог із клієнтом.', { reply_markup: DIALOG_KB });
+  }
+  if (isPowerPanelAuthorized(msg.chat.id)) return showPowerPanel(msg.chat.id);
   await bot.sendMessage(msg.chat.id,
     `🟣 <b>Violet Motion — Адмін панель</b>\n\nОберіть розділ кнопками нижче:`,
     { parse_mode: 'HTML', reply_markup: MAIN_KB });
 });
 
-bot.onText(/\/analytics/, msg => { if (!isAdmin(msg.from.id)) return; showAnalyticsMenu(msg.chat.id); });
-bot.onText(/\/search (.+)/, (msg, match) => { if (!isAdmin(msg.from.id)) return; showOrders(msg.chat.id, 1, match[1].trim().toLowerCase()); });
-bot.onText(/\/orders/,  msg => { if (!isAdmin(msg.from.id)) return; showOrders(msg.chat.id); });
-bot.onText(/\/track(?:ing)?/, msg => { if (!isAdmin(msg.from.id)) return; showTrackingMenu(msg.chat.id); });
-bot.onText(/\/reviews/, msg => { if (!isAdmin(msg.from.id)) return; showReviews(msg.chat.id); });
-bot.onText(/\/support/, msg => { if (!isAdmin(msg.from.id)) return; showSupport(msg.chat.id); });
-bot.onText(/\/crm/,     msg => { if (!isAdmin(msg.from.id)) return; showCrmPicker(msg.chat.id); });
-bot.onText(/\/stats/,   msg => { if (!isAdmin(msg.from.id)) return; showStats(msg.chat.id); });
+function regularCommand(msg, action) {
+  if (!isAdmin(msg.from.id)) return;
+  if (managerDialogs[msg.chat.id]) {
+    return bot.sendMessage(msg.chat.id, 'ℹ️ Спочатку завершіть активний діалог із клієнтом.', { reply_markup: DIALOG_KB });
+  }
+  if (isPowerPanelAuthorized(msg.chat.id)) return showPowerPanel(msg.chat.id);
+  return action();
+}
+
+bot.onText(/\/analytics/, msg => regularCommand(msg, () => showAnalyticsMenu(msg.chat.id)));
+bot.onText(/\/search (.+)/, (msg, match) => regularCommand(msg, () => showOrders(msg.chat.id, 1, match[1].trim().toLowerCase())));
+bot.onText(/\/orders/,  msg => regularCommand(msg, () => showOrders(msg.chat.id)));
+bot.onText(/\/track(?:ing)?/, msg => regularCommand(msg, () => showTrackingMenu(msg.chat.id)));
+bot.onText(/\/reviews/, msg => regularCommand(msg, () => showReviews(msg.chat.id)));
+bot.onText(/\/support/, msg => regularCommand(msg, () => showSupport(msg.chat.id)));
+bot.onText(/\/crm/,     msg => regularCommand(msg, () => showCrmPicker(msg.chat.id)));
+bot.onText(/\/stats/,   msg => regularCommand(msg, () => showStats(msg.chat.id)));
 bot.onText(/\/power/,   msg => { if (!isAdmin(msg.from.id)) return; isPowerPanelAuthorized(msg.chat.id) ? showPowerPanel(msg.chat.id) : requestPowerPanelPassword(msg.chat.id); });
 bot.onText(/\/private/, msg => { if (!isAdmin(msg.from.id)) return; isPowerPanelAuthorized(msg.chat.id) ? showPowerPanel(msg.chat.id) : requestPowerPanelPassword(msg.chat.id); });
 
@@ -2059,6 +2185,11 @@ bot.on('message', async msg => {
   const chatId = msg.chat.id;
   const text   = msg.text.trim();
   const inDialog = !!managerDialogs[chatId];
+
+  if (inDialog && CONTROL_BUTTONS.has(text) && text !== '🔚 Завершити діалог') {
+    await bot.sendMessage(chatId, 'ℹ️ Це кнопка керування ботом, тому її не відправлено клієнту. Спочатку завершіть активний діалог.', { reply_markup: DIALOG_KB });
+    return;
+  }
 
   if (inDialog && text !== '🔚 Завершити діалог') {
     await serverPost('/api/support/relay', {
@@ -2091,8 +2222,8 @@ bot.on('message', async msg => {
     }
     if (text === POWERBANK_PANEL_PASSWORD) {
       delete pendingPowerAuth[chatId];
-      powerPanelSessions[chatId] = Date.now() + POWERBANK_SESSION_MS;
-      await bot.sendMessage(chatId, '✅ Доступ до Private відкрито.', { reply_markup: MAIN_KB });
+      enterPowerPanel(chatId);
+      await bot.sendMessage(chatId, '✅ Доступ до Private відкрито. Нижнє меню перемкнено на VoltGo.', { reply_markup: PRIVATE_KB });
       await showPowerPanel(chatId);
       return;
     }
@@ -2109,28 +2240,36 @@ bot.on('message', async msg => {
     return;
   }
 
-  if (pendingPrivateReconcile[chatId]) {
-    if (!isPowerPanelAuthorized(chatId)) {
-      delete pendingPrivateReconcile[chatId];
+  if (pendingReconcile[chatId]) {
+    const pending = pendingReconcile[chatId];
+    if (pending.scope === 'power' && !isPowerPanelAuthorized(chatId)) {
+      delete pendingReconcile[chatId];
       await requestPowerPanelPassword(chatId);
       return;
     }
-    const pending = pendingPrivateReconcile[chatId];
-    if (text === '-' || text.toLowerCase() === 'cancel') {
-      delete pendingPrivateReconcile[chatId];
+    if (pending.scope !== 'power' && isPowerPanelAuthorized(chatId)) {
+      delete pendingReconcile[chatId];
       await showPowerPanel(chatId);
       return;
     }
-    const endpoint = pending.kind === 'money'
-      ? '/api/admin/private/power/reconcile/money'
-      : '/api/admin/private/power/reconcile/returns';
+    if (text === '-' || text.toLowerCase() === 'cancel') {
+      delete pendingReconcile[chatId];
+      if (pending.scope === 'power') await showPowerPanel(chatId);
+      else await showManagerReconciliationPanel(chatId);
+      return;
+    }
+    const base = pending.scope === 'power' ? '/api/admin/private/power/reconcile' : '/api/admin/reconciliation';
+    const endpoint = `${base}/${pending.kind === 'money' ? 'money' : 'returns'}`;
     const result = await serverPost(endpoint, { text, managerId: String(msg.from.id) });
-    if (result && !result.error) delete pendingPrivateReconcile[chatId];
-    await bot.sendMessage(chatId, privateReconcileResultText(result, pending.kind), {
+    if (result && !result.error) delete pendingReconcile[chatId];
+    await bot.sendMessage(chatId, reconcileResultText(result, pending.kind, pending.scope), {
       parse_mode: 'HTML',
-      reply_markup: privateListKeyboard(),
+      reply_markup: pending.scope === 'power' ? PRIVATE_KB : MAIN_KB,
     });
-    if (result && !result.error) await showPowerPanel(chatId);
+    if (result && !result.error) {
+      if (pending.scope === 'power') await showPowerPanel(chatId);
+      else await showManagerReconciliationPanel(chatId);
+    }
     return;
   }
 
@@ -2176,13 +2315,13 @@ bot.on('message', async msg => {
     const ttn = text.trim();
 
     if (!ttn) {
-      await bot.sendMessage(chatId, '❌ Введіть ТТН текстом.', { reply_markup: MAIN_KB });
+      await bot.sendMessage(chatId, '❌ Введіть ТТН текстом.', { reply_markup: keyboardFor(chatId) });
       return;
     }
 
     const order = await serverGet(`/api/admin/orders/${id}`);
     if (!order || order.error) {
-      await bot.sendMessage(chatId, '❌ Замовлення не знайдено.', { reply_markup: MAIN_KB });
+      await bot.sendMessage(chatId, '❌ Замовлення не знайдено.', { reply_markup: keyboardFor(chatId) });
       return;
     }
 
@@ -2194,18 +2333,45 @@ bot.on('message', async msg => {
     });
 
     if (!updated || updated.error) {
-      await bot.sendMessage(chatId, '❌ Не вдалося зберегти ТТН.', { reply_markup: MAIN_KB });
+      await bot.sendMessage(chatId, '❌ Не вдалося зберегти ТТН.', { reply_markup: keyboardFor(chatId) });
       return;
     }
 
-    await bot.sendMessage(chatId, `✅ ТТН збережено для замовлення #${id}.`, { reply_markup: MAIN_KB });
+    await bot.sendMessage(chatId, `✅ ТТН збережено для замовлення #${id}.`, { reply_markup: keyboardFor(chatId) });
     await showOrderDetail(chatId, id);
+    return;
+  }
+
+  if (isPowerPanelAuthorized(chatId)) {
+    switch (text) {
+      case '📦 VoltGo замовлення': await showOrders(chatId, 1, null, null, { model: 'power', status: 'active' }); break;
+      case '💰 Провести гроші': await startReconciliationInput(chatId, 'money', 'power'); break;
+      case '↩️ Провести повернення': await startReconciliationInput(chatId, 'return', 'power'); break;
+      case '⏳ Очікуємо гроші': await showPrivateReconciliationList(chatId, 'pending_money'); break;
+      case '📥 Очікуємо повернення': await showPrivateReconciliationList(chatId, 'pending_returns'); break;
+      case '✅ Гроші отримано': await showPrivateReconciliationList(chatId, 'money_received'); break;
+      case '✅ Повернення отримано': await showPrivateReconciliationList(chatId, 'returns_received'); break;
+      case '🔄 Звірити з API НП': {
+        const sync = await serverPost('/api/admin/np/sync', { limit: 100, background: true, source: 'private-power-keyboard' });
+        await bot.sendMessage(chatId, sync && !sync.error ? npSyncStatusLine(sync) : '❌ Не вдалося запустити звірку Нової Пошти.', { parse_mode: 'HTML', reply_markup: PRIVATE_KB });
+        break;
+      }
+      case '🔐 Вийти з Private':
+        leavePowerPanel(chatId);
+        await bot.sendMessage(chatId, '🔐 Ви вийшли з Private. Загальне меню менеджера відновлено.', { reply_markup: MAIN_KB });
+        break;
+      default:
+        await bot.sendMessage(chatId, '🔒 Ви зараз у Private · VoltGo. Для повернення до загального бота натисніть «🔐 Вийти з Private».', { reply_markup: PRIVATE_KB });
+    }
     return;
   }
 
   switch (text) {
     case '📦 Замовлення':  showOrders(chatId);       break;
     case '🚚 Відстеження': showTrackingMenu(chatId); break;
+    case '💰 Провести гроші': await startReconciliationInput(chatId, 'money', 'manager'); break;
+    case '↩️ Провести повернення': await startReconciliationInput(chatId, 'return', 'manager'); break;
+    case '📋 Звірка ТТН': await showManagerReconciliationPanel(chatId); break;
     case '💬 Відгуки':     showReviews(chatId);      break;
     case '🎧 Підтримка':   showSupport(chatId);      break;
     case '💼 CRM':         showCrmPicker(chatId);    break;
@@ -2245,8 +2411,25 @@ bot.on('message', async msg => {
    CALLBACK QUERIES
 ═══════════════════════════════════════════════════════════ */
 function callbackOrderId(data = '') {
-  const match = String(data).match(/^(?:od|os|confirm|cancel|del_order|fill|npdata|npcreate|npcreate_force|oi|nt|nprt|nprcreate|nprdone|npsync|delivery_cancel)_(\d+)/);
-  return match ? Number(match[1]) : null;
+  const value = String(data);
+  const direct = value.match(/^(?:od|os|confirm|cancel|del_order|del_confirm|fill|npdata|npcreate|npcreate_force|nprecreate|oi|ttn|nt|nprt|nprcreate|nprdone|npsync|delivery_cancel|npcancel)_(\d+)/);
+  if (direct) return Number(direct[1]);
+  const sender = value.match(/^nps_(?:back|retry|confirm)_(\d+)/);
+  if (sender) return Number(sender[1]);
+  const senderMode = value.match(/^nps_mode_[a-z]+_(\d+)/);
+  if (senderMode) return Number(senderMode[1]);
+  const city = value.match(/^npcity_(\d+)_/);
+  return city ? Number(city[1]) : null;
+}
+
+async function privateCallbackAllowed(chatId, data) {
+  if (!isPowerPanelAuthorized(chatId)) return true;
+  if (data === 'noop' || data.startsWith('power_')) return true;
+  if (/^of_\d+_power_/.test(data)) return true;
+  const orderId = callbackOrderId(data);
+  if (!orderId) return false;
+  const order = await serverGet(`/api/admin/orders/${orderId}`);
+  return !!(order && !order.error && orderModelKey(order) === 'power');
 }
 
 bot.on('callback_query', async q => {
@@ -2257,6 +2440,19 @@ bot.on('callback_query', async q => {
 
   if (!isAdmin(q.from.id)) { await ack(q.id, '🚫 Доступ заборонено.'); return; }
   if (data === 'noop')      { await ack(q.id); return; }
+
+  if (managerDialogs[chatId]) {
+    await ack(q.id, 'Спочатку завершіть діалог.');
+    await bot.sendMessage(chatId, 'ℹ️ Під час активного діалогу керування ботом призупинено, щоб службова дія не змішалась із листуванням клієнта.', { reply_markup: DIALOG_KB });
+    return;
+  }
+
+  if (!(await privateCallbackAllowed(chatId, data))) {
+    await ack(q.id, '🔒 Спочатку вийдіть із Private.');
+    await bot.sendMessage(chatId, '🔒 Private · VoltGo ізольовано від загального бота. Натисніть «🔐 Вийти з Private», щоб повернутися до замовлень менеджерів.', { reply_markup: PRIVATE_KB });
+    await showPowerPanel(chatId);
+    return;
+  }
 
   const protectedOrderId = callbackOrderId(data);
   if (protectedOrderId && !isPowerPanelAuthorized(chatId)) {
@@ -2280,15 +2476,13 @@ bot.on('callback_query', async q => {
 
     if (data === 'power_cancel_auth') {
       delete pendingPowerAuth[chatId];
-      delete pendingPrivateReconcile[chatId];
+      delete pendingReconcile[chatId];
       await reply(chatId, '🔒 Вхід до Private скасовано.', MAIN_KB, msgId);
       return;
     }
 
     if (data === 'power_logout') {
-      delete pendingPowerAuth[chatId];
-      delete powerPanelSessions[chatId];
-      delete pendingPrivateReconcile[chatId];
+      leavePowerPanel(chatId);
       await reply(chatId, '🔐 Ви вийшли з Private.', MAIN_KB, msgId);
       return;
     }
@@ -2304,12 +2498,7 @@ bot.on('callback_query', async q => {
         return;
       }
       const kind = data === 'power_reconcile_money' ? 'money' : 'return';
-      pendingPrivateReconcile[chatId] = { kind };
-      await bot.sendMessage(chatId,
-        kind === 'money'
-          ? '💰 <b>Провести гроші</b>\n\nНадішліть ТТН, за які гроші фактично вже отримані. Можна одразу декілька — кожну з нового рядка або через пробіл.\n\nДля скасування надішліть «-».'
-          : '↩️ <b>Провести повернення</b>\n\nНадішліть ТТН повернень, які ви фізично вже отримали. Можна одразу декілька — кожну з нового рядка або через пробіл.\n\nДля скасування надішліть «-».',
-        { parse_mode: 'HTML', reply_markup: privateListKeyboard() });
+      await startReconciliationInput(chatId, kind, 'power');
       return;
     }
 
@@ -2340,6 +2529,31 @@ bot.on('callback_query', async q => {
       const requestedStatus = data.slice('power_orders_'.length);
       const status = Object.prototype.hasOwnProperty.call(ORDER_LIST_STATUSES, requestedStatus) ? requestedStatus : 'active';
       await showOrders(chatId, 1, null, msgId, { model: 'power', status });
+      return;
+    }
+
+    if (data === 'reconcile_panel') {
+      await showManagerReconciliationPanel(chatId, msgId);
+      return;
+    }
+
+    if (data === 'reconcile_money' || data === 'reconcile_returns') {
+      await startReconciliationInput(chatId, data === 'reconcile_money' ? 'money' : 'return', 'manager');
+      return;
+    }
+
+    if (data.startsWith('reconcile_list_')) {
+      await showManagerReconciliationList(chatId, data.slice('reconcile_list_'.length), msgId);
+      return;
+    }
+
+    if (data === 'reconcile_np_sync') {
+      const sync = await serverPost('/api/admin/np/sync', { limit: 100, background: true, source: 'manager-reconciliation' });
+      if (!sync || sync.error) {
+        await reply(chatId, `❌ Нова Пошта не синхронізувалась: ${esc(sync?.userMessage || sync?.error || 'помилка')}`, managerReconciliationKeyboard(), msgId);
+        return;
+      }
+      await reply(chatId, `${npSyncStatusLine(sync)}\n\nAPI НП оновить очікувані стани. Факт отримання закривається менеджером за ТТН.`, managerReconciliationKeyboard(), msgId);
       return;
     }
 
@@ -2624,16 +2838,16 @@ bot.on('callback_query', async q => {
       const isConf = oldStyle ? oldCode === 'c' : data.startsWith('confirm_');
       const id     = oldStyle ? Number(oldId) : Number(data.replace(isConf ? 'confirm_' : 'cancel_', ''));
       const order  = await serverGet(`/api/admin/orders/${id}`);
-      if (!order || order.error) { await bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: MAIN_KB }); return; }
+      if (!order || order.error) { await bot.sendMessage(chatId, '❌ Не знайдено.', { reply_markup: keyboardFor(chatId) }); return; }
       if (isConf) {
         await confirmOrderByManager(chatId, id, msgId, q.from?.id);
         return;
       }
       const updated = await serverPatch(`/api/admin/orders/${id}`, { status: 'cancelled' });
-      if (!updated || updated.error) { await bot.sendMessage(chatId, '❌ Не вдалося змінити статус.', { reply_markup: MAIN_KB }); return; }
+      if (!updated || updated.error) { await bot.sendMessage(chatId, '❌ Не вдалося змінити статус.', { reply_markup: keyboardFor(chatId) }); return; }
       await bot.sendMessage(chatId,
         `❌ Замовлення #${id} (${updated.name}) — <b>скасовано</b>`,
-        { parse_mode: 'HTML', reply_markup: MAIN_KB });
+        { parse_mode: 'HTML', reply_markup: keyboardFor(chatId) });
       return;
     }
 
@@ -2641,7 +2855,7 @@ bot.on('callback_query', async q => {
       const id = Number(data.slice(10));
       const order = await serverGet(`/api/admin/orders/${id}`);
       if (!order || order.error) {
-        await reply(chatId, `❌ Замовлення #${id} не знайдено.`, MAIN_KB, msgId);
+        await reply(chatId, `❌ Замовлення #${id} не знайдено.`, keyboardFor(chatId), msgId);
         return;
       }
       await reply(chatId,
@@ -2660,7 +2874,7 @@ bot.on('callback_query', async q => {
     if (data.startsWith('del_confirm_')) {
       const id = Number(data.slice(12));
       const deleted = await serverDelete(`/api/admin/orders/${id}`);
-      if (!deleted || deleted.error) { await reply(chatId, `❌ Не вдалося видалити #${id}.`, MAIN_KB, msgId); return; }
+      if (!deleted || deleted.error) { await reply(chatId, `❌ Не вдалося видалити #${id}.`, keyboardFor(chatId), msgId); return; }
       await showOrders(chatId, 1, null, msgId);
       return;
     }
@@ -2699,7 +2913,7 @@ bot.on('callback_query', async q => {
 
   } catch (error) {
     console.error('[callback]', data, error.message);
-    await bot.sendMessage(chatId, `❌ Помилка бота: ${esc(error.message || 'невідома помилка')}`, { parse_mode: 'HTML', reply_markup: MAIN_KB }).catch(() => {});
+    await bot.sendMessage(chatId, `❌ Помилка бота: ${esc(error.message || 'невідома помилка')}`, { parse_mode: 'HTML', reply_markup: keyboardFor(chatId) }).catch(() => {});
   } finally {
     setTimeout(() => pendingCb.delete(cbKey), 2000);
   }
