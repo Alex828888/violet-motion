@@ -38,6 +38,10 @@ const MONOBANK_WEBHOOK_SECRET = process.env.MONOBANK_WEBHOOK_SECRET || '';
 // Card statement data is intentionally excluded from CRM by default.
 // Final money/return facts are confirmed manually by TTN against Nova Poshta tracking.
 const MONOBANK_CRM_ENABLED = process.env.MONOBANK_CRM_ENABLED === 'true';
+// Arbitrator (traffic manager) payout panel: fixed amount accrued per confirmed order,
+// counted from the moment the feature was turned on, independent of what happens to the
+// order afterwards (shipped/not shipped). Cleared to zero only when a payout is marked as received.
+const ARBITRATOR_RATE = Number(process.env.ARBITRATOR_RATE || 120);
 const APP_PUBLIC_URL = String(process.env.APP_PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
 const ZVONOK_CALL_URL = 'https://zvonok.com/manager/cabapi_external/api/v1/phones/call/';
 const SHOP_NAME = process.env.SHOP_NAME || 'Violet Motion';
@@ -77,6 +81,7 @@ const F = {
   orderNotify: path.join(DATA, 'order-notify.json'),
   npAfterpayments: path.join(DATA, 'np-afterpayments.json'),
   financeSettings: path.join(DATA, 'finance-settings.json'),
+  arbitrator: path.join(DATA, 'arbitrator.json'),
 };
 
 if (!fs.existsSync(DATA)) fs.mkdirSync(DATA, { recursive: true });
@@ -141,6 +146,58 @@ function applyPendingFinanceReset() {
   console.log(`[finance] reset applied: ${settings.resetKey}; orders were preserved`);
 }
 applyPendingFinanceReset();
+
+/* ── Arbitrator payout panel ──────────────────────────────── */
+// Persisted once: the exact moment counting starts. Never moves on redeploys.
+function ensureArbitratorSettings() {
+  const stored = read(F.arbitrator);
+  const settings = stored && !Array.isArray(stored) && typeof stored === 'object' ? stored : {};
+  let changed = false;
+  if (!settings.startAt) { settings.startAt = new Date().toISOString(); changed = true; }
+  if (!Number.isFinite(Number(settings.rate)) || Number(settings.rate) <= 0) { settings.rate = ARBITRATOR_RATE; changed = true; }
+  if (!Array.isArray(settings.payouts)) { settings.payouts = []; changed = true; }
+  if (!Object.prototype.hasOwnProperty.call(settings, 'lastPayoutAt')) { settings.lastPayoutAt = null; changed = true; }
+  if (changed) write(F.arbitrator, settings);
+  return settings;
+}
+function orderCountsForArbitrator(order, sinceMs) {
+  const confirmedAt = orderConfirmationAt(order);
+  return confirmedAt > 0 && confirmedAt >= sinceMs;
+}
+function arbitratorSummary() {
+  const settings = ensureArbitratorSettings();
+  const rate = Number(settings.rate) || ARBITRATOR_RATE;
+  const startMs = timestampMs(settings.startAt) || 0;
+  const lastPayoutMs = settings.lastPayoutAt ? timestampMs(settings.lastPayoutAt) : 0;
+  const cutoffMs = Math.max(startMs, lastPayoutMs);
+  const orders = read(F.orders);
+  const allAccrued = orders.filter(o => orderCountsForArbitrator(o, startMs));
+  const owedOrders = orders.filter(o => orderCountsForArbitrator(o, cutoffMs));
+  const totalPaidAmount = (settings.payouts || []).reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+  return {
+    rate,
+    startAt: settings.startAt,
+    lastPayoutAt: settings.lastPayoutAt,
+    owedOrdersCount: owedOrders.length,
+    owedAmount: owedOrders.length * rate,
+    totalOrdersAllTime: allAccrued.length,
+    totalEarnedAllTime: allAccrued.length * rate,
+    totalPaidAmount,
+    history: (settings.payouts || []).slice(-20).reverse(),
+  };
+}
+function recordArbitratorPayout() {
+  const settings = ensureArbitratorSettings();
+  const summary = arbitratorSummary();
+  if (!summary.owedOrdersCount) return { ...summary, alreadyPaid: true };
+  const now = new Date().toISOString();
+  settings.payouts = Array.isArray(settings.payouts) ? settings.payouts : [];
+  settings.payouts.push({ at: now, amount: summary.owedAmount, orders: summary.owedOrdersCount });
+  settings.lastPayoutAt = now;
+  write(F.arbitrator, settings);
+  return { ...arbitratorSummary(), alreadyPaid: false };
+}
+ensureArbitratorSettings();
 function mergeLegacyFileIfDataEmpty(key) {
   const current = read(F[key]);
   const legacyFile = path.join(ROOT, `${key}.json`);
@@ -2882,6 +2939,14 @@ if (MONOBANK_CRM_ENABLED && monoConfig.configured && process.env.MONOBANK_AUTO_S
       .catch(error => console.error('[Monobank sync]', error.message));
   }, monoIntervalMs).unref();
 }
+/* ── Arbitrator payout panel ──────────────────────────────── */
+app.get('/api/admin/arbitrator/summary', authBot, (_req, res) => {
+  res.json(arbitratorSummary());
+});
+app.post('/api/admin/arbitrator/payout', authBot, (_req, res) => {
+  res.json(recordArbitratorPayout());
+});
+
 app.delete('/api/admin/orders/cancelled', authBot, (_req, res) => {
   const arr = read(F.orders);
   const kept = arr.filter(x => (x.status || 'new') !== 'cancelled');

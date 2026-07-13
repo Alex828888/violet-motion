@@ -85,6 +85,7 @@ const MAIN_KB = {
     ['💬 Відгуки',    '🎧 Підтримка'],
     ['💼 CRM',        '📊 Статистика'],
     ['📈 Аналітика'],
+    ['🤝 Арбітраж'],
     ['🔍 Пошук'],
     ['❓ Допомога'],
     ['🔒 Private'],
@@ -1595,6 +1596,58 @@ async function showCrmPicker(chatId, msgId = null) {
   reply(chatId, text, crmPickerKb(), msgId);
 }
 
+/* ═══════════════════════════════════════════════════════════
+   ARBITRATOR PAYOUT PANEL
+═══════════════════════════════════════════════════════════ */
+function arbitratorKb(hasOwed) {
+  const rows = [];
+  if (hasOwed) rows.push([{ text: '✅ Гроші отримано', callback_data: 'arb_payout' }]);
+  rows.push([{ text: '🔄 Оновити', callback_data: 'arb_menu' }]);
+  return { inline_keyboard: rows };
+}
+
+async function showArbitratorPanel(chatId, msgId = null) {
+  const data = await serverGet('/api/admin/arbitrator/summary');
+  if (!data || data.error) {
+    return reply(chatId, '❌ Не вдалося завантажити панель арбітражника.', arbitratorKb(false), msgId);
+  }
+  const text =
+    `🤝 <b>Панель арбітражника</b>\n━━━━━━━━━━━━━━━\n` +
+    `Ставка: <b>${money(data.rate)}</b> за кожне підтверджене замовлення.\n` +
+    `Рахуємо з: <b>${fmtDate(data.startAt)}</b>\n\n` +
+    `<b>До виплати зараз</b>\n` +
+    `📦 Підтверджених замовлень: <b>${data.owedOrdersCount}</b>\n` +
+    `💵 Сума до виплати: <b>${money(data.owedAmount)}</b>\n\n` +
+    `<b>Всього</b>\n` +
+    `📦 Підтверджено за весь час: <b>${data.totalOrdersAllTime}</b>\n` +
+    `💰 Зароблено за весь час: <b>${money(data.totalEarnedAllTime)}</b>\n` +
+    `✅ Вже виплачено: <b>${money(data.totalPaidAmount)}</b>\n` +
+    (data.lastPayoutAt ? `🕒 Остання виплата: <b>${fmtDate(data.lastPayoutAt)}</b>\n` : '') +
+    (data.owedOrdersCount
+      ? `\nЯкщо гроші фактично надійшли — натисніть «✅ Гроші отримано», заборгованість обнулиться.`
+      : `\nНових підтверджених замовлень з моменту останньої виплати ще немає.`);
+  await reply(chatId, text, arbitratorKb(!!data.owedOrdersCount), msgId);
+}
+
+async function arbitratorPayout(chatId, msgId = null) {
+  const data = await serverPost('/api/admin/arbitrator/payout');
+  if (!data || data.error) {
+    return reply(chatId, '❌ Не вдалося провести виплату.', arbitratorKb(true), msgId);
+  }
+  if (data.alreadyPaid) {
+    return reply(chatId, 'ℹ️ Заборгованості немає — виплачувати нічого.', arbitratorKb(false), msgId);
+  }
+  const paidNow = data.history?.[0];
+  const text =
+    `✅ <b>Виплату зафіксовано</b>\n━━━━━━━━━━━━━━━\n` +
+    (paidNow ? `Отримано: <b>${money(paidNow.amount)}</b> за <b>${paidNow.orders}</b> замовлень.\n\n` : '') +
+    `<b>Поточний стан</b>\n` +
+    `💵 Заборгованість: <b>${money(data.owedAmount)}</b>\n` +
+    `✅ Вже виплачено всього: <b>${money(data.totalPaidAmount)}</b>\n\n` +
+    `Тепер рахунок нових доходів іде заново — з наступного підтвердженого замовлення.`;
+  await reply(chatId, text, arbitratorKb(!!data.owedOrdersCount), msgId);
+}
+
 function crmMenuKb(period = 'today') {
   return {
     inline_keyboard: [
@@ -2171,6 +2224,7 @@ bot.onText(/\/track(?:ing)?/, msg => regularCommand(msg, () => showTrackingMenu(
 bot.onText(/\/reviews/, msg => regularCommand(msg, () => showReviews(msg.chat.id)));
 bot.onText(/\/support/, msg => regularCommand(msg, () => showSupport(msg.chat.id)));
 bot.onText(/\/crm/,     msg => regularCommand(msg, () => showCrmPicker(msg.chat.id)));
+bot.onText(/\/arb(itrator)?/, msg => regularCommand(msg, () => showArbitratorPanel(msg.chat.id)));
 bot.onText(/\/stats/,   msg => regularCommand(msg, () => showStats(msg.chat.id)));
 bot.onText(/\/power/,   msg => { if (!isAdmin(msg.from.id)) return; isPowerPanelAuthorized(msg.chat.id) ? showPowerPanel(msg.chat.id) : requestPowerPanelPassword(msg.chat.id); });
 bot.onText(/\/private/, msg => { if (!isAdmin(msg.from.id)) return; isPowerPanelAuthorized(msg.chat.id) ? showPowerPanel(msg.chat.id) : requestPowerPanelPassword(msg.chat.id); });
@@ -2377,6 +2431,7 @@ bot.on('message', async msg => {
     case '💼 CRM':         showCrmPicker(chatId);    break;
     case '📊 Статистика':  showStats(chatId);         break;
     case '📈 Аналітика':   showAnalyticsMenu(chatId); break;
+    case '🤝 Арбітраж':    await showArbitratorPanel(chatId); break;
     case '🔒 Private':
       if (isPowerPanelAuthorized(chatId)) await showPowerPanel(chatId);
       else await requestPowerPanelPassword(chatId);
@@ -2391,7 +2446,8 @@ bot.on('message', async msg => {
 
     case '❓ Допомога':
       await bot.sendMessage(chatId,
-        `<b>Команди:</b>\n/orders — замовлення\n/crm — CRM\n/private — захищена панель VoltGo\n/reviews — відгуки\n/support — підтримка\n/stats — статистика\n/analytics — аналітика\n/search Ім'я — пошук\n\n` +
+        `<b>Команди:</b>\n/orders — замовлення\n/crm — CRM\n/arb — арбітраж\n/private — захищена панель VoltGo\n/reviews — відгуки\n/support — підтримка\n/stats — статистика\n/analytics — аналітика\n/search Ім'я — пошук\n\n` +
+        `🤝 <b>Арбітраж:</b> скільки грошей вам належить за підтверджені замовлення (120 грн за кожне). Кнопка «✅ Гроші отримано» обнуляє заборгованість.\n\n` +
         `💼 <b>CRM:</b> окремо замовлення з чергами дій і фінанси з фактом/прогнозом прибутку.\n\n` +
         `📈 <b>Аналітика:</b> кнопка в меню або /analytics\nПоказує: сесії, скрол, кліки, воронку, останні дії.\n\n` +
         `💬 <b>Підтримка:</b> коли приймаєте діалог — всі ваші повідомлення йдуть клієнту у реальному часі. Для завершення — 🔚 Завершити діалог`,
@@ -2556,6 +2612,10 @@ bot.on('callback_query', async q => {
       await reply(chatId, `${npSyncStatusLine(sync)}\n\nAPI НП оновить очікувані стани. Факт отримання закривається менеджером за ТТН.`, managerReconciliationKeyboard(), msgId);
       return;
     }
+
+    /* ─ Arbitrator callbacks ────────────────────────────── */
+    if (data === 'arb_menu') { await showArbitratorPanel(chatId, msgId); return; }
+    if (data === 'arb_payout') { await arbitratorPayout(chatId, msgId); return; }
 
     /* ─ CRM callbacks ───────────────────────────────────── */
     if (data === 'crm_menu') { await showCrmPicker(chatId, msgId); return; }
