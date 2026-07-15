@@ -24,6 +24,8 @@ const app        = express();
 const PORT       = process.env.PORT       || 3000;
 const TG_TOKEN   = process.env.TG_TOKEN   || process.env.BOT_TOKEN || '';
 const TG_CHAT_ID = process.env.TG_CHAT_ID || '';
+const ZAPUSK_TG_TOKEN = process.env.ZAPUSK_TG_TOKEN || '';
+const ZAPUSK_TG_CHAT_ID = process.env.ZAPUSK_TG_CHAT_ID || '';
 const TG_EXTRA_ADMIN_IDS = '7996143460';
 const TG_ADMIN_IDS = [process.env.ADMIN_IDS, TG_EXTRA_ADMIN_IDS].filter(Boolean).join(',');
 const API_KEY    = process.env.API_KEY    || 'violet-secret';
@@ -252,6 +254,26 @@ async function tgTo(chatId, text, extra = {}) {
     });
     return await r.json();
   } catch (e) { console.error('[TG]', e.message); return null; }
+}
+
+async function sendZapuskTelegram(text) {
+  if (!ZAPUSK_TG_TOKEN || !ZAPUSK_TG_CHAT_ID) return { ok: false, missingConfig: true };
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${ZAPUSK_TG_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: ZAPUSK_TG_CHAT_ID,
+        text,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      }),
+    });
+    return await r.json();
+  } catch (e) {
+    console.error('[ZAPUSK TG]', e.message);
+    return { ok: false };
+  }
 }
 
 async function tgEdit(chatId, messageId, text, extra = {}) {
@@ -3560,6 +3582,45 @@ app.get('/api/support/sessions', authBot, (_req, res) => {
     pending: (pendingMessages[id] || []).length,
   }));
   res.json(active);
+});
+
+/* ═══════════════════════════════════════════════════════════
+   ZAPUSK LEADS (public)
+═══════════════════════════════════════════════════════════ */
+app.post('/api/zapusk/lead', rateLimit(60 * 1000, 5), async (req, res) => {
+  const clean = (value, max = 200) => sanitizeStr(value, max).replace(/[<>]/g, '');
+  const escapeHtml = value => clean(value, 700).replace(/&/g, '&amp;');
+
+  if (req.body?.website) return res.json({ success: true });
+
+  const name = clean(req.body?.name, 80);
+  const phone = clean(req.body?.phone, 100);
+  const business = clean(req.body?.business, 120) || 'Не вказано';
+  const messenger = clean(req.body?.messenger, 40) || 'Не вказано';
+  const message = clean(req.body?.message, 700) || '—';
+  const source = clean(req.body?.source, 80) || 'Сайт';
+
+  if (name.length < 2 || phone.length < 5) {
+    return res.status(400).json({ error: 'Вкажіть ім’я та контакт' });
+  }
+  if (!ZAPUSK_TG_TOKEN || !ZAPUSK_TG_CHAT_ID) {
+    return res.status(503).json({ error: 'ZAPUSK Telegram is not configured' });
+  }
+
+  const result = await sendZapuskTelegram([
+    '🚀 <b>НОВА ЗАЯВКА ZAPUSK</b>',
+    '━━━━━━━━━━━━━━━━━━',
+    `👤 Ім’я: <b>${escapeHtml(name)}</b>`,
+    `📞 Контакт: <b>${escapeHtml(phone)}</b>`,
+    `🧩 Запит: <b>${escapeHtml(business)}</b>`,
+    `💬 Зручний зв’язок: <b>${escapeHtml(messenger)}</b>`,
+    `📝 Деталі: ${escapeHtml(message)}`,
+    `📍 Джерело: ${escapeHtml(source)}`,
+    '━━━━━━━━━━━━━━━━━━',
+  ].join('\n'));
+
+  if (!result?.ok) return res.status(502).json({ error: 'Telegram error' });
+  return res.json({ success: true });
 });
 
 /* ═══════════════════════════════════════════════════════════
