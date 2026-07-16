@@ -19,6 +19,7 @@ const cors    = require('cors');
 const crypto  = require('crypto');
 const novaPoshta = require('./nova-poshta');
 const monobank = require('./monobank');
+const { createCrmIntegration } = require('./crm-integration');
 
 const app        = express();
 const PORT       = process.env.PORT       || 3000;
@@ -84,6 +85,7 @@ const F = {
   npAfterpayments: path.join(DATA, 'np-afterpayments.json'),
   financeSettings: path.join(DATA, 'finance-settings.json'),
   arbitrator: path.join(DATA, 'arbitrator.json'),
+  crmSync: path.join(DATA, 'crm-sync.json'),
 };
 
 if (!fs.existsSync(DATA)) fs.mkdirSync(DATA, { recursive: true });
@@ -106,6 +108,12 @@ function write(file, data) {
   const tmp = `${file}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
   fs.renameSync(tmp, file);
+}
+let crmIntegration = null;
+function writeOrders(data, options = {}) {
+  const previous = read(F.orders);
+  write(F.orders, data);
+  if (crmIntegration) crmIntegration.onOrdersChanged(previous, data, options);
 }
 function nextId(arr) {
   return arr.length ? Math.max(...arr.map(x => x.id || 0)) + 1 : 1;
@@ -356,6 +364,15 @@ function authBot(req, res, next) {
   if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
+
+crmIntegration = createCrmIntegration({
+  app,
+  stateFile: F.crmSync,
+  readOrders: () => read(F.orders),
+  persistOrders: writeOrders,
+  adminAuth: authBot,
+  onOrderStatusChanged: order => updateOrderQueueNotice(order),
+});
 
 function sanitizeStr(val, max = 200) { return String(val || '').trim().slice(0, max); }
 function sha256Meta(value) {
@@ -942,7 +959,7 @@ function reconcileOrdersByTtn(kind, values, managerId = null, scope = 'power') {
     }
     updated.push({ id: orders[index].id, ttn, name: orders[index].name || '', price: asMoneyNumber(orders[index].price) });
   }
-  if (updated.length) write(F.orders, orders);
+  if (updated.length) writeOrders(orders);
   return { success: true, kind, scope, submitted: ttns.length, updated, alreadyClosed, wrongProduct, notFound };
 }
 
@@ -1453,7 +1470,7 @@ function importMonobankStatementItem(item, orders = read(F.orders)) {
         costProductLabel: orders[idx].costProductLabel || product.label,
         updatedAt: new Date().toISOString(),
       };
-      write(F.orders, orders);
+      writeOrders(orders);
     }
   } else if (isNova && bankAmount > 0) {
     entry = addFinanceEntryOnce({
@@ -2188,7 +2205,7 @@ async function syncOpenNovaPoshtaOrders(limit = 100, options = {}) {
     : { checked: 0, changed: 0, errors: [], found: 0 };
   changed += returnSync.changed;
   errors.push(...returnSync.errors);
-  if (changed) write(F.orders, orders);
+  if (changed) writeOrders(orders);
   return {
     checked: candidates.length,
     candidatePool: candidatePool.length,
@@ -2920,7 +2937,7 @@ app.patch('/api/admin/orders/:id', authBot, (req, res) => {
   const idx = arr.findIndex(x => x.id === id);
   if (idx < 0) return res.status(404).json({ error: 'Not found' });
   arr[idx] = ensurePaidOrderFinance({ ...arr[idx], ...req.body, id: arr[idx].id, updatedAt: new Date().toISOString() });
-  write(F.orders, arr);
+  writeOrders(arr);
   if (Object.prototype.hasOwnProperty.call(req.body || {}, 'status')) updateOrderQueueNotice(arr[idx]).catch(e => console.error('[order notice]', e.message));
   if (arr[idx].ttn && (
     Object.prototype.hasOwnProperty.call(req.body || {}, 'ttn') ||
@@ -2973,14 +2990,14 @@ app.delete('/api/admin/orders/cancelled', authBot, (_req, res) => {
   const arr = read(F.orders);
   const kept = arr.filter(x => (x.status || 'new') !== 'cancelled');
   const deleted = arr.length - kept.length;
-  if (deleted) write(F.orders, kept);
+  if (deleted) writeOrders(kept);
   updateOrderQueueNotice().catch(e => console.error('[order notice]', e.message));
   res.json({ success: true, deleted, remaining: kept.length });
 });
 app.delete('/api/admin/orders/:id', authBot, (req, res) => {
   const id = Number(req.params.id); const arr = read(F.orders);
   if (!arr.some(x => x.id === id)) return res.status(404).json({ error: 'Not found' });
-  write(F.orders, arr.filter(x => x.id !== id));
+  writeOrders(arr.filter(x => x.id !== id));
   updateOrderQueueNotice().catch(e => console.error('[order notice]', e.message));
   res.json({ success: true });
 });
@@ -3000,7 +3017,7 @@ app.post('/api/admin/orders/:id/expense', authBot, (req, res) => {
   arr[idx].expenses = [...(Array.isArray(arr[idx].expenses) ? arr[idx].expenses : []), expense];
   if (expense.category === 'return') arr[idx].returnExpense = amount;
   arr[idx].updatedAt = new Date().toISOString();
-  write(F.orders, arr);
+  writeOrders(arr);
   addFinanceEntryOnce({
     type: 'expense',
     title: expense.title,
@@ -3019,7 +3036,7 @@ app.post('/api/admin/orders/:id/comment', authBot, (req, res) => {
   if (idx < 0) return res.status(404).json({ error: 'Not found' });
   arr[idx].managerComment = sanitizeStr(req.body?.comment, 1000);
   arr[idx].updatedAt = new Date().toISOString();
-  write(F.orders, arr); res.json(arr[idx]);
+  writeOrders(arr); res.json(arr[idx]);
 });
 app.get('/api/admin/finance', authBot, (_req, res) => res.json(read(F.finance)));
 app.post('/api/admin/finance', authBot, (req, res) => {
@@ -3324,7 +3341,7 @@ app.post('/api/admin/orders/:id/np/create', authBot, async (req, res) => {
       ttnCreatedAt: now,
       updatedAt: now,
     };
-    write(F.orders, orders);
+    writeOrders(orders);
     updateOrderQueueNotice(orders[idx]).catch(e => console.error('[order notice]', e.message));
     scheduleNovaPoshtaSync({
       source: 'ttn-create',
@@ -3347,7 +3364,7 @@ app.post('/api/admin/orders/:id/np/sync', authBot, async (req, res) => {
   try {
     const { updated, track } = await syncOrderWithNovaPoshta(orders[idx]);
     orders[idx] = updated;
-    write(F.orders, orders);
+    writeOrders(orders);
     updateOrderQueueNotice(orders[idx]).catch(e => console.error('[order notice]', e.message));
     res.json({ success: true, order: orders[idx], track });
   } catch (error) {
@@ -3384,7 +3401,7 @@ app.post('/api/admin/orders/:id/np/return', authBot, async (req, res) => {
       updatedAt: now,
     };
     orders[idx] = updated;
-    write(F.orders, orders);
+    writeOrders(orders);
     updateOrderQueueNotice(orders[idx]).catch(e => console.error('[order notice]', e.message));
     res.json({ success: true, order: orders[idx], returnOrder: result.returnOrder || null, duplicate: !!result.duplicate });
   } catch (error) {
@@ -3407,7 +3424,7 @@ app.post('/api/admin/orders/:id/np/link-manual', authBot, async (req, res) => {
     } catch (error) {
       linked.syncError = error.message;
     }
-    write(F.orders, orders);
+    writeOrders(orders);
     updateOrderQueueNotice(orders[idx]).catch(e => console.error('[order notice]', e.message));
     res.json({ success: true, order: orders[idx], ttn: linked.ttn, document: linked.document, track: linked.track || null, syncError: linked.syncError || null });
   } catch (error) {
@@ -3466,7 +3483,7 @@ app.post('/api/admin/backup/restore', authBot, (req, res) => {
   const { orders, reviews, support, analytics, finance, financeSettings, crmProducts, npAfterpayments } = req.body || {};
   const restored = {};
   if (Array.isArray(orders)) {
-    write(F.orders, orders);
+    writeOrders(orders);
     restored.orders = orders.length;
   }
   if (Array.isArray(reviews)) {
@@ -3589,7 +3606,10 @@ app.get('/api/support/sessions', authBot, (_req, res) => {
 ═══════════════════════════════════════════════════════════ */
 app.post('/api/zapusk/lead', rateLimit(60 * 1000, 5), async (req, res) => {
   const clean = (value, max = 200) => sanitizeStr(value, max).replace(/[<>]/g, '');
-  const escapeHtml = value => clean(value, 700).replace(/&/g, '&amp;');
+  const escapeHtml = value => clean(value, 700)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 
   if (req.body?.website) return res.json({ success: true });
 
@@ -3684,7 +3704,7 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
     postOffice: cleanPostOffice || null,
     contactViaTelegram: !!contactViaTelegram, status: 'new', createdAt: new Date().toISOString(),
   };
-  activeOrders.push(o); write(F.orders, activeOrders);
+  activeOrders.push(o); writeOrders(activeOrders);
   await updateOrderQueueNotice(o);
   sendMetaConversionEvent('Lead', o, req, meta, { order_id: String(o.id) }).catch(e => console.error('[Meta CAPI]', e.message));
 
@@ -3735,14 +3755,14 @@ app.patch('/api/orders/:id',  (req, res) => {
   const arr = read(F.orders); const idx = arr.findIndex(x => x.id === +req.params.id);
   if (idx < 0) return res.status(404).json({ error: 'Not found' });
   arr[idx] = { ...arr[idx], ...req.body, id: arr[idx].id, updatedAt: new Date().toISOString() };
-  write(F.orders, arr);
+  writeOrders(arr);
   if (Object.prototype.hasOwnProperty.call(req.body || {}, 'status')) updateOrderQueueNotice(arr[idx]).catch(e => console.error('[order notice]', e.message));
   res.json(arr[idx]);
 });
 app.delete('/api/orders/:id', (req, res) => {
   const id = Number(req.params.id); const arr = read(F.orders);
   if (!arr.some(x => x.id === id)) return res.status(404).json({ error: 'Not found' });
-  write(F.orders, arr.filter(x => x.id !== id));
+  writeOrders(arr.filter(x => x.id !== id));
   updateOrderQueueNotice().catch(e => console.error('[order notice]', e.message));
   res.json({ success: true });
 });
@@ -3801,7 +3821,7 @@ app.all('/api/zvonok/ivr', async (req, res) => {
     ...(digit === '1' ? { confirmationSource: 'zvonok', zvonokConfirmedAt: new Date().toISOString() } : {}),
     ...(digit === '2' ? { cancelledAt: new Date().toISOString() } : {}),
   };
-  write(F.orders, orders);
+  writeOrders(orders);
 
   await tg(message);
   console.log(`[Zvonok] webhook order #${order.id}: ${nextStatus}`, payload);

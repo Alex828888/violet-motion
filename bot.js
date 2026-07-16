@@ -1585,6 +1585,7 @@ function crmPickerKb() {
         { text: '💰 Фінанси', callback_data: 'crm_finance' },
       ],
       [{ text: '📋 Звірка грошей і повернень', callback_data: 'reconcile_panel' }],
+      [{ text: '🔄 Синхронізація з іншою CRM', callback_data: 'crm_sync' }],
     ],
   };
 }
@@ -1594,6 +1595,39 @@ async function showCrmPicker(chatId, msgId = null) {
     `💼 <b>CRM Violet Motion</b>\n━━━━━━━━━━━━━━━\n` +
     `Оберіть розділ для відстеження. Факт отримання грошей і повернень проводиться у «Звірці» за ТТН:`;
   reply(chatId, text, crmPickerKb(), msgId);
+}
+
+function crmSyncKb() {
+  return {
+    inline_keyboard: [
+      [{ text: '🔄 Запустити звірку зараз', callback_data: 'crm_sync_run' }],
+      [{ text: '↻ Оновити стан', callback_data: 'crm_sync' }],
+      [{ text: '← CRM', callback_data: 'crm_menu' }],
+    ],
+  };
+}
+
+async function showCrmSync(chatId, msgId = null) {
+  const data = await serverGet('/api/admin/crm-sync/status');
+  if (!data || data.error) return reply(chatId, '❌ Стан синхронізації зараз недоступний.', crmSyncKb(), msgId);
+  const check = data.lastReconciliation || {};
+  const problems = Number(check.mismatches?.length || 0) + Number(check.missingLocal?.length || 0) + Number(check.missingRemote?.length || 0);
+  const text =
+    `🔄 <b>Синхронізація CRM</b>\n━━━━━━━━━━━━━━━\n` +
+    `Вхідний API: <b>${data.enabled ? 'увімкнено' : 'не налаштовано'}</b>\n` +
+    `Google CRM: <b>${data.outboundConfigured ? 'підключено' : 'очікує URL від партнера'}</b>\n` +
+    `У черзі на відправлення: <b>${data.pending || 0}</b>\n` +
+    `Помилок відправлення: <b>${data.failed || 0}</b>\n` +
+    (data.lastSuccessAt ? `Останній успішний обмін: <b>${fmtDate(data.lastSuccessAt)}</b>\n` : '') +
+    (data.lastError ? `Остання помилка: <b>${esc(data.lastError)}</b>\n` : '') +
+    (check.checkedAt
+      ? `\n<b>Остання звірка</b>\nЗбіглося: <b>${check.matched || 0}</b> · розбіжностей: <b>${problems}</b>\n` +
+        `Статуси відрізняються: <b>${check.statusMismatches || 0}</b>\n`
+      : '\nЗвірка ще не запускалася.\n') +
+    (!data.outboundConfigured
+      ? '\nПісля того як власник Google CRM надасть URL Apps Script, додайте його в PARTNER_CRM_URL.'
+      : problems ? '\n⚠️ Відкрийте звірку повторно після синхронізації. Нова версія автоматично застосовує свіжіший запис.' : '\n✅ Обидві CRM узгоджені.');
+  return reply(chatId, text, crmSyncKb(), msgId);
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -2623,6 +2657,18 @@ bot.on('callback_query', async q => {
     if (data === 'crm_finance') { await showCrmReport(chatId, 'today', msgId); return; }
 
     if (data === 'crm_orders') { await showOrderCrmReport(chatId, 'today', msgId); return; }
+
+    if (data === 'crm_sync') { await showCrmSync(chatId, msgId); return; }
+
+    if (data === 'crm_sync_run') {
+      const result = await serverPost('/api/admin/crm-sync/run', {});
+      if (!result || result.error) {
+        await reply(chatId, `❌ Синхронізація не виконана: ${esc(result?.error || 'помилка')}`, crmSyncKb(), msgId);
+        return;
+      }
+      await showCrmSync(chatId, msgId);
+      return;
+    }
 
     if (data.startsWith('crm_period_')) {
       const period = data.slice('crm_period_'.length);
