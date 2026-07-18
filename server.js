@@ -3604,6 +3604,11 @@ app.get('/api/support/sessions', authBot, (_req, res) => {
 /* ═══════════════════════════════════════════════════════════
    ZAPUSK LEADS (public)
 ═══════════════════════════════════════════════════════════ */
+app.get('/api/zapusk/health', (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: true });
+});
+
 app.post('/api/zapusk/lead', rateLimit(60 * 1000, 5), async (req, res) => {
   const clean = (value, max = 200) => sanitizeStr(value, max).replace(/[<>]/g, '');
   const escapeHtml = value => clean(value, 700)
