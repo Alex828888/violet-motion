@@ -16,11 +16,12 @@ async function listen(app) {
   return { server, base: `http://127.0.0.1:${server.address().port}` };
 }
 
-async function createHarness(t, initialOrders, partnerUrl = '') {
+async function createHarness(t, initialOrders, partnerUrl = '', options = {}) {
   process.env.PARTNER_CRM_API_KEY = 'test-partner-key-123456';
   if (partnerUrl) process.env.PARTNER_CRM_URL = partnerUrl;
   else delete process.env.PARTNER_CRM_URL;
   process.env.PARTNER_CRM_AUTO_SYNC = 'false';
+  delete process.env.PARTNER_CRM_ALLOW_BACKFILL;
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'violet-crm-hardening-test-'));
   const stateFile = path.join(tempDir, 'crm-sync.json');
   const app = express();
@@ -41,7 +42,9 @@ async function createHarness(t, initialOrders, partnerUrl = '') {
     readOrders: () => orders,
     persistOrders,
     adminAuth,
+    onOrderStatusChanged: options.onOrderStatusChanged || (() => {}),
     logger: silentLogger,
+    stateWriter: options.stateWriter || null,
   });
   const listener = await listen(app);
   t.after(() => {
@@ -82,6 +85,7 @@ test('partner API protects access, upserts orders, validates statuses and report
   process.env.PARTNER_CRM_API_KEY = 'test-partner-key-123456';
   delete process.env.PARTNER_CRM_URL;
   process.env.PARTNER_CRM_AUTO_SYNC = 'false';
+  delete process.env.PARTNER_CRM_ALLOW_BACKFILL;
 
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'violet-crm-test-'));
   const app = express();
@@ -110,6 +114,7 @@ test('partner API protects access, upserts orders, validates statuses and report
     readOrders: () => orders,
     persistOrders,
     adminAuth,
+    logger: silentLogger,
   });
 
   const server = app.listen(0);
@@ -145,34 +150,34 @@ test('partner API protects access, upserts orders, validates statuses and report
   assert.equal(body.order.status, 'confirmed');
   assert.equal(orders[0].integration.partnerOrderId, 'google-77');
 
-  response = await fetch(`${base}/api/integration/v1/orders/google-77`, {
+  response = await fetch(`${base}/api/integration/v1/orders/1`, {
     method: 'PATCH',
     headers: partnerHeaders,
-    body: JSON.stringify({ status: 'cancelled', updatedAt: '2026-07-16T08:30:00.000Z' }),
+    body: JSON.stringify({ externalId: 'google-77', status: 'cancelled', updatedAt: '2026-07-16T08:30:00.000Z' }),
   });
   body = await response.json();
   assert.equal(body.staleIgnored, true);
   assert.equal(body.order.status, 'confirmed');
 
-  response = await fetch(`${base}/api/integration/v1/orders/google-77`, {
+  response = await fetch(`${base}/api/integration/v1/orders/1`, {
     method: 'PATCH',
     headers: partnerHeaders,
-    body: JSON.stringify({ status: 'not-a-real-status' }),
+    body: JSON.stringify({ externalId: 'google-77', status: 'not-a-real-status' }),
   });
   assert.equal(response.status, 422);
 
-  response = await fetch(`${base}/api/integration/v1/orders/google-77`, {
+  response = await fetch(`${base}/api/integration/v1/orders/1`, {
     method: 'PATCH',
     headers: partnerHeaders,
-    body: JSON.stringify({ name: '', updatedAt: '2026-07-16T09:30:00.000Z' }),
+    body: JSON.stringify({ externalId: 'google-77', name: '', updatedAt: '2026-07-16T09:30:00.000Z' }),
   });
   assert.equal(response.status, 422);
   assert.equal(orders[0].name, 'Test Client');
 
-  response = await fetch(`${base}/api/integration/v1/orders/google-77`, {
+  response = await fetch(`${base}/api/integration/v1/orders/1`, {
     method: 'PATCH',
     headers: partnerHeaders,
-    body: JSON.stringify({ status: 'cancelled', updatedAt: '2026-07-15T09:30:00.000Z' }),
+    body: JSON.stringify({ externalId: 'google-77', status: 'cancelled', updatedAt: '2026-07-15T09:30:00.000Z' }),
   });
   assert.equal(response.status, 422);
   assert.equal(orders[0].status, 'confirmed');
@@ -195,6 +200,288 @@ test('partner API protects access, upserts orders, validates statuses and report
   body = await response.json();
   assert.equal(body.ok, false);
   assert.equal(body.reconciliation.statusMismatches, 1);
+});
+
+test('PATCH by localId updates confirmed and cancelled, returns the persisted projection, and never creates', async t => {
+  const notices = [];
+  const harness = await createHarness(t, [validOrder(1, {
+    integration: { partnerOrderId: 'universal-1' },
+  })], '', {
+    onOrderStatusChanged: order => notices.push({ id: order.id, status: order.status }),
+  });
+
+  let response = await fetch(`${harness.base}/api/integration/v1/orders/1`, {
+    method: 'PATCH',
+    headers: { ...harness.partnerHeaders, 'Idempotency-Key': 'confirm-local-1' },
+    body: JSON.stringify({
+      localId: '1',
+      externalId: 'universal-1',
+      status: 'confirmed',
+      updatedAt: '2026-07-16T09:00:00.000Z',
+    }),
+  });
+  let body = await response.json();
+  assert.equal(response.status, 200);
+  assert.deepEqual(body, {
+    ok: true,
+    created: false,
+    order: {
+      localId: '1',
+      externalId: 'universal-1',
+      status: 'confirmed',
+      updatedAt: '2026-07-16T09:00:00.000Z',
+    },
+  });
+  assert.equal(harness.orders.length, 1);
+  assert.equal(harness.orders[0].status, 'confirmed');
+
+  response = await fetch(`${harness.base}/api/integration/v1/orders`, { headers: harness.partnerHeaders });
+  body = await response.json();
+  assert.equal(body.orders.filter(order => order.status === 'new').length, 0);
+  assert.equal(body.orders[0].status, 'confirmed');
+
+  response = await fetch(`${harness.base}/api/integration/v1/orders/1`, {
+    method: 'PATCH',
+    headers: { ...harness.partnerHeaders, 'Idempotency-Key': 'cancel-local-1' },
+    body: JSON.stringify({
+      localId: '1',
+      externalId: 'universal-1',
+      status: 'cancelled',
+      updatedAt: '2026-07-16T10:00:00.000Z',
+    }),
+  });
+  body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.order.status, 'cancelled');
+  assert.equal(harness.orders[0].status, 'cancelled');
+
+  response = await fetch(`${harness.base}/api/integration/v1/orders/1`, {
+    method: 'PATCH',
+    headers: harness.partnerHeaders,
+    body: JSON.stringify({
+      localId: '1',
+      externalId: 'universal-1',
+      status: 'shipped',
+      updatedAt: '2026-07-16T11:00:00.000Z',
+    }),
+  });
+  body = await response.json();
+  assert.equal(response.status, 422);
+  assert.equal(body.error, 'invalid_status');
+  assert.equal(harness.orders[0].status, 'cancelled');
+
+  const beforeUnknown = JSON.parse(JSON.stringify(harness.orders));
+  response = await fetch(`${harness.base}/api/integration/v1/orders/999`, {
+    method: 'PATCH',
+    headers: { ...harness.partnerHeaders, 'Idempotency-Key': 'unknown-local-999' },
+    body: JSON.stringify({
+      localId: '999',
+      externalId: 'universal-999',
+      name: 'Would Be A Duplicate',
+      phone: '+380000000999',
+      size: '40',
+      status: 'confirmed',
+      createdAt: '2026-07-16T08:00:00.000Z',
+      updatedAt: '2026-07-16T11:00:00.000Z',
+    }),
+  });
+  body = await response.json();
+  assert.equal(response.status, 404);
+  assert.deepEqual(body, { ok: false, created: false, error: 'order_not_found' });
+  assert.deepEqual(harness.orders, beforeUnknown);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(notices, [
+    { id: 1, status: 'confirmed' },
+    { id: 1, status: 'cancelled' },
+  ]);
+});
+
+test('Idempotency-Key replays the exact first PATCH response without a second update or notice', async t => {
+  const notices = [];
+  const harness = await createHarness(t, [validOrder(1, {
+    integration: { partnerOrderId: 'universal-idempotent-1' },
+  })], '', {
+    onOrderStatusChanged: order => notices.push(order.status),
+  });
+  const headers = { ...harness.partnerHeaders, 'Idempotency-Key': 'same-request-key' };
+  const payload = {
+    localId: '1',
+    externalId: 'universal-idempotent-1',
+    status: 'confirmed',
+    updatedAt: '2026-07-16T09:00:00.000Z',
+  };
+
+  const firstResponse = await fetch(`${harness.base}/api/integration/v1/orders/1`, {
+    method: 'PATCH', headers, body: JSON.stringify(payload),
+  });
+  const firstBody = await firstResponse.json();
+  const afterFirst = JSON.parse(JSON.stringify(harness.orders));
+
+  const secondResponse = await fetch(`${harness.base}/api/integration/v1/orders/1`, {
+    method: 'PATCH', headers, body: JSON.stringify(payload),
+  });
+  const secondBody = await secondResponse.json();
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(firstResponse.status, 200);
+  assert.equal(secondResponse.status, 200);
+  assert.deepEqual(secondBody, firstBody);
+  assert.deepEqual(harness.orders, afterFirst);
+  assert.equal(harness.orders.length, 1);
+  assert.equal(harness.orders[0].updatedAt, '2026-07-16T09:00:00.000Z');
+  assert.deepEqual(notices, ['confirmed']);
+
+  const sameExternalResponse = await fetch(`${harness.base}/api/integration/v1/orders/1`, {
+    method: 'PATCH',
+    headers: { ...harness.partnerHeaders, 'Idempotency-Key': 'different-key-same-order' },
+    body: JSON.stringify(payload),
+  });
+  const sameExternalBody = await sameExternalResponse.json();
+  assert.equal(sameExternalResponse.status, 200);
+  assert.deepEqual(sameExternalBody, firstBody);
+  assert.equal(harness.orders.length, 1);
+  assert.equal(harness.orders[0].integration.partnerOrderId, 'universal-idempotent-1');
+  assert.deepEqual(notices, ['confirmed']);
+
+  const conflictResponse = await fetch(`${harness.base}/api/integration/v1/orders/1`, {
+    method: 'PATCH',
+    headers,
+    body: JSON.stringify({ ...payload, status: 'cancelled', updatedAt: '2026-07-16T10:00:00.000Z' }),
+  });
+  const conflict = await conflictResponse.json();
+  assert.equal(conflictResponse.status, 409);
+  assert.equal(conflict.error, 'idempotency_key_reused');
+  assert.equal(harness.orders[0].status, 'confirmed');
+  assert.deepEqual(notices, ['confirmed']);
+
+  const state = JSON.parse(fs.readFileSync(harness.stateFile, 'utf8'));
+  assert.equal(state.idempotency.length, 2);
+  assert.equal(JSON.stringify(state).includes('same-request-key'), false);
+
+  harness.applyLocal([{
+    ...harness.orders[0],
+    status: 'cancelled',
+    updatedAt: '2026-07-16T10:00:00.000Z',
+  }]);
+  let restartWrites = 0;
+  const restartApp = express();
+  restartApp.use(express.json());
+  createCrmIntegration({
+    app: restartApp,
+    stateFile: harness.stateFile,
+    readOrders: () => harness.orders,
+    persistOrders: () => { restartWrites++; },
+    adminAuth: (_req, _res, next) => next(),
+    onOrderStatusChanged: order => notices.push(order.status),
+    logger: silentLogger,
+  });
+  const restarted = await listen(restartApp);
+  t.after(() => restarted.server.close());
+  const replayAfterRestart = await fetch(`${restarted.base}/api/integration/v1/orders/1`, {
+    method: 'PATCH', headers, body: JSON.stringify(payload),
+  });
+  const replayAfterRestartBody = await replayAfterRestart.json();
+  assert.equal(replayAfterRestart.status, 200);
+  assert.deepEqual(replayAfterRestartBody, firstBody);
+  assert.equal(harness.orders[0].status, 'cancelled');
+  assert.equal(restartWrites, 0);
+  assert.deepEqual(notices, ['confirmed']);
+});
+
+test('PATCH rejects externalId rebinding and old timestamps without modifying either order', async t => {
+  const notices = [];
+  const initial = [
+    validOrder(1, {
+      status: 'confirmed',
+      updatedAt: '2026-07-16T10:00:00.000Z',
+      integration: { partnerOrderId: 'universal-bound-1' },
+    }),
+    validOrder(2),
+  ];
+  const harness = await createHarness(t, initial, '', {
+    onOrderStatusChanged: order => notices.push(order.status),
+  });
+  const original = JSON.parse(JSON.stringify(harness.orders));
+
+  let response = await fetch(`${harness.base}/api/integration/v1/orders/2`, {
+    method: 'PATCH',
+    headers: harness.partnerHeaders,
+    body: JSON.stringify({
+      localId: '2',
+      externalId: 'universal-bound-1',
+      status: 'confirmed',
+      updatedAt: '2026-07-16T11:00:00.000Z',
+    }),
+  });
+  let body = await response.json();
+  assert.equal(response.status, 409);
+  assert.equal(body.error, 'external_id_conflict');
+  assert.deepEqual(harness.orders, original);
+
+  response = await fetch(`${harness.base}/api/integration/v1/orders/1`, {
+    method: 'PATCH',
+    headers: harness.partnerHeaders,
+    body: JSON.stringify({
+      localId: '1',
+      externalId: 'replacement-external',
+      status: 'cancelled',
+      updatedAt: '2026-07-16T11:00:00.000Z',
+    }),
+  });
+  body = await response.json();
+  assert.equal(response.status, 409);
+  assert.equal(body.error, 'external_id_rebind_forbidden');
+  assert.deepEqual(harness.orders, original);
+
+  response = await fetch(`${harness.base}/api/integration/v1/orders/1`, {
+    method: 'PATCH',
+    headers: { ...harness.partnerHeaders, 'Idempotency-Key': 'stale-cancel-key' },
+    body: JSON.stringify({
+      localId: '1',
+      externalId: 'universal-bound-1',
+      status: 'cancelled',
+      updatedAt: '2026-07-16T09:00:00.000Z',
+    }),
+  });
+  body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.staleIgnored, true);
+  assert.equal(body.order.status, 'confirmed');
+  assert.deepEqual(harness.orders, original);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(notices, []);
+});
+
+test('PATCH rolls the order back and returns retryable HTTP 500 when durable idempotency storage fails', async t => {
+  const notices = [];
+  const initial = validOrder(1, { integration: { partnerOrderId: 'rollback-external-1' } });
+  const harness = await createHarness(t, [initial], '', {
+    onOrderStatusChanged: order => notices.push(order.status),
+    stateWriter: () => {
+      const error = new Error('Simulated state storage failure');
+      error.code = 'ENOSPC';
+      throw error;
+    },
+  });
+  const before = JSON.parse(JSON.stringify(harness.orders));
+
+  const response = await fetch(`${harness.base}/api/integration/v1/orders/1`, {
+    method: 'PATCH',
+    headers: { ...harness.partnerHeaders, 'Idempotency-Key': 'rollback-key' },
+    body: JSON.stringify({
+      localId: '1',
+      externalId: 'rollback-external-1',
+      status: 'confirmed',
+      updatedAt: '2026-07-16T09:00:00.000Z',
+    }),
+  });
+  const body = await response.json();
+  assert.equal(response.status, 500);
+  assert.deepEqual(body, { ok: false, created: false, error: 'patch_failed' });
+  assert.deepEqual(harness.orders, before);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(notices, []);
+  assert.equal(fs.existsSync(harness.stateFile), false);
 });
 
 test('batch quarantines a poison row without blocking valid rows or the sender cursor', async t => {
@@ -249,7 +536,7 @@ test('batch quarantines a poison row without blocking valid rows or the sender c
   assert.equal(JSON.stringify(status.recentErrors).includes('+380'), false);
 });
 
-test('startup removes an invalid partner import and merges only an active-new semantic partner duplicate', async t => {
+test('full sync audits invalid and duplicate historical orders without changing or deleting them', async t => {
   const canonical = validOrder(564, {
     name: 'Юлия Левченко',
     phone: '+380991234567',
@@ -272,44 +559,50 @@ test('startup removes an invalid partner import and merges only an active-new se
     integration: { partnerOrderId: 'poison-partner-id' },
   });
   const harness = await createHarness(t, [canonical, importedDuplicate, poison]);
+  const before = JSON.parse(JSON.stringify(harness.orders));
 
-  assert.deepEqual(harness.orders.map(order => order.id), [564]);
-  assert.equal(harness.orders[0].integration.partnerOrderId, 'stale-universal-563');
+  await harness.integration.runFullSync();
+
+  assert.deepEqual(harness.orders, before);
+  assert.deepEqual(harness.orders.map(order => order.id), [564, 565, 573]);
   const state = JSON.parse(fs.readFileSync(harness.stateFile, 'utf8'));
   assert.equal(state.quarantine.some(item => item.localId === '573'), true);
-  assert.equal(state.tombstones.some(item => item.localId === '573' && item.externalId === 'poison-partner-id'), true);
-  assert.equal(state.tombstones.some(item => item.localId === '565' && !item.externalId), true);
-  assert.equal(state.pending.some(item => item.type === 'order.delete' && item.localId === '573' && item.order.externalId === 'poison-partner-id'), true);
-  assert.equal(state.pending.some(item => item.type === 'order.upsert' && item.localId === '564'), true);
+  assert.equal(state.tombstones.length, 0);
+  assert.equal(state.pending.some(item => item.type === 'order.delete'), false);
 });
 
-test('acknowledged poison deletion resolves quarantine but keeps its tombstone', async t => {
-  const partnerApp = express();
-  partnerApp.use(express.json());
-  partnerApp.post('/bridge', (req, res) => res.json({
-    ok: true,
-    results: (req.body?.events || []).map(event => ({ eventId: event.eventId, ok: true })),
-  }));
-  const partner = await listen(partnerApp);
-  t.after(() => partner.server.close());
-  const poison = validOrder(573, {
-    name: '',
-    phone: '',
-    size: '',
-    status: 'cancelled',
-    integration: { partnerOrderId: 'poison-partner-id' },
-  });
-  const harness = await createHarness(t, [poison], `${partner.base}/bridge`);
-  let state = JSON.parse(fs.readFileSync(harness.stateFile, 'utf8'));
-  assert.equal(state.quarantine.length, 1);
-  assert.equal(state.tombstones.length, 1);
+test('identity audit reports existing conflicts without historical backfill', async t => {
+  const orders = [
+    validOrder(1, { integration: { partnerOrderId: 'duplicate-external' } }),
+    validOrder(1, { name: 'Second record', integration: { partnerOrderId: 'duplicate-external' } }),
+  ];
+  const harness = await createHarness(t, orders);
+  const before = JSON.parse(JSON.stringify(harness.orders));
+  const response = await fetch(`${harness.base}/api/admin/crm-sync/status`, { headers: harness.adminHeaders });
+  const body = await response.json();
 
-  const result = await harness.integration.flushPending(true);
-  assert.equal(result.sent, 1);
-  state = JSON.parse(fs.readFileSync(harness.stateFile, 'utf8'));
-  assert.equal(state.pending.length, 0);
-  assert.equal(state.quarantine.length, 0);
-  assert.equal(state.tombstones.length, 1);
+  assert.equal(response.status, 200);
+  assert.deepEqual(body.identityConflicts, { localId: 1, externalId: 1 });
+  assert.deepEqual(harness.orders, before);
+});
+
+test('DELETE refuses conflicting localId and externalId instead of deleting either order', async t => {
+  const initial = [
+    validOrder(1, { integration: { partnerOrderId: 'delete-external-1' } }),
+    validOrder(2, { integration: { partnerOrderId: 'delete-external-2' } }),
+  ];
+  const harness = await createHarness(t, initial);
+  const before = JSON.parse(JSON.stringify(harness.orders));
+  const response = await fetch(`${harness.base}/api/integration/v1/orders/delete-external-2`, {
+    method: 'DELETE',
+    headers: harness.partnerHeaders,
+    body: JSON.stringify({ localId: '1' }),
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 409);
+  assert.deepEqual(body, { ok: false, deleted: false, error: 'identity_binding_conflict' });
+  assert.deepEqual(harness.orders, before);
 });
 
 test('inbound delete is idempotent and its tombstone blocks stale resurrection', async t => {
@@ -434,6 +727,141 @@ test('a push acknowledgement cannot erase a newer event queued during the networ
   assert.equal(state.pending[0].localId, '1');
   assert.equal(state.pending[0].order.status, 'shipped');
   assert.equal(state.pending[0].attempts, 0);
+});
+
+test('inbound final PATCH supersedes a stale in-flight outbox event and converges on the next flush', async t => {
+  let releaseFirst;
+  let markFirstStarted;
+  const firstStarted = new Promise(resolve => { markFirstStarted = resolve; });
+  const firstGate = new Promise(resolve => { releaseFirst = resolve; });
+  let pushCalls = 0;
+  let remoteStatus = 'new';
+  const partnerApp = express();
+  partnerApp.use(express.json());
+  partnerApp.post('/bridge', async (req, res) => {
+    const events = req.body?.events || [];
+    if (events.length) {
+      pushCalls++;
+      remoteStatus = events.at(-1).order.status;
+      if (pushCalls === 1) {
+        markFirstStarted();
+        await firstGate;
+      }
+    }
+    res.json({ ok: true, results: events.map(event => ({ eventId: event.eventId, ok: true })) });
+  });
+  const partner = await listen(partnerApp);
+  t.after(() => partner.server.close());
+  const integrationLink = { partnerOrderId: 'inflight-final-1' };
+  const harness = await createHarness(t, [validOrder(1, { integration: integrationLink })], `${partner.base}/bridge`);
+  harness.applyLocal([validOrder(1, {
+    managerComment: 'Queued local edit',
+    updatedAt: '2026-07-16T08:30:00.000Z',
+    integration: integrationLink,
+  })]);
+  let state = JSON.parse(fs.readFileSync(harness.stateFile, 'utf8'));
+  const staleEventId = state.pending[0].eventId;
+  assert.equal(state.pending[0].order.status, 'new');
+
+  const firstFlush = harness.integration.flushPending(true);
+  await firstStarted;
+  const patchResponse = await fetch(`${harness.base}/api/integration/v1/orders/1`, {
+    method: 'PATCH',
+    headers: { ...harness.partnerHeaders, 'Idempotency-Key': 'inflight-confirm-1' },
+    body: JSON.stringify({
+      localId: '1',
+      externalId: 'inflight-final-1',
+      status: 'confirmed',
+      updatedAt: '2026-07-16T09:00:00.000Z',
+    }),
+  });
+  assert.equal(patchResponse.status, 200);
+  assert.equal(harness.orders[0].status, 'confirmed');
+  state = JSON.parse(fs.readFileSync(harness.stateFile, 'utf8'));
+  assert.equal(state.pending.length, 1);
+  assert.notEqual(state.pending[0].eventId, staleEventId);
+  assert.equal(state.pending[0].order.status, 'confirmed');
+
+  releaseFirst();
+  await firstFlush;
+  state = JSON.parse(fs.readFileSync(harness.stateFile, 'utf8'));
+  assert.equal(state.pending.length, 1);
+  assert.equal(state.pending[0].order.status, 'confirmed');
+  assert.notEqual(state.pending[0].eventId, staleEventId);
+
+  const secondFlush = await harness.integration.flushPending(true);
+  assert.equal(secondFlush.sent, 1);
+  assert.equal(remoteStatus, 'confirmed');
+  assert.equal(harness.orders[0].status, 'confirmed');
+  state = JSON.parse(fs.readFileSync(harness.stateFile, 'utf8'));
+  assert.equal(state.pending.length, 0);
+});
+
+test('automatic full sync does not backfill or delete missing historical orders by default', async t => {
+  const receivedEvents = [];
+  const partnerApp = express();
+  partnerApp.use(express.json());
+  partnerApp.post('/bridge', (req, res) => {
+    if (req.body?.action === 'list') {
+      return res.json({
+        ok: true,
+        orders: [{
+          ...validOrder(999, { integration: undefined }),
+          localId: '999',
+          externalId: 'remote-only-999',
+        }],
+      });
+    }
+    receivedEvents.push(...(req.body?.events || []));
+    return res.json({
+      ok: true,
+      results: (req.body?.events || []).map(event => ({ eventId: event.eventId, ok: true })),
+    });
+  });
+  const partner = await listen(partnerApp);
+  t.after(() => partner.server.close());
+  const local = validOrder(1, { integration: { partnerOrderId: 'local-only-1' } });
+  const harness = await createHarness(t, [local], `${partner.base}/bridge`);
+  const before = JSON.parse(JSON.stringify(harness.orders));
+
+  const result = await harness.integration.runFullSync();
+  assert.equal(result.applied.imported, 0);
+  assert.equal(result.applied.deleted, 0);
+  assert.equal(result.applied.results[0].action, 'missing_skipped_no_backfill');
+  assert.equal(result.queuedMissing, 0);
+  assert.equal(receivedEvents.length, 0);
+  assert.deepEqual(harness.orders, before);
+});
+
+test('equal-time final Universal status upgrades local no_answer and is never pushed back', async t => {
+  const receivedEvents = [];
+  const remoteOrder = {
+    ...validOrder(1, { status: 'confirmed' }),
+    localId: '1',
+    externalId: 'equal-time-final-1',
+  };
+  const partnerApp = express();
+  partnerApp.use(express.json());
+  partnerApp.post('/bridge', (req, res) => {
+    if (req.body?.action === 'list') return res.json({ ok: true, orders: [remoteOrder] });
+    receivedEvents.push(...(req.body?.events || []));
+    return res.json({
+      ok: true,
+      results: (req.body?.events || []).map(event => ({ eventId: event.eventId, ok: true })),
+    });
+  });
+  const partner = await listen(partnerApp);
+  t.after(() => partner.server.close());
+  const harness = await createHarness(t, [validOrder(1, {
+    status: 'no_answer',
+    integration: { partnerOrderId: 'equal-time-final-1' },
+  })], `${partner.base}/bridge`);
+
+  const result = await harness.integration.runFullSync();
+  assert.equal(result.applied.applied, 1);
+  assert.equal(harness.orders[0].status, 'confirmed');
+  assert.equal(receivedEvents.length, 0);
+  assert.equal(result.reconciliation.statusMismatches, 0);
 });
 
 test('full sync pushes local-newer field and status mismatches and refreshes to convergence', async t => {

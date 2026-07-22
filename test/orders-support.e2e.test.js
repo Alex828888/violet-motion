@@ -76,6 +76,7 @@ async function startServer(t, { orders = [], support = [] } = {}) {
       NP_AUTO_SYNC: 'false',
       MONOBANK_CRM_ENABLED: 'false',
       PARTNER_CRM_AUTO_SYNC: 'false',
+      PARTNER_CRM_ALLOW_BACKFILL: 'false',
       PARTNER_CRM_URL: '',
       PARTNER_CRM_API_KEY: 'e2e-partner-key',
     },
@@ -386,6 +387,57 @@ test('support keeps a durable transcript, verified order context, summary, and p
   const cancelRecord = app.read('support.json').find(item => item.id === result.payload.id);
   assert.equal(cancelRecord.category, 'manager_required');
   assert.equal(cancelRecord.status, 'waiting_manager');
+});
+
+test('Universal PATCH status is immediately consistent in orders and CRM statistics', async t => {
+  const app = await startServer(t, {
+    orders: [{
+      id: 1,
+      name: 'Synthetic Integration Test',
+      phone: '+380000000001',
+      product: 'Violet Motion Sneakers',
+      size: '40',
+      color: 'black',
+      quantity: 1,
+      status: 'new',
+      createdAt: '2026-07-22T08:00:00.000Z',
+      updatedAt: '2026-07-22T08:00:00.000Z',
+      integration: { partnerOrderId: 'e2e-universal-1' },
+    }],
+  });
+
+  const patchResponse = await fetch(`${app.base}/api/integration/v1/orders/1`, {
+    method: 'PATCH',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': 'e2e-partner-key',
+      'idempotency-key': 'e2e-confirm-1',
+    },
+    body: JSON.stringify({
+      localId: '1',
+      externalId: 'e2e-universal-1',
+      status: 'confirmed',
+      updatedAt: '2026-07-22T09:00:00.000Z',
+    }),
+  });
+  const patchBody = await patchResponse.json();
+  assert.equal(patchResponse.status, 200);
+  assert.deepEqual(patchBody.order, {
+    localId: '1',
+    externalId: 'e2e-universal-1',
+    status: 'confirmed',
+    updatedAt: '2026-07-22T09:00:00.000Z',
+  });
+
+  const stored = await jsonRequest(app.base, '/api/admin/orders/1', { authorized: true });
+  assert.equal(stored.response.status, 200);
+  assert.equal(stored.payload.status, 'confirmed');
+
+  const summary = await jsonRequest(app.base, '/api/admin/crm/orders/summary?period=all', { authorized: true });
+  assert.equal(summary.response.status, 200);
+  assert.equal(summary.payload.totals.waitingConfirmation, 0);
+  assert.equal(summary.payload.totals.confirmed, 1);
+  assert.equal(summary.payload.totals.cancelled, 0);
 });
 
 function extractFunction(source, name) {

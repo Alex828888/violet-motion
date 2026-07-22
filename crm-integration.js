@@ -21,7 +21,11 @@ const MAX_RETRY_ATTEMPTS = 8;
 const MAX_DEAD_LETTER = 1000;
 const MAX_QUARANTINE = 500;
 const MAX_TOMBSTONES = 5000;
+const MAX_IDEMPOTENCY_RECORDS = 2000;
+const MAX_IDEMPOTENCY_KEY_LENGTH = 300;
 const REQUIRED_REMOTE_CREATE_FIELDS = ['name', 'phone', 'size'];
+const UNIVERSAL_PATCH_STATUSES = new Set(['confirmed', 'cancelled']);
+const UNIVERSAL_PENDING_STATUSES = new Set(['new', 'no_answer']);
 
 function safeString(value, max = 500) {
   return String(value == null ? '' : value).trim().slice(0, max);
@@ -94,10 +98,12 @@ function createCrmIntegration({
   adminAuth,
   onOrderStatusChanged = () => {},
   logger = console,
+  stateWriter = null,
 }) {
   const apiKey = String(process.env.PARTNER_CRM_API_KEY || '').trim();
   const partnerUrl = String(process.env.PARTNER_CRM_URL || '').trim();
   const autoSync = process.env.PARTNER_CRM_AUTO_SYNC !== 'false';
+  const allowBackfill = process.env.PARTNER_CRM_ALLOW_BACKFILL === 'true';
   const intervalMinutes = Math.max(1, Number(process.env.PARTNER_CRM_SYNC_INTERVAL_MINUTES || 5));
   const requestTimeoutMs = Math.max(3000, Number(process.env.PARTNER_CRM_TIMEOUT_MS || 15000));
   let flushTimer = null;
@@ -106,12 +112,13 @@ function createCrmIntegration({
 
   function emptyState() {
     return {
-      version: 2,
+      version: 3,
       pending: [],
       deadLetter: [],
       history: [],
       tombstones: [],
       quarantine: [],
+      idempotency: [],
       syncErrors: [],
       lastPushAt: null,
       lastPullAt: null,
@@ -128,11 +135,13 @@ function createCrmIntegration({
       return {
         ...emptyState(),
         ...parsed,
+        version: 3,
         pending: Array.isArray(parsed.pending) ? parsed.pending : [],
         deadLetter: Array.isArray(parsed.deadLetter) ? parsed.deadLetter : [],
         history: Array.isArray(parsed.history) ? parsed.history : [],
         tombstones: Array.isArray(parsed.tombstones) ? parsed.tombstones : [],
         quarantine: Array.isArray(parsed.quarantine) ? parsed.quarantine : [],
+        idempotency: Array.isArray(parsed.idempotency) ? parsed.idempotency : [],
         syncErrors: Array.isArray(parsed.syncErrors) ? parsed.syncErrors : [],
       };
     } catch {
@@ -141,6 +150,7 @@ function createCrmIntegration({
   }
 
   function writeState(state) {
+    if (typeof stateWriter === 'function') return stateWriter(state);
     const tmp = `${stateFile}.tmp`;
     fs.mkdirSync(path.dirname(stateFile), { recursive: true });
     fs.writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
@@ -373,6 +383,127 @@ function createCrmIntegration({
     return orders.find(order => safeString(order?.integration?.partnerOrderId, 200) === partnerId) || null;
   }
 
+  function findLocalOrdersById(orders, localId) {
+    const wanted = safeString(localId, 50);
+    if (!wanted) return [];
+    return orders.filter(order => safeString(order?.id, 50) === wanted);
+  }
+
+  function findOrdersByExternalId(orders, externalId) {
+    const wanted = safeString(externalId, 200);
+    if (!wanted) return [];
+    return orders.filter(order => safeString(order?.integration?.partnerOrderId, 200) === wanted);
+  }
+
+  function identityConflict(message, code) {
+    const error = new Error(message);
+    error.code = code;
+    error.httpStatus = 409;
+    return error;
+  }
+
+  function assertExternalBinding(orders, target, requestedExternalId = '') {
+    const requested = safeString(requestedExternalId, 200);
+    const current = safeString(target?.integration?.partnerOrderId, 200);
+    const targetId = safeString(target?.id, 50);
+    const effective = requested || current;
+
+    if (requested && current && requested !== current) {
+      throw identityConflict('Existing externalId binding cannot be changed', 'EXTERNAL_ID_REBIND_FORBIDDEN');
+    }
+    if (!effective) return;
+    const owners = findOrdersByExternalId(orders, effective);
+    if (owners.length > 1 || owners.some(order => safeString(order?.id, 50) !== targetId)) {
+      throw identityConflict('externalId is already bound to another order', 'EXTERNAL_ID_CONFLICT');
+    }
+  }
+
+  function identityConflictCounts(orders = readOrders()) {
+    const localIds = new Map();
+    const externalIds = new Map();
+    for (const order of orders) {
+      const localId = safeString(order?.id, 50);
+      const externalId = safeString(order?.integration?.partnerOrderId, 200);
+      if (localId) localIds.set(localId, Number(localIds.get(localId) || 0) + 1);
+      if (externalId) externalIds.set(externalId, Number(externalIds.get(externalId) || 0) + 1);
+    }
+    return {
+      localId: [...localIds.values()].filter(count => count > 1).length,
+      externalId: [...externalIds.values()].filter(count => count > 1).length,
+    };
+  }
+
+  function patchResponseOrder(order) {
+    const view = publicOrder(order);
+    return {
+      localId: view.localId,
+      externalId: view.externalId,
+      status: view.status,
+      updatedAt: view.updatedAt,
+    };
+  }
+
+  function patchRequestHash(localId, input, patch, externalId) {
+    const createdAt = input.createdAt == null ? null : String(input.createdAt);
+    const updatedValue = input.updatedAt ?? input.sourceUpdatedAt;
+    const updatedAt = updatedValue == null ? null : String(updatedValue);
+    return stableHash({
+      operation: 'universal_order_patch',
+      localId: safeString(localId, 50),
+      bodyLocalId: remoteIdentity(input).localId,
+      externalId: safeString(externalId, 200) || null,
+      createdAt,
+      updatedAt,
+      patch,
+    });
+  }
+
+  function readIdempotencyReplay(state, idempotencyKey, requestHash) {
+    const rawKey = String(idempotencyKey == null ? '' : idempotencyKey).trim();
+    if (!rawKey) return null;
+    if (rawKey.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
+      const error = validationError('Idempotency-Key is too long', 'IDEMPOTENCY_KEY_TOO_LONG');
+      error.httpStatus = 400;
+      throw error;
+    }
+    const keyHash = stableHash({ key: rawKey });
+    const existing = state.idempotency.find(item => item.keyHash === keyHash);
+    if (!existing) return { keyHash, replay: null };
+    if (existing.requestHash !== requestHash) {
+      throw identityConflict('Idempotency-Key was already used for another request', 'IDEMPOTENCY_KEY_REUSED');
+    }
+    return {
+      keyHash,
+      replay: {
+        statusCode: Number(existing.statusCode) || 200,
+        body: JSON.parse(JSON.stringify(existing.response)),
+      },
+    };
+  }
+
+  function rememberIdempotency(state, keyHash, requestHash, statusCode, response) {
+    if (!keyHash) return;
+    state.idempotency.push({
+      keyHash,
+      requestHash,
+      statusCode,
+      response: JSON.parse(JSON.stringify(response)),
+      createdAt: new Date().toISOString(),
+    });
+    state.idempotency = state.idempotency.slice(-MAX_IDEMPOTENCY_RECORDS);
+  }
+
+  function supersedeOrderOutbox(state, localId, order) {
+    const wanted = safeString(localId, 50);
+    const found = state.pending.some(item => item.localId === wanted)
+      || state.deadLetter.some(item => item.localId === wanted);
+    if (!found) return false;
+    state.pending = state.pending.filter(item => item.localId !== wanted);
+    state.deadLetter = state.deadLetter.filter(item => item.localId !== wanted);
+    queueItem(state, 'order.upsert', publicOrder(order));
+    return true;
+  }
+
   function normalizedPhone(value) {
     let digits = String(value || '').replace(/\D/g, '');
     if (digits.startsWith('00')) digits = digits.slice(2);
@@ -403,9 +534,24 @@ function createCrmIntegration({
 
   function upsertRemoteOrder(input = {}, externalId = '') {
     const orders = readOrders();
-    const exactExisting = findLocalOrder(orders, input, externalId);
+    const identity = remoteIdentity(input, externalId);
+    const localMatches = findLocalOrdersById(orders, identity.localId);
+    const externalMatches = findOrdersByExternalId(orders, identity.externalId);
+    if (localMatches.length > 1) {
+      throw identityConflict('localId is not unique', 'LOCAL_ID_CONFLICT');
+    }
+    if (externalMatches.length > 1) {
+      throw identityConflict('externalId is not unique', 'EXTERNAL_ID_CONFLICT');
+    }
+    const byLocalId = localMatches[0] || null;
+    const byExternalId = externalMatches[0] || null;
+    if (byLocalId && byExternalId && safeString(byLocalId.id, 50) !== safeString(byExternalId.id, 50)) {
+      throw identityConflict('localId and externalId refer to different orders', 'IDENTITY_BINDING_CONFLICT');
+    }
+    const exactExisting = byLocalId || byExternalId;
     const existing = exactExisting || findSemanticNewLocal(orders, input);
     const partnerId = safeString(input.externalId || input.partnerOrderId || externalId, 200);
+    if (existing) assertExternalBinding(orders, existing, partnerId);
     const state = readState();
     const tombstone = findTombstone(state, input, externalId);
     if (tombstone && input.forceRecreate !== true) {
@@ -468,10 +614,127 @@ function createCrmIntegration({
     clearQuarantineForIdentity(state, input, externalId);
     if (input.forceRecreate === true) removeMatchingTombstones(state, input, externalId);
     writeState(state);
-    if (Object.prototype.hasOwnProperty.call(patch, 'status')) {
-      Promise.resolve(onOrderStatusChanged(saved)).catch(error => logger.error('[CRM sync notice]', error.message));
+    if (Object.prototype.hasOwnProperty.call(patch, 'status') && patch.status !== existing?.status) {
+      Promise.resolve().then(() => onOrderStatusChanged(saved))
+        .catch(error => logger.error('[CRM sync notice]', safeErrorMessage(error.message)));
     }
     return { order: publicOrder(saved), created };
+  }
+
+  function patchExistingRemoteOrder(localId, input = {}, idempotencyKey = '') {
+    const pathLocalId = safeString(localId, 50);
+    const patch = normalizeRemotePatch(input);
+    if (Object.prototype.hasOwnProperty.call(patch, 'status') && !UNIVERSAL_PATCH_STATUSES.has(patch.status)) {
+      throw validationError('Universal PATCH accepts only confirmed or cancelled', 'INVALID_STATUS');
+    }
+
+    const bodyIdentity = remoteIdentity(input);
+    if (bodyIdentity.localId && bodyIdentity.localId !== pathLocalId) {
+      throw identityConflict('Body localId does not match path localId', 'LOCAL_ID_MISMATCH');
+    }
+    const requestedExternalId = safeString(
+      input.externalId || input.partnerOrderId || input?.integration?.partnerOrderId,
+      200,
+    );
+    const requestHash = patchRequestHash(pathLocalId, input, patch, requestedExternalId);
+    const state = readState();
+    const idempotency = readIdempotencyReplay(state, idempotencyKey, requestHash);
+    if (idempotency?.replay) return idempotency.replay;
+
+    const orders = readOrders();
+    const matches = findLocalOrdersById(orders, pathLocalId);
+    if (!matches.length) {
+      return {
+        statusCode: 404,
+        body: { ok: false, created: false, error: 'order_not_found' },
+      };
+    }
+    if (matches.length > 1) {
+      throw identityConflict('localId is not unique', 'LOCAL_ID_CONFLICT');
+    }
+
+    const existing = matches[0];
+    assertExternalBinding(orders, existing, requestedExternalId);
+    validateRemoteUpdate(input, existing);
+
+    const suppliedRemoteTime = asIsoDate(input.updatedAt || input.sourceUpdatedAt);
+    const localTime = new Date(existing.updatedAt || existing.createdAt || 0).getTime();
+    const remoteTime = suppliedRemoteTime ? new Date(suppliedRemoteTime).getTime() : null;
+    if (Number.isFinite(localTime) && Number.isFinite(remoteTime) && remoteTime < localTime) {
+      const response = {
+        ok: true,
+        created: false,
+        staleIgnored: true,
+        order: patchResponseOrder(existing),
+      };
+      if (idempotency?.keyHash) {
+        rememberIdempotency(state, idempotency.keyHash, requestHash, 200, response);
+        writeState(state);
+      }
+      return { statusCode: 200, body: response };
+    }
+
+    const changedFields = Object.keys(patch).filter(field => {
+      if (NUMBER_FIELDS.has(field)) return Number(existing[field]) !== Number(patch[field]);
+      return safeString(existing[field], field === 'managerComment' ? 1000 : 300) !== patch[field];
+    });
+    const currentExternalId = safeString(existing?.integration?.partnerOrderId, 200);
+    const externalIdChanged = !!requestedExternalId && requestedExternalId !== currentExternalId;
+    const timestampAdvanced = Number.isFinite(remoteTime) && (!Number.isFinite(localTime) || remoteTime > localTime);
+
+    if (!changedFields.length && !externalIdChanged && !timestampAdvanced) {
+      const response = { ok: true, created: false, order: patchResponseOrder(existing) };
+      const supersededOutbox = supersedeOrderOutbox(state, pathLocalId, existing);
+      if (idempotency?.keyHash) {
+        rememberIdempotency(state, idempotency.keyHash, requestHash, 200, response);
+      }
+      if (idempotency?.keyHash || supersededOutbox) writeState(state);
+      if (supersededOutbox) scheduleFlushAfterCurrent(100);
+      return { statusCode: 200, body: response };
+    }
+
+    const now = new Date().toISOString();
+    const saved = {
+      ...existing,
+      ...patch,
+      id: existing.id,
+      updatedAt: suppliedRemoteTime || now,
+      integration: {
+        ...(existing.integration && typeof existing.integration === 'object' ? existing.integration : {}),
+        partnerOrderId: requestedExternalId || currentExternalId || null,
+        partnerUpdatedAt: suppliedRemoteTime || now,
+        lastReceivedAt: now,
+      },
+    };
+    const response = { ok: true, created: false, order: patchResponseOrder(saved) };
+    const nextOrders = orders.map(order => (
+      safeString(order?.id, 50) === pathLocalId ? saved : order
+    ));
+    const previousQuarantineCount = state.quarantine.length;
+    clearQuarantineForIdentity(state, { localId: pathLocalId, externalId: requestedExternalId });
+    const supersededOutbox = supersedeOrderOutbox(state, pathLocalId, saved);
+    if (idempotency?.keyHash) {
+      rememberIdempotency(state, idempotency.keyHash, requestHash, 200, response);
+    }
+
+    persistOrders(nextOrders, { suppressPartnerSync: true, source: 'partner_patch' });
+    try {
+      if (idempotency?.keyHash || supersededOutbox || state.quarantine.length !== previousQuarantineCount) writeState(state);
+    } catch (error) {
+      try {
+        persistOrders(orders, { suppressPartnerSync: true, source: 'partner_patch_rollback' });
+      } catch (rollbackError) {
+        logger.error('[CRM patch rollback]', safeErrorMessage(rollbackError.message));
+      }
+      throw error;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(patch, 'status') && patch.status !== existing.status) {
+      Promise.resolve().then(() => onOrderStatusChanged(saved))
+        .catch(error => logger.error('[CRM sync notice]', safeErrorMessage(error.message)));
+    }
+    if (supersededOutbox) scheduleFlushAfterCurrent(100);
+    return { statusCode: 200, body: response };
   }
 
   function queueItem(state, type, order) {
@@ -510,6 +773,14 @@ function createCrmIntegration({
       flushPending(false).catch(error => logger.error('[CRM sync push]', safeErrorMessage(error.message)));
     }, delayMs);
     if (flushTimer.unref) flushTimer.unref();
+  }
+
+  function scheduleFlushAfterCurrent(delayMs = 300) {
+    if (flushPromise) {
+      flushPromise.finally(() => scheduleFlush(delayMs)).catch(() => {});
+      return;
+    }
+    scheduleFlush(delayMs);
   }
 
   function onOrdersChanged(previous = [], current = [], options = {}) {
@@ -566,89 +837,22 @@ function createCrmIntegration({
   function quarantineInvalidLocalOrders() {
     const orders = readOrders();
     const state = readState();
-    const kept = [];
-    let removed = 0;
     let quarantined = 0;
     let stateChanged = false;
     for (const order of orders) {
       try {
         validateLocalExport(order);
-        kept.push(order);
       } catch (error) {
         const snapshot = publicOrder(order);
         const known = state.quarantine.some(item => item.fingerprint === remoteFingerprint(snapshot, snapshot.externalId));
         quarantineRemote(state, snapshot, error, 'local_export_validation');
         quarantined++;
         stateChanged = true;
-        if (order?.integration?.partnerOrderId) {
-          addTombstone(state, snapshot, snapshot.externalId, 'invalid_partner_order');
-          queueItem(state, 'order.delete', snapshot);
-          removed++;
-        } else {
-          kept.push(order);
-        }
         if (known) state.lastError = state.lastError || safeError(error).message;
       }
     }
-    if (removed) persistOrders(kept, { suppressPartnerSync: true, source: 'sync_quarantine' });
     if (stateChanged) writeState(state);
-    if (removed) scheduleFlush(100);
-    return { removed, quarantined };
-  }
-
-  function mergeExistingSemanticPartnerDuplicates() {
-    const orders = readOrders();
-    const groups = new Map();
-    for (const order of orders) {
-      if (safeString(order.status || 'new', 50).toLowerCase() !== 'new') continue;
-      const fingerprint = semanticNewFingerprint(order);
-      if (!fingerprint) continue;
-      if (!groups.has(fingerprint)) groups.set(fingerprint, []);
-      groups.get(fingerprint).push(order);
-    }
-
-    const removeIds = new Set();
-    const replacements = new Map();
-    const state = readState();
-    let merged = 0;
-    for (const group of groups.values()) {
-      const partnerLinked = group.filter(order => safeString(order?.integration?.partnerOrderId, 200));
-      const localOnly = group.filter(order => !safeString(order?.integration?.partnerOrderId, 200));
-      if (partnerLinked.length !== 1 || !localOnly.length) continue;
-      const duplicate = partnerLinked[0];
-      const canonical = localOnly.slice().sort((a, b) => Number(a.id) - Number(b.id))[0];
-      const mergedOrder = {
-        ...canonical,
-        integration: {
-          ...(canonical.integration && typeof canonical.integration === 'object' ? canonical.integration : {}),
-          ...(duplicate.integration && typeof duplicate.integration === 'object' ? duplicate.integration : {}),
-          mergedDuplicateLocalId: String(duplicate.id),
-          mergedAt: new Date().toISOString(),
-        },
-      };
-      replacements.set(String(canonical.id), mergedOrder);
-      removeIds.add(String(duplicate.id));
-      state.pending = state.pending.filter(item => item.localId !== String(duplicate.id));
-      addTombstone(state, { localId: String(duplicate.id) }, '', 'semantic_duplicate_merged');
-      queueItem(state, 'order.upsert', publicOrder(mergedOrder));
-      state.history.push({
-        type: 'semantic_duplicate_merged',
-        localId: String(duplicate.id),
-        canonicalLocalId: String(canonical.id),
-        ok: true,
-        at: new Date().toISOString(),
-      });
-      merged++;
-    }
-    if (!merged) return { merged: 0 };
-    const next = orders
-      .filter(order => !removeIds.has(String(order.id)))
-      .map(order => replacements.get(String(order.id)) || order);
-    state.history = state.history.slice(-MAX_HISTORY);
-    persistOrders(next, { suppressPartnerSync: true, source: 'sync_semantic_merge' });
-    writeState(state);
-    scheduleFlush(100);
-    return { merged };
+    return { removed: 0, quarantined };
   }
 
   async function fetchPartner(body) {
@@ -891,7 +1095,23 @@ function createCrmIntegration({
 
   function deleteRemoteOrder(input = {}, externalId = '', reason = 'partner_delete') {
     const orders = readOrders();
-    const existing = findLocalOrder(orders, input, externalId);
+    const identity = remoteIdentity(input, externalId);
+    const localMatches = findLocalOrdersById(orders, identity.localId);
+    const externalMatches = findOrdersByExternalId(orders, identity.externalId);
+    if (localMatches.length > 1) throw identityConflict('localId is not unique', 'LOCAL_ID_CONFLICT');
+    if (externalMatches.length > 1) throw identityConflict('externalId is not unique', 'EXTERNAL_ID_CONFLICT');
+    const byLocalId = localMatches[0] || null;
+    const byExternalId = externalMatches[0] || null;
+    if (byLocalId && byExternalId && safeString(byLocalId.id, 50) !== safeString(byExternalId.id, 50)) {
+      throw identityConflict('localId and externalId refer to different orders', 'IDENTITY_BINDING_CONFLICT');
+    }
+    if (byLocalId && identity.externalId) {
+      const currentExternalId = safeString(byLocalId?.integration?.partnerOrderId, 200);
+      if (currentExternalId && currentExternalId !== identity.externalId) {
+        throw identityConflict('externalId does not match the existing binding', 'IDENTITY_BINDING_CONFLICT');
+      }
+    }
+    const existing = byLocalId || byExternalId;
     const state = readState();
     const identitySource = existing ? publicOrder(existing) : input;
     addTombstone(state, identitySource, externalId, reason);
@@ -975,7 +1195,9 @@ function createCrmIntegration({
     };
   }
 
-  function applyRemoteNewer(remoteOrders = []) {
+  function applyRemoteNewer(remoteOrders = [], options = {}) {
+    const allowMissing = options.allowMissing === true;
+    const allowDeletes = options.allowDeletes === true;
     let applied = 0;
     let imported = 0;
     let deleted = 0;
@@ -988,6 +1210,10 @@ function createCrmIntegration({
       try {
         if (!remote || typeof remote !== 'object') throw validationError('Remote order must be an object', 'REMOTE_INVALID_PAYLOAD');
         if (remoteIsDelete(remote)) {
+          if (!allowDeletes) {
+            results.push({ ...identity, ok: true, action: 'delete_skipped_no_backfill' });
+            continue;
+          }
           const deletion = deleteRemoteOrder(remote, remote.externalId, 'partner_delete');
           if (deletion.existed) deleted++;
           results.push({ ...identity, ok: true, action: 'delete', existed: deletion.existed });
@@ -1004,6 +1230,10 @@ function createCrmIntegration({
         const orders = readOrders();
         const local = findLocalOrder(orders, remote, remote.externalId);
         if (!local) {
+          if (!allowMissing) {
+            results.push({ ...identity, ok: true, action: 'missing_skipped_no_backfill' });
+            continue;
+          }
           const result = upsertRemoteOrder(remote, remote.externalId);
           if (result.tombstoneIgnored) tombstoneIgnored++;
           else if (result.created) imported++;
@@ -1027,7 +1257,11 @@ function createCrmIntegration({
         const remoteTime = new Date(updatedValue).getTime();
         if (!Number.isFinite(remoteTime)) throw validationError('Remote order has invalid updatedAt', 'REMOTE_INVALID_DATE');
         const localTime = new Date(local.updatedAt || local.createdAt || 0).getTime();
-        if (Number.isFinite(localTime) && remoteTime <= localTime) {
+        const finalStatusUpgrade = UNIVERSAL_PENDING_STATUSES.has(safeString(local.status || 'new', 50))
+          && UNIVERSAL_PATCH_STATUSES.has(safeString(remote.status, 50));
+        if (Number.isFinite(localTime) && (
+          remoteTime < localTime || (remoteTime === localTime && !finalStatusUpgrade)
+        )) {
           staleIgnored++;
           results.push({ ...identity, ok: true, action: 'stale_ignored' });
           continue;
@@ -1080,6 +1314,12 @@ function createCrmIntegration({
     for (const mismatch of reconciliation.mismatches) {
       const local = byId.get(String(mismatch.localId));
       if (!local) continue;
+      if (UNIVERSAL_PENDING_STATUSES.has(safeString(local.status || 'new', 50))
+        && UNIVERSAL_PATCH_STATUSES.has(safeString(mismatch.remoteStatus, 50))) {
+        // Never downgrade a final Universal status back to new. A strictly older
+        // remote timestamp stays visible as a reconciliation error until retried.
+        continue;
+      }
       const localTime = new Date(mismatch.localUpdatedAt || local.updatedAt || local.createdAt || 0).getTime();
       const remoteTime = new Date(mismatch.remoteUpdatedAt || 0).getTime();
       // A newer remote snapshot is handled by applyRemoteNewer. Remaining local-newer
@@ -1102,15 +1342,17 @@ function createCrmIntegration({
   async function performFullSync(options = {}) {
     const forcePending = options === true || options?.forcePending === true;
     try {
-      mergeExistingSemanticPartnerDuplicates();
       quarantineInvalidLocalOrders();
       const firstPush = await flushPending(forcePending);
       if (!partnerUrl) return { configured: false, push: firstPush, reconciliation: null };
       const pulled = await fetchPartner({ action: 'list' });
       const remoteOrders = Array.isArray(pulled.orders) ? pulled.orders.slice(0, 10000) : [];
-      const applied = applyRemoteNewer(remoteOrders);
+      const applied = applyRemoteNewer(remoteOrders, {
+        allowMissing: allowBackfill,
+        allowDeletes: allowBackfill,
+      });
       let reconciliation = compareSnapshots(remoteOrders);
-      const queuedMissing = queueMissingRemote(reconciliation);
+      const queuedMissing = allowBackfill ? queueMissingRemote(reconciliation) : 0;
       const mismatchQueue = queueLocalNewerMismatches(reconciliation);
       const queuedMismatches = mismatchQueue.queued;
       const queued = queuedMissing + queuedMismatches;
@@ -1173,11 +1415,14 @@ function createCrmIntegration({
       enabled: !!apiKey,
       outboundConfigured: !!partnerUrl,
       autoSync,
+      allowBackfill,
       pending: state.pending.length,
       failed: failed.length,
       deadLetter: state.deadLetter.length,
       quarantine: state.quarantine.length,
       tombstones: state.tombstones.length,
+      idempotencyRecords: state.idempotency.length,
+      identityConflicts: identityConflictCounts(),
       lastError: state.lastError,
       lastPushAt: state.lastPushAt,
       lastPullAt: state.lastPullAt,
@@ -1188,11 +1433,47 @@ function createCrmIntegration({
   }
 
   function inputErrorStatus(error) {
-    return error?.code === 'INVALID_STATUS' || safeString(error?.code, 80).startsWith('REMOTE_') ? 422 : 400;
+    if (Number.isFinite(Number(error?.httpStatus))) return Number(error.httpStatus);
+    if (error?.code === 'INVALID_STATUS' || safeString(error?.code, 80).startsWith('REMOTE_')) return 422;
+    return 500;
   }
 
-  mergeExistingSemanticPartnerDuplicates();
-  quarantineInvalidLocalOrders();
+  function publicPatchError(error) {
+    const code = safeString(error?.code || 'PATCH_FAILED', 80).toLowerCase();
+    const allowed = new Set([
+      'external_id_conflict',
+      'external_id_rebind_forbidden',
+      'identity_binding_conflict',
+      'idempotency_key_reused',
+      'idempotency_key_too_long',
+      'invalid_status',
+      'local_id_conflict',
+      'local_id_mismatch',
+      'remote_invalid_date',
+      'remote_invalid_date_order',
+      'remote_required_fields',
+    ]);
+    return allowed.has(code) ? code : 'patch_failed';
+  }
+
+  function recordPatchError(error, localId, externalId = '') {
+    try {
+      const state = readState();
+      recordSyncError(state, error, {
+        operation: 'inbound_patch',
+        localId: safeString(localId, 50) || null,
+        externalId: safeString(externalId, 200) || null,
+      });
+      writeState(state);
+    } catch (loggingError) {
+      logger.error('[CRM patch logging]', safeErrorMessage(loggingError.message));
+    }
+  }
+
+  const startupIdentityConflicts = identityConflictCounts();
+  if (startupIdentityConflicts.localId || startupIdentityConflicts.externalId) {
+    logger.warn('[CRM identity audit]', JSON.stringify(startupIdentityConflicts));
+  }
 
   app.get('/api/integration/v1/health', authPartner, (_req, res) => {
     res.json({ ok: true, service: 'violet-motion-crm', version: 1, time: new Date().toISOString() });
@@ -1258,17 +1539,44 @@ function createCrmIntegration({
       res.status(inputErrorStatus(error)).json({ error: error.message, code: error.code || 'INVALID_ORDER' });
     }
   });
-  app.patch('/api/integration/v1/orders/:externalId', authPartner, (req, res) => {
+  app.patch('/api/integration/v1/orders/:localId', authPartner, (req, res) => {
+    const externalId = safeString(
+      req.body?.externalId || req.body?.partnerOrderId || req.body?.integration?.partnerOrderId,
+      200,
+    );
     try {
-      const result = upsertRemoteOrder(req.body || {}, req.params.externalId);
-      res.status(result.created ? 201 : 200).json({ ok: true, ...result });
+      const result = patchExistingRemoteOrder(
+        req.params.localId,
+        req.body || {},
+        req.headers['idempotency-key'],
+      );
+      if (result.statusCode >= 400) {
+        const error = validationError('Order was not found for inbound PATCH', 'ORDER_NOT_FOUND');
+        error.httpStatus = result.statusCode;
+        recordPatchError(error, req.params.localId, externalId);
+      }
+      res.status(result.statusCode).json(result.body);
     } catch (error) {
-      res.status(inputErrorStatus(error)).json({ error: error.message, code: error.code || 'INVALID_ORDER' });
+      recordPatchError(error, req.params.localId, externalId);
+      res.status(inputErrorStatus(error)).json({
+        ok: false,
+        created: false,
+        error: publicPatchError(error),
+      });
     }
   });
   app.delete('/api/integration/v1/orders/:externalId', authPartner, (req, res) => {
-    const result = deleteRemoteOrder(req.body || {}, req.params.externalId, 'partner_api_delete');
-    res.json({ ok: true, ...result });
+    try {
+      const result = deleteRemoteOrder(req.body || {}, req.params.externalId, 'partner_api_delete');
+      res.json({ ok: true, ...result });
+    } catch (error) {
+      recordPatchError(error, req.body?.localId, req.params.externalId);
+      res.status(inputErrorStatus(error)).json({
+        ok: false,
+        deleted: false,
+        error: publicPatchError(error),
+      });
+    }
   });
 
   app.get('/api/admin/crm-sync/status', adminAuth, (_req, res) => res.json(statusPayload()));
