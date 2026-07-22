@@ -12,7 +12,7 @@
  */
 
 require('dotenv').config();
-const TelegramBot = require('node-telegram-bot-api');
+const { TelegramBot } = require('node-telegram-bot-api');
 
 const TOKEN = process.env.BOT_TOKEN || process.env.TG_TOKEN || '';
 
@@ -1514,27 +1514,98 @@ async function showReviews(chatId, page = 1, msgId = null) {
 /* ═══════════════════════════════════════════════════════════
    SUPPORT
 ═══════════════════════════════════════════════════════════ */
-async function showSupport(chatId, page = 1, msgId = null) {
-  let msgs = await serverGet('/api/admin/support');
-  if (!Array.isArray(msgs)) return reply(chatId, '❌ Не вдалося завантажити підтримку.', MAIN_KB, msgId);
-  msgs = msgs.filter(m => !m.answered).reverse();
-  if (!msgs.length) return reply(chatId, '🎧 Нових запитів немає.', MAIN_KB, msgId);
-  const { items, page: p, total } = paginate(msgs, page);
-  let text = `🎧 <b>Підтримка</b> (${msgs.length} без відповіді):\n\n`;
-  items.forEach(m => {
-    const excerpt = m.message.length > 100 ? m.message.slice(0, 100) + '…' : m.message;
-    text += `💬 <b>#${m.id}</b>${m.accepted ? ' ✋' : ''}\n<i>${excerpt}</i>\n📅 ${fmtDate(m.timestamp)}\n\n`;
+function supportIsManagerRequest(record = {}) {
+  const status = String(record.status || '').toLowerCase();
+  if (['waiting_manager', 'accepted'].includes(status)) return true;
+  if (status === 'closed') return false;
+  if (record.category === 'manager_required') return !record.answered || record.accepted;
+  // Backward compatibility: legacy records did not have category/status.
+  return !record.category && !record.status && !record.answered;
+}
+
+function supportIsAiHistory(record = {}) {
+  const completed = record.status === 'closed' || !!record.completedAt || !!record.summaryNotifiedAt;
+  if (!completed) return false;
+  if (record.category === 'ai_history') return true;
+  // Backward compatibility for AI records written before category/status existed.
+  return !!record.aiHandled || !!record.aiLastReply || (!!record.summary && !record.accepted);
+}
+
+function supportRecordTime(record = {}) {
+  const value = record.completedAt || record.updatedAt || record.timestamp || record.startedAt || 0;
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function supportMenuKeyboard(managerCount, historyCount) {
+  return { inline_keyboard: [
+    [{ text: `👩‍💼 Запити менеджеру (${managerCount})`, callback_data: 'support_manager' }],
+    [{ text: `🤖 Історія AI (${historyCount})`, callback_data: 'support_ai' }],
+    [{ text: '← Головне меню', callback_data: 'main' }],
+  ] };
+}
+
+async function showSupport(chatId, msgId = null) {
+  const records = await serverGet('/api/admin/support');
+  if (!Array.isArray(records)) return reply(chatId, '❌ Не вдалося завантажити підтримку.', MAIN_KB, msgId);
+  const managerCount = records.filter(supportIsManagerRequest).length;
+  const historyCount = records.filter(supportIsAiHistory).length;
+  const text =
+    `🎧 <b>Підтримка</b>\n\n` +
+    `👩‍💼 Потрібна відповідь менеджера: <b>${managerCount}</b>\n` +
+    `🤖 Завершені діалоги з AI: <b>${historyCount}</b>\n\n` +
+    'Оберіть розділ:';
+  return reply(chatId, text, supportMenuKeyboard(managerCount, historyCount), msgId);
+}
+
+async function showSupportList(chatId, kind, page = 1, msgId = null) {
+  const records = await serverGet('/api/admin/support');
+  if (!Array.isArray(records)) return reply(chatId, '❌ Не вдалося завантажити підтримку.', MAIN_KB, msgId);
+  const isManager = kind === 'manager';
+  const filtered = records
+    .filter(isManager ? supportIsManagerRequest : supportIsAiHistory)
+    .sort((a, b) => supportRecordTime(b) - supportRecordTime(a));
+  if (!filtered.length) {
+    return reply(
+      chatId,
+      isManager ? '✅ Запитів, які потребують менеджера, немає.' : '🤖 Завершених AI-діалогів ще немає.',
+      { inline_keyboard: [[{ text: '← До підтримки', callback_data: 'support_menu' }]] },
+      msgId,
+    );
+  }
+
+  const { items, page: p, total } = paginate(filtered, page);
+  let text = isManager
+    ? `👩‍💼 <b>Запити менеджеру</b> (${filtered.length})\n\n`
+    : `🤖 <b>Історія діалогів з AI</b> (${filtered.length})\n\n`;
+
+  items.forEach(record => {
+    const customer = record.customer || {};
+    const summary = record.summary || {};
+    const rawTopic = summary.topic || record.message || 'Без опису';
+    const topic = rawTopic.length > 120 ? `${rawTopic.slice(0, 120)}…` : rawTopic;
+    const customerLine = customer.name || customer.phone || record.sessionId || 'Клієнт не вказаний';
+    text += `${isManager ? '💬' : '🤖'} <b>#${esc(record.id)}</b>${record.accepted ? ' ✋' : ''}\n`;
+    text += `👤 ${esc(customerLine)}${customer.orderId ? ` · 📦 #${esc(customer.orderId)}` : ''}\n`;
+    text += `<i>${esc(topic)}</i>\n`;
+    if (!isManager) {
+      if (summary.wanted) text += `🎯 ${esc(summary.wanted)}\n`;
+      text += `${summary.resolved === false ? '⚠️ Не вирішено' : '✅ Вирішено'}\n`;
+    }
+    text += `📅 ${fmtDate(record.completedAt || record.updatedAt || record.timestamp)}\n\n`;
   });
-  const rows = items.map(m => [{
-    text: m.accepted ? `💬 Відповісти #${m.id}` : `✋ Прийняти #${m.id}`,
-    callback_data: m.accepted ? `answered_${m.id}` : `accept_${m.sessionId || m.id}`,
-  }]);
+
+  const rows = isManager ? items.map(record => [{
+    text: record.accepted ? `💬 Продовжити #${record.id}` : `✋ Прийняти #${record.id}`,
+    callback_data: `accept_${record.sessionId || record.id}`,
+  }]) : [];
   const nav = [];
-  if (p > 1)     nav.push({ text: '← Назад', callback_data: `sp_${p - 1}` });
+  if (p > 1) nav.push({ text: '← Назад', callback_data: `sp_${kind}_${p - 1}` });
   nav.push({ text: `${p}/${total}`, callback_data: 'noop' });
-  if (p < total) nav.push({ text: 'Далі →', callback_data: `sp_${p + 1}` });
-  if (nav.length) rows.push(nav);
-  reply(chatId, text, { inline_keyboard: rows }, msgId);
+  if (p < total) nav.push({ text: 'Далі →', callback_data: `sp_${kind}_${p + 1}` });
+  rows.push(nav);
+  rows.push([{ text: '← До підтримки', callback_data: 'support_menu' }]);
+  return reply(chatId, text, { inline_keyboard: rows }, msgId);
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -1555,12 +1626,13 @@ async function showStats(chatId, msgId = null) {
   const sc = {};
   orders.forEach(o => { sc[o.size] = (sc[o.size] || 0) + 1; });
   const top = Object.entries(sc).sort((a, b) => b[1] - a[1])[0];
+  const pendingSupport = Array.isArray(support) ? support.filter(supportIsManagerRequest).length : '?';
 
   const text =
     `📊 <b>Статистика</b>\n━━━━━━━━━━━━━━━\n` +
     `📦 Замовлень: <b>${orders.length}</b>  🆕 ${orders.filter(o => o.status === 'new').length}  ✅ ${orders.filter(o => o.status === 'confirmed').length}  ❌ ${orders.filter(o => o.status === 'cancelled').length}\n` +
     `💬 Відгуків: <b>${reviews.length}</b>  ⭐ ${avg}\n` +
-    `🎧 Підтримка: <b>${Array.isArray(support) ? support.length : '?'}</b>  ⚠️ ${Array.isArray(support) ? support.filter(m => !m.answered).length : '?'} без відповіді\n` +
+    `🎧 Підтримка: <b>${Array.isArray(support) ? support.length : '?'}</b>  ⚠️ ${pendingSupport} потребують менеджера\n` +
     (top ? `👟 Топ розмір: <b>${top[0]}</b> (${top[1]} шт)\n` : '') +
     `━━━━━━━━━━━━━━━`;
 
@@ -1601,6 +1673,7 @@ function crmSyncKb() {
   return {
     inline_keyboard: [
       [{ text: '🔄 Запустити звірку зараз', callback_data: 'crm_sync_run' }],
+      [{ text: '♻️ Повторити помилки після 8 спроб', callback_data: 'crm_sync_retry' }],
       [{ text: '↻ Оновити стан', callback_data: 'crm_sync' }],
       [{ text: '← CRM', callback_data: 'crm_menu' }],
     ],
@@ -1615,9 +1688,10 @@ async function showCrmSync(chatId, msgId = null) {
   const text =
     `🔄 <b>Синхронізація CRM</b>\n━━━━━━━━━━━━━━━\n` +
     `Вхідний API: <b>${data.enabled ? 'увімкнено' : 'не налаштовано'}</b>\n` +
-    `Google CRM: <b>${data.outboundConfigured ? 'підключено' : 'очікує URL від партнера'}</b>\n` +
+    `Universal CRM: <b>${data.outboundConfigured ? 'підключено' : 'очікує URL від партнера'}</b>\n` +
     `У черзі на відправлення: <b>${data.pending || 0}</b>\n` +
-    `Помилок відправлення: <b>${data.failed || 0}</b>\n` +
+    `Тимчасових помилок: <b>${data.failed || 0}</b>\n` +
+    `Після 8 спроб: <b>${data.deadLetter || 0}</b> · карантин: <b>${data.quarantine || 0}</b>\n` +
     (data.lastSuccessAt ? `Останній успішний обмін: <b>${fmtDate(data.lastSuccessAt)}</b>\n` : '') +
     (data.lastError ? `Остання помилка: <b>${esc(data.lastError)}</b>\n` : '') +
     (check.checkedAt
@@ -1625,7 +1699,7 @@ async function showCrmSync(chatId, msgId = null) {
         `Статуси відрізняються: <b>${check.statusMismatches || 0}</b>\n`
       : '\nЗвірка ще не запускалася.\n') +
     (!data.outboundConfigured
-      ? '\nПісля того як власник Google CRM надасть URL Apps Script, додайте його в PARTNER_CRM_URL.'
+      ? '\nДодайте production bridge Universal CRM у PARTNER_CRM_URL.'
       : problems ? '\n⚠️ Відкрийте звірку повторно після синхронізації. Нова версія автоматично застосовує свіжіший запис.' : '\n✅ Обидві CRM узгоджені.');
   return reply(chatId, text, crmSyncKb(), msgId);
 }
@@ -2661,9 +2735,19 @@ bot.on('callback_query', async q => {
     if (data === 'crm_sync') { await showCrmSync(chatId, msgId); return; }
 
     if (data === 'crm_sync_run') {
-      const result = await serverPost('/api/admin/crm-sync/run', {});
+      const result = await serverPost('/api/admin/crm-sync/run', { forcePending: true });
       if (!result || result.error) {
         await reply(chatId, `❌ Синхронізація не виконана: ${esc(result?.error || 'помилка')}`, crmSyncKb(), msgId);
+        return;
+      }
+      await showCrmSync(chatId, msgId);
+      return;
+    }
+
+    if (data === 'crm_sync_retry') {
+      const result = await serverPost('/api/admin/crm-sync/retry', {});
+      if (!result || result.error) {
+        await reply(chatId, `❌ Повтор не запущено: ${esc(result?.error || 'помилка')}`, crmSyncKb(), msgId);
         return;
       }
       await showCrmSync(chatId, msgId);
@@ -2997,7 +3081,14 @@ bot.on('callback_query', async q => {
     }
 
     /* ─ Support ─────────────────────────────────────────── */
-    if (data.startsWith('sp_'))         { showSupport(chatId, Number(data.slice(3)), msgId); return; }
+    if (data === 'support_menu')    { await showSupport(chatId, msgId); return; }
+    if (data === 'support_manager') { await showSupportList(chatId, 'manager', 1, msgId); return; }
+    if (data === 'support_ai')      { await showSupportList(chatId, 'ai', 1, msgId); return; }
+    const supportPage = data.match(/^sp_(manager|ai)_(\d+)$/);
+    if (supportPage) {
+      await showSupportList(chatId, supportPage[1], Number(supportPage[2]), msgId);
+      return;
+    }
 
     if (data.startsWith('accept_')) {
       const sessionId = data.slice(7);

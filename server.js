@@ -34,6 +34,7 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const SUPPORT_AI_ENABLED = process.env.SUPPORT_AI_ENABLED !== 'false';
 const SUPPORT_AI_MAX_PER_SESSION = Math.max(1, Number(process.env.SUPPORT_AI_MAX_PER_SESSION || 8));
+const SUPPORT_AI_IDLE_MINUTES = Math.max(2, Number(process.env.SUPPORT_AI_IDLE_MINUTES || 10));
 const ZVONOK_API_KEY = process.env.ZVONOK_API_KEY || '';
 const ZVONOK_CAMPAIGN_ID = process.env.ZVONOK_CAMPAIGN_ID || '';
 const ZVONOK_WEBHOOK_SECRET = process.env.ZVONOK_WEBHOOK_SECRET || '';
@@ -117,6 +118,46 @@ function writeOrders(data, options = {}) {
 }
 function nextId(arr) {
   return arr.length ? Math.max(...arr.map(x => x.id || 0)) + 1 : 1;
+}
+
+// Serialize public order creation/upgrades inside one Node process. Render is
+// configured with WEB_CONCURRENCY=1; this also prevents fetch + sendBeacon from
+// racing each other in that process.
+let orderMutationTail = Promise.resolve();
+async function withOrderMutationLock(task) {
+  const previous = orderMutationTail;
+  let release;
+  orderMutationTail = new Promise(resolve => { release = resolve; });
+  await previous;
+  try { return await task(); }
+  finally { release(); }
+}
+
+function normalizeOrderPhone(value) {
+  let digits = String(value || '').replace(/\D/g, '');
+  if (digits.startsWith('00')) digits = digits.slice(2);
+  if (digits.length === 10 && digits.startsWith('0')) digits = `38${digits}`;
+  if (digits.length === 11 && digits.startsWith('80')) digits = `3${digits}`;
+  return digits;
+}
+
+function normalizeOrderPart(value) {
+  return String(value == null ? '' : value).trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function orderDedupeFingerprint(order = {}) {
+  return [
+    normalizeOrderPhone(order.phone),
+    normalizeOrderPart(order.product || PRODUCT_NAME),
+    normalizeOrderPart(order.variant || order.productVariant || ''),
+    normalizeOrderPart(order.size),
+    normalizeOrderPart(order.color),
+    String(Math.max(1, Number(order.quantity) || 1)),
+  ].join('|');
+}
+
+function isActiveNewOrder(order) {
+  return (order?.status || 'new') === 'new';
 }
 const DEFAULT_FINANCE_START_AT = '2026-05-25T21:00:00.000Z';
 const DEFAULT_FINANCE_RESET_KEY = 'finance-reset-2026-05-26';
@@ -2389,6 +2430,7 @@ async function updateOrderQueueNotice(latestOrder = null) {
 
 const supportAiHistory = {};
 const supportAiUsage = {};
+const supportSessionLocks = new Map();
 const SUPPORT_SIZE_CHART = {
   36: '23 см',
   37: '23.5 см',
@@ -2430,13 +2472,32 @@ function supportSessionKey(sessionId, fallbackId = null) {
   return String(sessionId || fallbackId || '').trim();
 }
 
+async function withSupportSessionLock(sessionId, task) {
+  const key = supportSessionKey(sessionId, 'anonymous');
+  const previous = supportSessionLocks.get(key) || Promise.resolve();
+  let release;
+  const current = new Promise(resolve => { release = resolve; });
+  supportSessionLocks.set(key, current);
+  await previous;
+  try { return await task(); }
+  finally {
+    release();
+    if (supportSessionLocks.get(key) === current) supportSessionLocks.delete(key);
+  }
+}
+
+function supportRecordIsOpen(record) {
+  if (record?.status) return record.status !== 'closed';
+  return !record?.answered;
+}
+
 function findOpenSupportIndex(msgs, sessionId) {
   const key = supportSessionKey(sessionId);
   if (!key) return -1;
-  let idx = msgs.findIndex(m => supportSessionKey(m.sessionId, m.id) === key && !m.answered);
+  let idx = msgs.findIndex(m => supportSessionKey(m.sessionId, m.id) === key && supportRecordIsOpen(m));
   if (idx >= 0) return idx;
   const numeric = Number(key);
-  return Number.isFinite(numeric) ? msgs.findIndex(m => m.id === numeric && !m.answered) : -1;
+  return Number.isFinite(numeric) ? msgs.findIndex(m => m.id === numeric && supportRecordIsOpen(m)) : -1;
 }
 
 function updateSupportRecord(sessionId, patch) {
@@ -2446,6 +2507,51 @@ function updateSupportRecord(sessionId, patch) {
   msgs[idx] = { ...msgs[idx], ...patch, id: msgs[idx].id, updatedAt: new Date().toISOString() };
   write(F.support, msgs);
   return msgs[idx];
+}
+
+function supportMessage(role, text, at = new Date().toISOString(), extra = {}) {
+  return { role, text: sanitizeStr(text, 2000), at, ...extra };
+}
+
+function supportTranscript(record) {
+  if (Array.isArray(record?.messages)) return record.messages;
+  return record?.message ? [supportMessage('user', record.message, record.timestamp || record.createdAt)] : [];
+}
+
+function asIsoSupportDate(value, fallback = new Date().toISOString()) {
+  if (!value) return fallback;
+  const parsed = new Date(value || 0);
+  return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : fallback;
+}
+
+function resolveSupportCustomer(raw = {}) {
+  const orderId = Number(raw?.orderId || 0);
+  if (orderId) {
+    const order = read(F.orders).find(item => Number(item.id) === orderId);
+    if (order) return {
+      name: sanitizeStr(order.fullName || order.name, 140) || null,
+      phone: sanitizeStr(order.phone, 30) || null,
+      orderId: order.id,
+    };
+  }
+  return {
+    name: sanitizeStr(raw?.name, 140) || null,
+    phone: sanitizeStr(raw?.phone, 30) || null,
+    orderId: null,
+  };
+}
+
+function supportFallbackSummary(record, managerRequired = false) {
+  const messages = supportTranscript(record);
+  const firstUser = messages.find(item => item.role === 'user')?.text || record.message || 'Звернення до підтримки';
+  const lastAi = [...messages].reverse().find(item => item.role === 'ai')?.text || '';
+  return {
+    topic: sanitizeStr(firstUser, 180),
+    wanted: sanitizeStr(firstUser, 180),
+    resolved: !managerRequired && !!lastAi,
+    managerRequired,
+    managerAction: managerRequired ? sanitizeStr(record.handoffReason || 'Зв’язатися з клієнтом і вирішити запит', 180) : '',
+  };
 }
 
 function isLikelyLowValueSupportMessage(text) {
@@ -2461,6 +2567,20 @@ function isLikelyLowValueSupportMessage(text) {
 
 function wantsHumanOperator(text) {
   return /(оператор|менеджер|людин|человек|жив[а-яіїєґ]*|human|operator|manager|support|позвон|подзвон|передзвон|звонок|дзвінок)/i.test(text);
+}
+
+function supportIssueNeedsManager(text) {
+  const message = String(text || '').toLowerCase();
+  if (wantsHumanOperator(message)) return true;
+  return (
+    /(?:скас|отмен)[а-яіїєґ\s]{0,24}(?:замов|заказ)/i.test(message) ||
+    /(?:змін|измен)[а-яіїєґ\s]{0,30}(?:замов|заказ|адрес|телефон|розмір|размер|відділен|отделен)/i.test(message) ||
+    /(?:де|где|статус)[а-яіїєґ\s]{0,24}(?:замов|заказ|посил|посыл)/i.test(message) ||
+    /(?:не\s+(?:прийш|пришел|пришла|отрим|получ)|затрим|задерж)[а-яіїєґ\s]{0,30}(?:замов|заказ|посил|посыл|достав)/i.test(message) ||
+    /(?:претенз|скарг|жалоб|брак|пошкод|поврежд|не\s+той|не\s+тот|не\s+та)[а-яіїєґ\s]{0,40}/i.test(message) ||
+    /(?:повернут|повернути|вернуть|возврат)[а-яіїєґ\s]{0,24}(?:замов|заказ|товар|пару)/i.test(message) ||
+    /(?:проблем)[а-яіїєґ\s]{0,24}(?:достав|оплат|замов|заказ|посил|посыл)/i.test(message)
+  );
 }
 
 function offTopicSupportReply(text) {
@@ -2532,7 +2652,7 @@ function parseGeminiJson(raw) {
   try { return JSON.parse(match[0]); } catch { return null; }
 }
 
-async function askSupportAi(sessionId, message) {
+async function askSupportAi(sessionId, message, savedTranscript = []) {
   if (!SUPPORT_AI_ENABLED || !GEMINI_API_KEY) return null;
   const key = supportSessionKey(sessionId, 'anonymous');
   supportAiUsage[key] = supportAiUsage[key] || 0;
@@ -2540,7 +2660,13 @@ async function askSupportAi(sessionId, message) {
     return { action: 'handoff', reply: 'Передаю діалог менеджеру, щоб не ганяти вас по колу. Він підключиться й допоможе.', reason: 'ai_session_limit' };
   }
 
-  const history = (supportAiHistory[key] || []).slice(-8);
+  const persistedHistory = Array.isArray(savedTranscript)
+    ? savedTranscript.filter(item => ['user', 'ai'].includes(item.role) && item.text).slice(-8).map(item => ({
+      role: item.role === 'ai' ? 'model' : 'user',
+      parts: [{ text: sanitizeStr(item.text, 1200) }],
+    }))
+    : [];
+  const history = (persistedHistory.length ? persistedHistory : (supportAiHistory[key] || [])).slice(-8);
   supportAiUsage[key]++;
 
   const ctrl = new AbortController();
@@ -2596,20 +2722,74 @@ async function askSupportAi(sessionId, message) {
   }
 }
 
+async function summarizeSupportConversation(record, managerRequired = false) {
+  const fallback = supportFallbackSummary(record, managerRequired);
+  if (!SUPPORT_AI_ENABLED || !GEMINI_API_KEY) return fallback;
+  const transcript = supportTranscript(record).slice(-14)
+    .map(item => `${item.role}: ${sanitizeStr(item.text, 600)}`)
+    .join('\n');
+  if (!transcript) return fallback;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 9000);
+  try {
+    const response = await fetch(geminiEndpoint(), {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+      body: JSON.stringify({
+        system_instruction: { parts: [{ text: 'Create a very short Ukrainian support summary. Return JSON only. Do not copy the whole dialogue.' }] },
+        contents: [{ role: 'user', parts: [{ text:
+          `Conversation:\n${transcript}\n\nReturn: {"topic":"...","wanted":"...","resolved":true,"managerRequired":${managerRequired},"managerAction":"..."}`,
+        }] }],
+        generationConfig: { temperature: 0.15, maxOutputTokens: 220, responseMimeType: 'application/json' },
+      }),
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) return fallback;
+    const raw = data?.candidates?.[0]?.content?.parts?.map(part => part.text || '').join('');
+    const parsed = parseGeminiJson(raw);
+    if (!parsed) return fallback;
+    return {
+      topic: sanitizeStr(parsed.topic || fallback.topic, 180),
+      wanted: sanitizeStr(parsed.wanted || fallback.wanted, 180),
+      resolved: managerRequired ? false : parsed.resolved !== false,
+      managerRequired,
+      managerAction: managerRequired ? sanitizeStr(parsed.managerAction || fallback.managerAction, 180) : '',
+    };
+  } catch {
+    return fallback;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function notifySupportRequest(msg, mode = 'new') {
   const ts = new Date(msg.timestamp || msg.updatedAt || Date.now()).toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' });
+  const customer = msg.customer || {};
+  const summary = msg.summary || supportFallbackSummary(msg, mode === 'handoff');
   const title = mode === 'handoff'
-    ? '🤝 <b>ПОТРІБЕН МЕНЕДЖЕР</b>'
+    ? `🤝 <b>ПОТРІБЕН МЕНЕДЖЕР #${msg.id}</b>`
+    : mode === 'history'
+      ? `🤖 <b>ДІАЛОГ З AI ЗАВЕРШЕНО #${msg.id}</b>`
     : mode === 'dialog'
       ? `💬 <b>НОВЕ ПОВІДОМЛЕННЯ В ДІАЛОЗІ #${msg.id}</b>`
       : `🎧 <b>ПІДТРИМКА #${msg.id}</b>`;
-  const text =
-    `${title}\n━━━━━━━━━━━━━━\n` +
-    `🆔 <code>${escapeHtml(msg.sessionId || msg.id)}</code>\n` +
-    (msg.handoffReason ? `ℹ️ ${escapeHtml(msg.handoffReason)}\n` : '') +
-    `💬 ${escapeHtml(msg.message)}\n📅 ${ts}`;
+  const text = mode === 'history'
+    ? `${title}\n━━━━━━━━━━━━━━\n` +
+      `👤 ${escapeHtml(customer.name || msg.sessionId || msg.id)}\n` +
+      `💬 Тема: ${escapeHtml(summary.topic)}\n` +
+      `✅ Вирішено: <b>${summary.resolved ? 'так' : 'ні'}</b>\n` +
+      `🕒 Завершено: ${ts}`
+    : `${title}\n━━━━━━━━━━━━━━\n` +
+      `👤 ${escapeHtml(customer.name || 'Не вказано')}\n` +
+      (customer.phone ? `📱 ${escapeHtml(customer.phone)}\n` : '') +
+      (customer.orderId ? `📦 Замовлення #${escapeHtml(customer.orderId)}\n` : '') +
+      `📝 Суть: ${escapeHtml(summary.topic || msg.message)}\n` +
+      `🎯 Потрібно: ${escapeHtml(summary.managerAction || msg.handoffReason || 'Відповісти клієнту')}\n` +
+      `🕒 ${ts}`;
 
-  const keyboard = mode === 'dialog' ? undefined : {
+  const keyboard = ['dialog', 'history'].includes(mode) ? undefined : {
     reply_markup: { inline_keyboard: [[
       { text: '✋ Прийняти діалог', callback_data: `accept_${msg.sessionId || msg.id}` },
     ]] },
@@ -2622,6 +2802,43 @@ async function notifySupportRequest(msg, mode = 'new') {
   }
   await tg(text, keyboard || {});
 }
+
+let supportFinalizeRunning = false;
+async function finalizeDueSupportConversations() {
+  if (supportFinalizeRunning) return;
+  supportFinalizeRunning = true;
+  try {
+    const snapshot = read(F.support);
+    const due = snapshot.filter(record => (
+      record.category === 'ai_history' &&
+      record.status === 'active' &&
+      !record.summaryNotifiedAt &&
+      new Date(record.summaryDueAt || 0).getTime() <= Date.now()
+    ));
+    for (const candidate of due) {
+      const summary = await summarizeSupportConversation(candidate, false);
+      await withSupportSessionLock(candidate.sessionId || candidate.id, async () => {
+        const records = read(F.support);
+        const idx = records.findIndex(item => item.id === candidate.id);
+        if (idx < 0 || records[idx].summaryNotifiedAt || records[idx].status !== 'active') return;
+        const now = new Date().toISOString();
+        records[idx] = {
+          ...records[idx], summary, status: 'closed', answered: true,
+          completedAt: now, summaryNotifiedAt: now, updatedAt: now,
+        };
+        write(F.support, records);
+        await notifySupportRequest(records[idx], 'history');
+      });
+    }
+  } finally {
+    supportFinalizeRunning = false;
+  }
+}
+
+const supportFinalizeTimer = setInterval(() => {
+  finalizeDueSupportConversations().catch(error => console.error('[support summary]', error.message));
+}, 60 * 1000);
+if (supportFinalizeTimer.unref) supportFinalizeTimer.unref();
 
 function normalizePhoneForZvonok(phone) {
   const raw = String(phone || '').trim();
@@ -3558,6 +3775,15 @@ app.post('/api/support/relay', authBot, (req, res) => {
   const { sessionId, text, managerName } = req.body;
   if (!sessionId || !text) return res.status(400).json({ error: 'Missing fields' });
   sseWrite(sessionId, { type: 'message', text, managerName: managerName || 'Оператор' });
+  const records = read(F.support);
+  const idx = findOpenSupportIndex(records, sessionId);
+  if (idx >= 0) {
+    const now = new Date().toISOString();
+    records[idx].messages = [...supportTranscript(records[idx]), supportMessage('manager', text, now, { managerName: sanitizeStr(managerName, 100) })];
+    records[idx].message = sanitizeStr(text, 2000);
+    records[idx].updatedAt = now;
+    write(F.support, records);
+  }
   res.json({ success: true });
 });
 
@@ -3567,6 +3793,8 @@ app.post('/api/support/accept', authBot, (req, res) => {
   const support = updateSupportRecord(sessionId, {
     accepted: true,
     answered: false,
+    category: 'manager_required',
+    status: 'accepted',
     managerId: managerId || null,
     acceptedAt: new Date().toISOString(),
   });
@@ -3586,8 +3814,12 @@ app.post('/api/support/end', authBot, (req, res) => {
   const realSessionId = supportSessionKey(msgs[idx]?.sessionId, sessionId);
   sseWrite(realSessionId, { type: 'end' });
   if (idx >= 0) {
+    const now = new Date().toISOString();
     msgs[idx].answered = true;
-    msgs[idx].endedAt  = new Date().toISOString();
+    msgs[idx].status = 'closed';
+    msgs[idx].endedAt = now;
+    msgs[idx].completedAt = now;
+    msgs[idx].updatedAt = now;
     write(F.support, msgs);
   }
   res.json({ success: true });
@@ -3604,11 +3836,6 @@ app.get('/api/support/sessions', authBot, (_req, res) => {
 /* ═══════════════════════════════════════════════════════════
    ZAPUSK LEADS (public)
 ═══════════════════════════════════════════════════════════ */
-app.get('/api/zapusk/health', (_req, res) => {
-  res.set('Cache-Control', 'no-store');
-  res.json({ ok: true });
-});
-
 app.post('/api/zapusk/lead', rateLimit(60 * 1000, 5), async (req, res) => {
   const clean = (value, max = 200) => sanitizeStr(value, max).replace(/[<>]/g, '');
   const escapeHtml = value => clean(value, 700)
@@ -3651,9 +3878,120 @@ app.post('/api/zapusk/lead', rateLimit(60 * 1000, 5), async (req, res) => {
 /* ═══════════════════════════════════════════════════════════
    ORDERS (public)
 ═══════════════════════════════════════════════════════════ */
+function orderTelegramKeyboard(order) {
+  return { reply_markup: { inline_keyboard: [[
+    { text: '✅ Підтвердити', callback_data: `confirm_${order.id}` },
+    { text: '❌ Скасувати', callback_data: `cancel_${order.id}` },
+  ], [
+    { text: '📋 Відкрити', callback_data: `od_${order.id}` },
+    { text: '🚚 Відстеження', callback_data: 'track_menu' },
+  ], [
+    { text: '🗑 Видалити', callback_data: `del_order_${order.id}` },
+  ]] } };
+}
+
+function orderTelegramText(order, upgraded = false) {
+  const ts = new Date(order.updatedAt || order.createdAt).toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' });
+  const isInstant = order.orderMode === 'instant';
+  const isPowerbank = /voltgo|powerbank|павербанк/i.test(order.product || '');
+  return (
+    `🛒 <b>${isInstant ? 'ПОВНЕ ЗАМОВЛЕННЯ' : 'НОВА ЗАЯВКА'} #${order.id}</b>\n━━━━━━━━━━━━━━━━━━\n` +
+    (upgraded ? `🔁 <b>Заявку доповнено клієнтом, ID збережено</b>\n` : '') +
+    (order.product ? `🛍 Товар: <b>${escapeHtml(order.product)}</b>\n` : '') +
+    `👤 Ім'я: <b>${escapeHtml(order.name)}</b>\n📱 Телефон: <b>${escapeHtml(order.phone)}</b>\n` +
+    `${isPowerbank ? '🔋 Ємність' : '👟 Розмір'}: <b>${escapeHtml(order.size)}</b>\n` +
+    (order.variant ? `🏷 Варіант: <b>${escapeHtml(order.variant)}</b>\n` : '') +
+    (order.quantity ? `🔢 Кількість: <b>${escapeHtml(order.quantity)}</b>\n` : '') +
+    (order.fullName ? `🧾 Ім'я та прізвище: <b>${escapeHtml(order.fullName)}</b>\n` : '') +
+    (order.city ? `🏙 Місто: <b>${escapeHtml(order.city)}</b>\n` : '') +
+    (order.district ? `📍 Район: <b>${escapeHtml(order.district)}</b>\n` : '') +
+    (order.postOffice ? `📦 Відділення Нової Пошти: <b>${escapeHtml(order.postOffice)}</b>\n` : '') +
+    (order.color ? `🎨 Колір: <b>${escapeHtml(order.color)}</b>\n` : '') +
+    (order.price ? `💵 Ціна: <b>${escapeHtml(order.price)} грн</b>\n` : '') +
+    (order.contactViaTelegram ? `💬 Зв'язок: <b>Telegram</b>\n` : `📞 Зв'язок: <b>Дзвінок</b>\n`) +
+    (isInstant
+      ? `✅ Тип: <b>оформлено одразу</b>\n🤖 ZVONOK: <b>автоматичне підтвердження</b>\n`
+      : `👩‍💼 Обробка: <b>передзвонить менеджер, без ZVONOK</b>\n`) +
+    `📅 ${ts}\n━━━━━━━━━━━━━━━━━━`
+  );
+}
+
+function telegramOrderMessageRefs(result) {
+  const responses = Array.isArray(result?.result) ? result.result : [result];
+  return responses.map(item => ({
+    chatId: item?.result?.chat?.id,
+    messageId: item?.result?.message_id,
+  })).filter(item => item.chatId && item.messageId);
+}
+
+async function saveTelegramOrderRefs(orderId, refs) {
+  if (!refs.length) return null;
+  return withOrderMutationLock(async () => {
+    const orders = read(F.orders);
+    const idx = orders.findIndex(order => Number(order.id) === Number(orderId));
+    if (idx < 0) return null;
+    orders[idx] = { ...orders[idx], telegramOrderMessages: refs };
+    writeOrders(orders);
+    return orders[idx];
+  });
+}
+
+async function notifyOrderCreatedOrUpgraded(order, upgraded) {
+  const refs = Array.isArray(order.telegramOrderMessages) ? order.telegramOrderMessages : [];
+  if (upgraded && refs.length) {
+    await Promise.all(refs.map(ref => tgEdit(ref.chatId, ref.messageId, orderTelegramText(order, true), orderTelegramKeyboard(order))));
+    return;
+  }
+  if (upgraded) return; // Never create a second Telegram card for one checkout.
+  const sent = await tg(orderTelegramText(order, false), orderTelegramKeyboard(order));
+  const refsAfterSend = telegramOrderMessageRefs(sent);
+  const latest = await saveTelegramOrderRefs(order.id, refsAfterSend);
+  // An instant upgrade can arrive while Telegram is still creating the manual
+  // card. In that race, refresh the just-created card with the canonical order.
+  if (latest && latest.updatedAt !== order.updatedAt && refsAfterSend.length) {
+    await Promise.all(refsAfterSend.map(ref => (
+      tgEdit(ref.chatId, ref.messageId, orderTelegramText(latest, true), orderTelegramKeyboard(latest))
+    )));
+  }
+}
+
+async function dispatchZvonokOnce(order, req) {
+  const selected = await withOrderMutationLock(async () => {
+    const orders = read(F.orders);
+    const idx = orders.findIndex(item => Number(item.id) === Number(order.id));
+    if (idx < 0 || orders[idx].orderMode !== 'instant' || orders[idx].zvonokDispatchStartedAt) return null;
+    const now = new Date().toISOString();
+    orders[idx] = {
+      ...orders[idx],
+      zvonokDispatchStartedAt: now,
+      zvonokDispatchAttempts: Number(orders[idx].zvonokDispatchAttempts || 0) + 1,
+      updatedAt: orders[idx].updatedAt || now,
+    };
+    writeOrders(orders);
+    return orders[idx];
+  });
+  if (!selected) return null;
+
+  const result = await startZvonokCall(selected, req);
+  await withOrderMutationLock(async () => {
+    const orders = read(F.orders);
+    const idx = orders.findIndex(item => Number(item.id) === Number(order.id));
+    if (idx < 0) return;
+    orders[idx] = {
+      ...orders[idx],
+      zvonokDispatchOk: !!result?.ok,
+      zvonokDispatchStatus: result?.status || null,
+      zvonokDispatchFinishedAt: new Date().toISOString(),
+      ...(result ? {} : { zvonokDispatchStartedAt: null, zvonokDispatchError: 'call_start_failed' }),
+    };
+    writeOrders(orders);
+  });
+  return result;
+}
+
 app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
   const {
-    name, phone, size, color, product, price, contactViaTelegram,
+    name, phone, size, color, product, price, variant, productVariant, quantity, contactViaTelegram,
     orderMode, fullName, city, district, postOffice, delivery,
     replaceOrderId, clientOrderKey, meta,
   } = req.body;
@@ -3665,6 +4003,8 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
   const cleanColor = sanitizeStr(color, 40);
   const cleanProduct = sanitizeStr(product, 100);
   const cleanPrice = sanitizeStr(price, 20);
+  const cleanVariant = sanitizeStr(variant || productVariant, 80);
+  const cleanQuantity = Math.max(1, Math.min(20, Number(quantity) || 1));
   const cleanClientOrderKey = sanitizeStr(clientOrderKey, 80);
   const cleanOrderMode = sanitizeStr(orderMode, 20) === 'instant' ? 'instant' : 'manual';
   const deliveryData = delivery && typeof delivery === 'object' ? delivery : {};
@@ -3677,86 +4017,108 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
   if (cleanOrderMode === 'instant' && (!cleanFullName || !cleanCity || !cleanPostOffice))
     return res.status(400).json({ error: 'Missing delivery fields' });
 
-  const orders = read(F.orders);
-  if (cleanOrderMode === 'manual' && cleanClientOrderKey) {
-    const existing = orders.find(x => x.clientOrderKey === cleanClientOrderKey);
-    if (existing) return res.json({ success: true, id: existing.id, duplicate: true });
-  }
-  let activeOrders = orders;
-  let replacedOrderId = null;
-  const replaceId = Number(replaceOrderId || 0);
-  if (cleanOrderMode === 'instant' && replaceId) {
-    const replaceIdx = orders.findIndex(x => (
-      x.id === replaceId &&
-      (x.status || 'new') === 'new' &&
-      (x.orderMode || 'manual') === 'manual' &&
-      String(x.phone || '').replace(/\D/g, '') === cleanPhone.replace(/\D/g, '')
-    ));
-    if (replaceIdx >= 0) {
-      replacedOrderId = orders[replaceIdx].id;
-      activeOrders = orders.filter(x => x.id !== replacedOrderId);
-    }
-  }
-  const o = {
-    id: nextId(orders), name: cleanName, phone: cleanPhone, size: cleanSize,
-    color: cleanColor || null, product: cleanProduct || null, price: cleanPrice || null,
+  const incoming = {
+    name: cleanName,
+    phone: cleanPhone,
+    size: cleanSize,
+    color: cleanColor || null,
+    product: cleanProduct || null,
+    price: cleanPrice || null,
+    variant: cleanVariant || null,
+    quantity: cleanQuantity,
     clientOrderKey: cleanClientOrderKey || null,
     orderMode: cleanOrderMode,
-    replacedOrderId,
     fullName: cleanFullName || null,
     city: cleanCity || null,
     district: cleanDistrict || null,
     postOffice: cleanPostOffice || null,
-    contactViaTelegram: !!contactViaTelegram, status: 'new', createdAt: new Date().toISOString(),
+    contactViaTelegram: !!contactViaTelegram,
   };
-  activeOrders.push(o); writeOrders(activeOrders);
-  await updateOrderQueueNotice(o);
-  sendMetaConversionEvent('Lead', o, req, meta, { order_id: String(o.id) }).catch(e => console.error('[Meta CAPI]', e.message));
 
-  const ts = new Date(o.createdAt).toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' });
-  const isInstant = o.orderMode === 'instant';
-  const isPowerbank = /voltgo|powerbank|павербанк/i.test(o.product || '');
-  await tg(
-    `🛒 <b>${isInstant ? 'ПОВНЕ ЗАМОВЛЕННЯ' : 'НОВА ЗАЯВКА'} #${o.id}</b>\n━━━━━━━━━━━━━━━━━━\n` +
-    (o.product ? `🛍 Товар: <b>${o.product}</b>\n` : '') +
-    `👤 Ім'я: <b>${o.name}</b>\n📱 Телефон: <b>${o.phone}</b>\n` +
-    `${isPowerbank ? '🔋 Ємність' : '👟 Розмір'}: <b>${o.size}</b>\n` +
-    (o.fullName ? `🧾 Ім'я та прізвище: <b>${o.fullName}</b>\n` : '') +
-    (o.city ? `🏙 Місто: <b>${o.city}</b>\n` : '') +
-    (o.district ? `📍 Район: <b>${o.district}</b>\n` : '') +
-    (o.postOffice ? `📦 Відділення Нової Пошти: <b>${o.postOffice}</b>\n` : '') +
-    (o.color ? `🎨 Колір: <b>${o.color}</b>\n` : '') +
-    (o.price ? `💵 Ціна: <b>${o.price} грн</b>\n` : '') +
-    (o.contactViaTelegram ? `💬 Зв'язок: <b>Telegram</b>\n` : `📞 Зв'язок: <b>Дзвінок</b>\n`) +
-    (isInstant
-      ? `✅ Тип: <b>оформлено одразу</b>\n🤖 ZVONOK: <b>запускаємо автоматичне підтвердження</b>\n`
-      : `👩‍💼 Обробка: <b>передзвонить менеджер, без ZVONOK</b>\n`) +
-    (replacedOrderId ? `🔁 Попередню заявку #${replacedOrderId} видалено\n` : '') +
-    `📅 ${ts}\n━━━━━━━━━━━━━━━━━━`,
-    { reply_markup: { inline_keyboard: [[
-      { text: '✅ Підтвердити', callback_data: `confirm_${o.id}` },
-      { text: '❌ Скасувати',  callback_data: `cancel_${o.id}` },
-    ], [
-      { text: '📋 Відкрити', callback_data: `od_${o.id}` },
-      { text: '🚚 Відстеження', callback_data: 'track_menu' },
-    ], [
-      { text: '🗑 Видалити', callback_data: `del_order_${o.id}` },
-    ]] } }
-  );
-  if (isInstant) {
-    try { await startZvonokCall(o, req); }
+  const mutation = await withOrderMutationLock(async () => {
+    const orders = read(F.orders);
+    const fingerprint = orderDedupeFingerprint(incoming);
+    const byKeyIdx = cleanClientOrderKey
+      ? orders.findIndex(order => order.clientOrderKey === cleanClientOrderKey)
+      : -1;
+
+    if (byKeyIdx >= 0 && (cleanOrderMode === 'manual' || orders[byKeyIdx].orderMode === 'instant' || !isActiveNewOrder(orders[byKeyIdx]))) {
+      return { order: orders[byKeyIdx], duplicate: true, upgraded: false, created: false };
+    }
+
+    if (cleanOrderMode === 'manual') {
+      const duplicate = orders.find(order => isActiveNewOrder(order) && orderDedupeFingerprint(order) === fingerprint);
+      if (duplicate) return { order: duplicate, duplicate: true, upgraded: false, created: false };
+    }
+
+    let upgradeIdx = byKeyIdx;
+    const replaceId = Number(replaceOrderId || 0);
+    if (cleanOrderMode === 'instant' && upgradeIdx < 0 && replaceId) {
+      upgradeIdx = orders.findIndex(order => (
+        Number(order.id) === replaceId &&
+        isActiveNewOrder(order) &&
+        (order.orderMode || 'manual') === 'manual' &&
+        orderDedupeFingerprint(order) === fingerprint
+      ));
+    }
+    if (cleanOrderMode === 'instant' && upgradeIdx < 0) {
+      upgradeIdx = orders.findIndex(order => (
+        isActiveNewOrder(order) &&
+        (order.orderMode || 'manual') === 'manual' &&
+        orderDedupeFingerprint(order) === fingerprint
+      ));
+    }
+    if (cleanOrderMode === 'instant' && upgradeIdx < 0) {
+      const duplicate = orders.find(order => isActiveNewOrder(order) && orderDedupeFingerprint(order) === fingerprint);
+      if (duplicate) return { order: duplicate, duplicate: true, upgraded: false, created: false };
+    }
+
+    const now = new Date().toISOString();
+    if (cleanOrderMode === 'instant' && upgradeIdx >= 0 && isActiveNewOrder(orders[upgradeIdx])) {
+      const previous = orders[upgradeIdx];
+      orders[upgradeIdx] = {
+        ...previous,
+        ...incoming,
+        id: previous.id,
+        createdAt: previous.createdAt || now,
+        updatedAt: now,
+        upgradedFromManualAt: now,
+        confirmationSource: 'zvonok_pending',
+        clientOrderKey: previous.clientOrderKey || cleanClientOrderKey || null,
+      };
+      writeOrders(orders);
+      return { order: orders[upgradeIdx], duplicate: false, upgraded: true, created: false };
+    }
+
+    const order = { id: nextId(orders), ...incoming, status: 'new', createdAt: now, updatedAt: now };
+    orders.push(order);
+    writeOrders(orders);
+    return { order, duplicate: false, upgraded: false, created: true };
+  });
+
+  const o = mutation.order;
+  if (mutation.duplicate) {
+    return res.json({ success: true, id: o.id, duplicate: true, orderMode: o.orderMode || 'manual' });
+  }
+  await updateOrderQueueNotice(o);
+  if (mutation.created) {
+    sendMetaConversionEvent('Lead', o, req, meta, { order_id: String(o.id) }).catch(e => console.error('[Meta CAPI]', e.message));
+  }
+  await notifyOrderCreatedOrUpgraded(o, mutation.upgraded);
+  if (o.orderMode === 'instant') {
+    try { await dispatchZvonokOnce(o, req); }
     catch (e) { console.error(`[Zvonok] unexpected order #${o.id} error:`, e.message); }
   }
 
-  res.json({ success: true, id: o.id });
+  res.json({ success: true, id: o.id, upgraded: mutation.upgraded });
 });
 
-app.get('/api/orders',        (_req, res) => res.json(read(F.orders)));
-app.get('/api/orders/:id',    (req, res) => {
+app.get('/api/orders',        authBot, (_req, res) => res.json(read(F.orders)));
+app.get('/api/orders/:id',    authBot, (req, res) => {
   const o = read(F.orders).find(x => x.id === +req.params.id);
   o ? res.json(o) : res.status(404).json({ error: 'Not found' });
 });
-app.patch('/api/orders/:id',  (req, res) => {
+app.patch('/api/orders/:id',  authBot, (req, res) => {
   const arr = read(F.orders); const idx = arr.findIndex(x => x.id === +req.params.id);
   if (idx < 0) return res.status(404).json({ error: 'Not found' });
   arr[idx] = { ...arr[idx], ...req.body, id: arr[idx].id, updatedAt: new Date().toISOString() };
@@ -3764,7 +4126,7 @@ app.patch('/api/orders/:id',  (req, res) => {
   if (Object.prototype.hasOwnProperty.call(req.body || {}, 'status')) updateOrderQueueNotice(arr[idx]).catch(e => console.error('[order notice]', e.message));
   res.json(arr[idx]);
 });
-app.delete('/api/orders/:id', (req, res) => {
+app.delete('/api/orders/:id', authBot, (req, res) => {
   const id = Number(req.params.id); const arr = read(F.orders);
   if (!arr.some(x => x.id === id)) return res.status(404).json({ error: 'Not found' });
   writeOrders(arr.filter(x => x.id !== id));
@@ -3869,131 +4231,105 @@ app.delete('/api/reviews/:id', (req, res) => {
    SUPPORT (public)
 ═══════════════════════════════════════════════════════════ */
 app.post('/api/support', rateLimit(60 * 1000, 10), async (req, res) => {
-  const { message, sessionId, timestamp } = req.body;
+  const { message, sessionId, timestamp, customer } = req.body;
   if (!message) return res.status(400).json({ error: 'Missing message' });
   const cleanMsg = sanitizeStr(message, 2000);
   if (!cleanMsg) return res.status(400).json({ error: 'Empty message' });
-
-  const msgs = read(F.support);
-  const existingIdx = findOpenSupportIndex(msgs, sessionId);
-
-  if (existingIdx >= 0) {
-    msgs[existingIdx].message   = cleanMsg;
-    msgs[existingIdx].timestamp = timestamp || new Date().toISOString();
-    msgs[existingIdx].updatedAt = new Date().toISOString();
-    write(F.support, msgs);
-    const current = msgs[existingIdx];
-    if (current.accepted) {
-      await notifySupportRequest(current, 'dialog');
-      return res.json({ success: true, id: current.id, repeated: true, human: true });
-    }
-
-    const needsHuman = wantsHumanOperator(cleanMsg);
-    const ai = needsHuman ? null : await askSupportAi(sessionId, cleanMsg);
-    if (ai?.action === 'answer') {
-      msgs[existingIdx] = { ...current, answered: true, aiHandled: true, aiLastReply: ai.reply, updatedAt: new Date().toISOString() };
-      write(F.support, msgs);
-      return res.json({ success: true, id: current.id, repeated: true, aiReply: ai.reply, ai: true });
-    }
-
-    if (!needsHuman && !ai) {
-      msgs[existingIdx] = { ...current, answered: false, aiError: true, updatedAt: new Date().toISOString() };
-      write(F.support, msgs);
-      return res.json({
-        success: true,
-        id: current.id,
-        repeated: true,
-        aiError: true,
-        aiReply: 'Gemini зараз не відповів. Перевірте GEMINI_API_KEY / GEMINI_MODEL у Render Logs.',
+  const key = supportSessionKey(sessionId, `anonymous_${req.ip}`);
+  const result = await withSupportSessionLock(key, async () => {
+    const now = new Date().toISOString();
+    const messageAt = asIsoSupportDate(timestamp, now);
+    const msgs = read(F.support);
+    let idx = findOpenSupportIndex(msgs, sessionId);
+    const repeated = idx >= 0;
+    if (idx < 0) {
+      idx = msgs.length;
+      msgs.push({
+        id: nextId(msgs),
+        sessionId: sessionId || null,
+        category: 'ai_history',
+        status: 'active',
+        customer: resolveSupportCustomer(customer),
+        messages: [],
+        startedAt: now,
+        timestamp: messageAt,
+        answered: false,
+        accepted: false,
       });
     }
 
-    msgs[existingIdx] = {
+    let current = msgs[idx];
+    const priorTranscript = supportTranscript(current);
+    current = {
       ...current,
+      customer: current.customer?.orderId ? current.customer : resolveSupportCustomer(customer),
+      message: cleanMsg,
+      timestamp: messageAt,
+      updatedAt: now,
+      messages: [...priorTranscript, supportMessage('user', cleanMsg, messageAt)],
+    };
+
+    if (current.accepted || current.status === 'accepted') {
+      msgs[idx] = current;
+      write(F.support, msgs);
+      await notifySupportRequest(current, 'dialog');
+      return { success: true, id: current.id, repeated, human: true };
+    }
+
+    const needsHuman = supportIssueNeedsManager(cleanMsg);
+    const localReply = needsHuman ? null : localSupportReply(cleanMsg);
+    const ai = localReply
+      ? { action: 'answer', reply: localReply, reason: 'local_knowledge_base' }
+      : needsHuman ? null : await askSupportAi(sessionId, cleanMsg, priorTranscript);
+    if (ai?.action === 'answer') {
+      current = {
+        ...current,
+        category: 'ai_history',
+        status: 'active',
+        answered: true,
+        aiHandled: true,
+        aiError: false,
+        aiLastReply: ai.reply,
+        messages: [...current.messages, supportMessage('ai', ai.reply, new Date().toISOString())],
+        summaryDueAt: new Date(Date.now() + SUPPORT_AI_IDLE_MINUTES * 60 * 1000).toISOString(),
+      };
+      msgs[idx] = current;
+      write(F.support, msgs);
+      return { success: true, id: current.id, repeated, aiReply: ai.reply, ai: true };
+    }
+
+    const handoffReason = needsHuman
+      ? 'Клієнт попросив менеджера або потрібна дія з замовленням'
+      : ai?.reason || 'AI не зміг надійно вирішити запит';
+    current = {
+      ...current,
+      category: 'manager_required',
+      status: 'waiting_manager',
       accepted: false,
       answered: false,
-      handoffReason: needsHuman ? 'Клієнт попросив менеджера' : (ai?.reason || 'Gemini попросив передати менеджеру'),
-      updatedAt: new Date().toISOString(),
+      aiError: !needsHuman && !ai,
+      handoffReason,
+      summary: supportFallbackSummary({ ...current, handoffReason }, true),
+      summaryDueAt: null,
     };
+    if (ai?.reply) current.messages = [...current.messages, supportMessage('ai', ai.reply, new Date().toISOString())];
+    msgs[idx] = current;
     write(F.support, msgs);
-    await notifySupportRequest(msgs[existingIdx], 'handoff');
-    return res.json({
+    await notifySupportRequest(current, 'handoff');
+    return {
       success: true,
       id: current.id,
-      repeated: true,
+      repeated,
       handoff: true,
+      aiError: !needsHuman && !ai,
       aiReply: ai?.reply || 'Передаю питання менеджеру. Він підключиться й допоможе з деталями.',
-    });
-    const ts = new Date(current.timestamp).toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' });
-    if (current.accepted) {
-      await tg(`💬 <b>НОВЕ ПОВІДОМЛЕННЯ В ДІАЛОЗІ #${current.id}</b>\n━━━━━━━━━━━━━━\n🆔 <code>${current.sessionId}</code>\n💬 ${current.message}\n📅 ${ts}`);
-    } else {
-      await tg(
-        `💭 <b>КЛІЄНТ ДОПИСАВ У ЗАПИТ #${current.id}</b>\n━━━━━━━━━━━━━━\n💬 ${current.message}\n📅 ${ts}`,
-        { reply_markup: { inline_keyboard: [[{ text: '✋ Прийняти діалог', callback_data: `accept_${current.sessionId || current.id}` }]] } }
-      );
-    }
-    return res.json({ success: true, id: current.id, repeated: true });
-  }
-
-  const requestedHuman = wantsHumanOperator(cleanMsg);
-  const ai = requestedHuman ? null : await askSupportAi(sessionId, cleanMsg);
-
-  if (ai?.action === 'answer') {
-    const msg = {
-      id: nextId(msgs), message: cleanMsg, sessionId: sessionId || null,
-      timestamp: timestamp || new Date().toISOString(), answered: true, accepted: false,
-      aiHandled: true, aiLastReply: ai.reply,
     };
-    msgs.push(msg); write(F.support, msgs);
-    return res.json({ success: true, id: msg.id, aiReply: ai.reply, ai: true });
-  }
-
-  if (!requestedHuman && !ai) {
-    const msg = {
-      id: nextId(msgs), message: cleanMsg, sessionId: sessionId || null,
-      timestamp: timestamp || new Date().toISOString(), answered: false, accepted: false,
-      aiError: true,
-    };
-    msgs.push(msg); write(F.support, msgs);
-    return res.json({
-      success: true,
-      id: msg.id,
-      aiError: true,
-      aiReply: 'Gemini зараз не відповів. Перевірте GEMINI_API_KEY / GEMINI_MODEL у Render Logs.',
-    });
-  }
-
-  const handoffMsg = {
-    id: nextId(msgs), message: cleanMsg, sessionId: sessionId || null,
-    timestamp: timestamp || new Date().toISOString(), answered: false, accepted: false,
-    handoffReason: requestedHuman ? 'Клієнт попросив менеджера' : (ai?.reason || 'Gemini попросив передати менеджеру'),
-  };
-  msgs.push(handoffMsg); write(F.support, msgs);
-  await notifySupportRequest(handoffMsg, requestedHuman || ai?.action === 'handoff' ? 'handoff' : 'new');
-  return res.json({
-    success: true,
-    id: handoffMsg.id,
-    handoff: true,
-    aiReply: ai?.reply || 'Передаю питання менеджеру. Він підключиться й допоможе з деталями.',
   });
-
-  const msg = {
-    id: nextId(msgs), message: cleanMsg, sessionId: sessionId || null,
-    timestamp: timestamp || new Date().toISOString(), answered: false, accepted: false,
-  };
-  msgs.push(msg); write(F.support, msgs);
-
-  const ts = new Date(msg.timestamp).toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' });
-  await tg(
-    `🎧 <b>ПІДТРИМКА #${msg.id}</b>\n━━━━━━━━━━━━━━\n💬 ${msg.message}\n📅 ${ts}`,
-    { reply_markup: { inline_keyboard: [[{ text: '✋ Прийняти діалог', callback_data: `accept_${sessionId || msg.id}` }]] } }
-  );
-  res.json({ success: true, id: msg.id });
+  res.json(result);
 });
 
-app.get('/api/support',        (_req, res) => res.json(read(F.support)));
-app.patch('/api/support/:id',  (req, res) => {
+app.get('/api/support',        authBot, (_req, res) => res.json(read(F.support)));
+app.patch('/api/support/:id',  authBot, (req, res) => {
   const arr = read(F.support); const idx = arr.findIndex(x => x.id === +req.params.id);
   if (idx < 0) return res.status(404).json({ error: 'Not found' });
   arr[idx] = { ...arr[idx], ...req.body, id: arr[idx].id, updatedAt: new Date().toISOString() };
@@ -4015,5 +4351,5 @@ app.listen(PORT, () => {
   console.log(`🟣 ${SHOP_NAME} → http://localhost:${PORT}`);
   console.log(`🖥️  Landing directory: ${PUBLIC_ROOT}`);
   if (!TG_TOKEN) console.warn('⚠️  TG_TOKEN not set — Telegram disabled');
-  console.log(`🔑 API key: ${API_KEY}`);
+  console.log(`🔑 API key configured: ${API_KEY ? 'yes' : 'no'}`);
 });

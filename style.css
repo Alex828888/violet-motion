@@ -527,6 +527,25 @@ button, input, textarea, select { font: inherit; }
 .quick-order-skip.visible { display: inline-block; }
 .quick-order-send { background: linear-gradient(135deg,#5cff9d,#1fcf74); }
 .quick-order-send:disabled, .quick-order-input:disabled, .quick-order-skip:disabled { opacity: 0.5; cursor: not-allowed; }
+.quick-order-review-actions {
+  align-self: stretch;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 4px;
+}
+.quick-order-review-actions button {
+  min-height: 44px;
+  padding: 9px 12px;
+  border: none;
+  border-radius: 14px;
+  color: #fff;
+  font-weight: 850;
+  cursor: pointer;
+}
+.quick-order-review-confirm { background: linear-gradient(135deg,#5cff9d,#1fcf74); }
+.quick-order-review-edit { background: rgba(255,255,255,0.1); }
+.quick-order-review-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* ── Support ─────────────────────────────────────────────────── */
 .support-fab { position: fixed; right: 20px; bottom: 24px; z-index: 200; width: 56px; height: 56px; border-radius: 50%; background: linear-gradient(135deg, #d799ff, #8a3cff); border: none; cursor: pointer; display: grid; place-items: center; color: #fff; box-shadow: 0 8px 28px rgba(138,60,255,0.45); transition: transform 0.25s ease, box-shadow 0.25s ease; }

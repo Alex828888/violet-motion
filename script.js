@@ -528,6 +528,36 @@ let pendingManualOrderId = null;
 let instantOrderSent     = false;
 let pendingOrderKey      = '';
 
+function createOrderKey() {
+  if (window.crypto?.randomUUID) return `order_${window.crypto.randomUUID()}`;
+  return `order_${Date.now()}_${Math.random().toString(36).slice(2, 12)}`;
+}
+
+function rememberLastOrder(result, payload) {
+  try {
+    sessionStorage.setItem('vm_last_order', JSON.stringify({
+      orderId: result.id,
+      name: payload.fullName || payload.name || '',
+      phone: payload.phone || '',
+      savedAt: new Date().toISOString(),
+    }));
+  } catch {}
+}
+
+function supportCustomerContext() {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem('vm_last_order') || 'null');
+    if (!saved || typeof saved !== 'object') return null;
+    return {
+      orderId: Number(saved.orderId) || null,
+      name: String(saved.name || '').slice(0, 140),
+      phone: String(saved.phone || '').slice(0, 30),
+    };
+  } catch {
+    return null;
+  }
+}
+
 function showSuccessOverlay(order) {
   successDetails.innerHTML =
     `👤 <b>${esc(order.name)}</b><br />📱 <b>${esc(order.phone)}</b><br />👟 Розмір: <b>${esc(order.size)}</b><br />🚚 Доставка: Нова Пошта`;
@@ -615,6 +645,7 @@ async function sendPendingOrder(mode, extra = {}) {
 
   if (mode === 'manual') {
     pendingManualOrderId = result.id;
+    rememberLastOrder(result, payload);
     successOrderSending = false;
     if (orderSuccessSub) {
       orderSuccessSub.innerHTML = 'Заявку передано менеджеру.<br />Можете закрити вікно або оформити одразу.';
@@ -631,6 +662,7 @@ async function sendPendingOrder(mode, extra = {}) {
 
   successOrderSent = true;
   instantOrderSent = true;
+  rememberLastOrder(result, payload);
   pendingManualOrderId = null;
   pendingOrderKey = '';
   fbTrack('Lead', { content_name: 'Violet Motion Order', value: 895, currency: 'UAH' }, { eventId: leadEventId });
@@ -684,9 +716,10 @@ function showQuickError(text = '') {
 function askQuickStep(runId = quickOrderRunId) {
   if (runId !== quickOrderRunId || !quickOrderOverlay.classList.contains('visible')) return;
   const step = quickOrderSteps[quickOrderStep];
-  if (!step) return finishQuickOrder();
-  addQuickMsg(step.prompt);
-  quickOrderInput.value = '';
+  if (!step) return showQuickOrderReview();
+  const existing = String(quickOrderData[step.key] || '');
+  addQuickMsg(existing ? `${step.prompt}\nПоточне значення: ${existing}` : step.prompt);
+  quickOrderInput.value = existing;
   quickOrderInput.disabled = false;
   quickOrderSend.disabled = false;
   quickOrderSkip.disabled = false;
@@ -717,7 +750,7 @@ function closeQuickOrderChat() {
 async function submitQuickAnswer(skip = false) {
   if (quickOrderDone) return;
   const step = quickOrderSteps[quickOrderStep];
-  if (!step) return finishQuickOrder();
+  if (!step) return showQuickOrderReview();
   const value = skip ? '' : quickOrderInput.value.trim();
   if (step.required && !value) {
     return showQuickError('Це поле потрібно заповнити, щоб оформити замовлення.');
@@ -730,19 +763,59 @@ async function submitQuickAnswer(skip = false) {
   setTimeout(() => askQuickStep(runId), 250);
 }
 
-async function finishQuickOrder() {
+function quickOrderReviewText() {
+  const order = pendingOrder || {};
+  const lines = [
+    'Перевірте замовлення перед підтвердженням:',
+    `Ім’я: ${order.name || '—'}`,
+    `Телефон: ${order.phone || '—'}`,
+    `Товар: ${order.product || 'Violet Motion Sneakers'}`,
+    `Розмір: ${order.size || '—'}`,
+    `Колір: ${order.color || '—'}`,
+    `Кількість: ${order.quantity || 1}`,
+    `Отримувач: ${quickOrderData.fullName || '—'}`,
+    `Місто: ${quickOrderData.city || '—'}`,
+    quickOrderData.district ? `Район: ${quickOrderData.district}` : null,
+    `Нова Пошта: ${quickOrderData.postOffice || '—'}`,
+  ];
+  return lines.filter(Boolean).join('\n');
+}
+
+function showQuickOrderReview() {
   quickOrderDone = true;
   quickOrderInput.disabled = true;
   quickOrderSend.disabled = true;
   quickOrderSkip.disabled = true;
   quickOrderSkip.classList.remove('visible');
-  addQuickMsg('Дякуємо. Передаємо повне замовлення і запускаємо автоматичне підтвердження ZVONOK.');
+  addQuickMsg(quickOrderReviewText());
+  const actions = document.createElement('div');
+  actions.className = 'quick-order-review-actions';
+  actions.innerHTML =
+    '<button type="button" class="quick-order-review-confirm">Підтвердити</button>' +
+    '<button type="button" class="quick-order-review-edit">Виправити дані</button>';
+  quickOrderMessages.appendChild(actions);
+  quickOrderMessages.scrollTop = quickOrderMessages.scrollHeight;
+
+  const confirmBtn = actions.querySelector('.quick-order-review-confirm');
+  const editBtn = actions.querySelector('.quick-order-review-edit');
+  confirmBtn.addEventListener('click', () => submitConfirmedQuickOrder(actions));
+  editBtn.addEventListener('click', () => {
+    actions.remove();
+    quickOrderDone = false;
+    quickOrderStep = 0;
+    addQuickMsg('Добре, перевіримо дані ще раз. Змініть потрібне поле або залиште поточне значення.', 'bot');
+    askQuickStep();
+  });
+}
+
+async function submitConfirmedQuickOrder(actions) {
+  const buttons = actions.querySelectorAll('button');
+  buttons.forEach(button => { button.disabled = true; });
+  addQuickMsg('Дані підтверджено. Зберігаємо замовлення та запускаємо автоматичний дзвінок.');
   const sent = await sendPendingOrder('instant', quickOrderData);
   if (!sent) {
-    quickOrderDone = false;
-    quickOrderInput.disabled = false;
-    quickOrderSend.disabled = false;
-    addQuickMsg('Не вдалося надіслати. Перевірте інтернет і натисніть OK ще раз.');
+    buttons.forEach(button => { button.disabled = false; });
+    addQuickMsg('Не вдалося надіслати. Перевірте інтернет і натисніть «Підтвердити» ще раз.');
     return;
   }
   closeQuickOrderChat();
@@ -822,7 +895,7 @@ document.getElementById('orderForm').addEventListener('submit', async e => {
   successOrderSending = false;
   pendingManualOrderId = null;
   instantOrderSent = false;
-  pendingOrderKey = `order_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  pendingOrderKey = createOrderKey();
   pendingOrder.meta = metaBrowserData(checkoutEventId);
   showSuccessOverlay(pendingOrder);
   sendPendingOrder('manual');
@@ -1232,7 +1305,10 @@ async function sendSupportMsg() {
   if (!operatorConnected) showTyping();
 
   const result = await postJSON('/api/support', {
-    message: text, sessionId: SESSION_ID, timestamp: new Date().toISOString(),
+    message: text,
+    sessionId: SESSION_ID,
+    timestamp: new Date().toISOString(),
+    customer: supportCustomerContext(),
   });
 
   sendingSupport = false;
