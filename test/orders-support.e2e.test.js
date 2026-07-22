@@ -43,13 +43,32 @@ async function eventually(check, { timeout = 4_000, interval = 25 } = {}) {
   throw lastError || new Error('Condition was not met');
 }
 
-async function startServer(t, { orders = [], support = [] } = {}) {
+async function startServer(t, { orders = [], support = [], env: envOverrides = {} } = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'violet-server-e2e-'));
   const fastTimerPreload = path.join(dataDir, 'fast-support-timer.cjs');
   fs.writeFileSync(fastTimerPreload, [
     "'use strict';",
     'const nativeSetInterval = global.setInterval;',
     'global.setInterval = (callback, delay, ...args) => nativeSetInterval(callback, Number(delay) === 60000 ? 25 : delay, ...args);',
+    'const nativeFetch = global.fetch;',
+    "if (process.env.E2E_REVERSE_GEMINI === 'true') {",
+    '  let geminiCalls = 0;',
+    '  let releaseGeminiCalls;',
+    '  const bothGeminiCallsStarted = new Promise(resolve => { releaseGeminiCalls = resolve; });',
+    '  global.fetch = async (input, options = {}) => {',
+    "    if (String(input).startsWith('https://generativelanguage.googleapis.com/')) {",
+    "      const body = JSON.parse(options.body || '{}');",
+    "      const message = body.contents?.at(-1)?.parts?.[0]?.text || '';",
+    '      geminiCalls++;',
+    '      if (geminiCalls >= 2) releaseGeminiCalls();',
+    '      await bothGeminiCallsStarted;',
+    "      await new Promise(resolve => setTimeout(resolve, message.includes('slow-alpha') ? 100 : 10));",
+    "      const answer = JSON.stringify({ action: 'answer', reply: `mock:${message}` });",
+    "      return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: answer }] } }] }), { status: 200, headers: { 'content-type': 'application/json' } });",
+    '    }',
+    '    return nativeFetch(input, options);',
+    '  };',
+    '}',
   ].join('\n'), 'utf8');
   const port = await unusedPort();
   const logs = [];
@@ -79,6 +98,7 @@ async function startServer(t, { orders = [], support = [] } = {}) {
       PARTNER_CRM_ALLOW_BACKFILL: 'false',
       PARTNER_CRM_URL: '',
       PARTNER_CRM_API_KEY: 'e2e-partner-key',
+      ...envOverrides,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -159,6 +179,101 @@ function manualOrder(overrides = {}) {
     ...overrides,
   };
 }
+
+test('production static surface exposes only landing assets and protects destructive review routes', async t => {
+  const app = await startServer(t);
+  const blocked = [
+    '/data/orders.json',
+    '/data/support.json',
+    '/server.js',
+    '/bot.js',
+    '/package.json',
+    '/package-lock.json',
+    '/CRM_INTEGRATION.md',
+    '/test/crm-integration.test.js',
+    '/node_modules/express/index.js',
+    '/orders.json',
+  ];
+  for (const pathname of blocked) {
+    const response = await fetch(`${app.base}${pathname}`);
+    assert.equal(response.status, 404, `${pathname} must not be public`);
+  }
+
+  for (const pathname of ['/', '/style.css', '/script.js', '/main.jpg', '/shoes-poster.jpg', '/images/logo.jpg', '/media/shoes-video.mp4']) {
+    const response = await fetch(`${app.base}${pathname}`);
+    assert.equal(response.status, 200, `${pathname} must remain public`);
+    assert.equal(response.headers.has('x-powered-by'), false);
+    assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(response.headers.get('referrer-policy'), 'strict-origin-when-cross-origin');
+  }
+
+  let result = await jsonRequest(app.base, '/api/reviews/1', { method: 'DELETE' });
+  assert.equal(result.response.status, 401);
+  result = await jsonRequest(app.base, '/api/reviews/1', { method: 'DELETE', authorized: true });
+  assert.equal(result.response.status, 404);
+
+  const invalidStream = await fetch(`${app.base}/api/support/stream?sessionId=__proto__`);
+  assert.equal(invalidStream.status, 400);
+  result = await jsonRequest(app.base, '/api/support', {
+    method: 'POST',
+    body: { sessionId: 'constructor', message: 'test' },
+  });
+  assert.equal(result.response.status, 400);
+});
+
+test('corrupt runtime JSON fails closed without erasing data and the process recovers', async t => {
+  const app = await startServer(t);
+  const ordersFile = path.join(app.dataDir, 'orders.json');
+  const corruptContents = '{"incomplete":';
+  fs.writeFileSync(ordersFile, corruptContents, 'utf8');
+
+  let result = await jsonRequest(app.base, '/api/order', {
+    method: 'POST',
+    body: manualOrder({ clientOrderKey: 'corrupt-json-attempt' }),
+  });
+  assert.equal(result.response.status, 500);
+  assert.equal(result.payload.error, 'Internal server error');
+  assert.equal(fs.readFileSync(ordersFile, 'utf8'), corruptContents);
+
+  atomicJson(ordersFile, []);
+  result = await jsonRequest(app.base, '/api/order', {
+    method: 'POST',
+    body: manualOrder({ clientOrderKey: 'after-json-repair' }),
+  });
+  assert.equal(result.response.status, 200);
+  assert.equal(result.payload.success, true);
+  assert.equal(app.read('orders.json').length, 1);
+});
+
+test('public rate limits are isolated per endpoint', async t => {
+  const app = await startServer(t);
+  const ip = '198.51.100.77';
+  let result = await jsonRequest(app.base, '/api/support', {
+    method: 'POST',
+    ip,
+    body: { sessionId: 'rate-limit-session', message: 'Яка ціна?' },
+  });
+  assert.equal(result.response.status, 200);
+
+  for (let index = 0; index < 5; index++) {
+    result = await jsonRequest(app.base, '/api/order', {
+      method: 'POST',
+      ip,
+      body: manualOrder({
+        phone: `+3806700000${String(index).padStart(2, '0')}`,
+        clientOrderKey: `rate-order-${index}`,
+      }),
+    });
+    assert.equal(result.response.status, 200);
+  }
+
+  result = await jsonRequest(app.base, '/api/order', {
+    method: 'POST',
+    ip,
+    body: manualOrder({ phone: '+380670000099', clientOrderKey: 'rate-order-over-limit' }),
+  });
+  assert.equal(result.response.status, 429);
+});
 
 test('public order API deduplicates semantically, upgrades in place, and serializes races', async t => {
   const app = await startServer(t);
@@ -389,6 +504,47 @@ test('support keeps a durable transcript, verified order context, summary, and p
   assert.equal(cancelRecord.status, 'waiting_manager');
 });
 
+test('concurrent AI replies for different support sessions merge without losing either transcript', async t => {
+  const app = await startServer(t, {
+    env: {
+      E2E_REVERSE_GEMINI: 'true',
+      GEMINI_API_KEY: 'e2e-gemini-key',
+      SUPPORT_AI_ENABLED: 'true',
+    },
+  });
+
+  const slow = jsonRequest(app.base, '/api/support', {
+    method: 'POST',
+    body: { sessionId: 'concurrent-alpha', message: 'slow-alpha question' },
+    ip: '192.0.2.40',
+  });
+  const fast = jsonRequest(app.base, '/api/support', {
+    method: 'POST',
+    body: { sessionId: 'concurrent-beta', message: 'fast-beta question' },
+    ip: '192.0.2.41',
+  });
+  const [slowResult, fastResult] = await Promise.all([slow, fast]);
+
+  assert.equal(slowResult.response.status, 200);
+  assert.equal(fastResult.response.status, 200);
+  assert.equal(slowResult.payload.aiReply, 'mock:slow-alpha question');
+  assert.equal(fastResult.payload.aiReply, 'mock:fast-beta question');
+  assert.notEqual(slowResult.payload.id, fastResult.payload.id);
+
+  const records = app.read('support.json');
+  assert.equal(records.length, 2);
+  const alpha = records.find(record => record.sessionId === 'concurrent-alpha');
+  const beta = records.find(record => record.sessionId === 'concurrent-beta');
+  assert.deepEqual(alpha.messages.map(item => [item.role, item.text]), [
+    ['user', 'slow-alpha question'],
+    ['ai', 'mock:slow-alpha question'],
+  ]);
+  assert.deepEqual(beta.messages.map(item => [item.role, item.text]), [
+    ['user', 'fast-beta question'],
+    ['ai', 'mock:fast-beta question'],
+  ]);
+});
+
 test('Universal PATCH status is immediately consistent in orders and CRM statistics', async t => {
   const app = await startServer(t, {
     orders: [{
@@ -474,6 +630,19 @@ test('instant-order frontend requires explicit final confirmation and offers edi
 test('Telegram bot dependency exposes the runtime API used by bot.js', () => {
   const { TelegramBot } = require('node-telegram-bot-api');
   const bot = new TelegramBot('123456:TESTTOKEN', { polling: false });
-  ['onText', 'on', 'sendMessage', 'editMessageText', 'answerCallbackQuery', 'setWebHook', 'processUpdate']
+  ['onText', 'on', 'sendMessage', 'editMessageText', 'answerCallbackQuery', 'setWebhook', 'processUpdate']
     .forEach(method => assert.equal(typeof bot[method], 'function', `${method} must be available`));
+});
+
+test('admin and Telegram configuration fail closed without published fallback secrets', () => {
+  const serverSource = fs.readFileSync(path.join(ROOT, 'server.js'), 'utf8');
+  const botSource = fs.readFileSync(path.join(ROOT, 'bot.js'), 'utf8');
+  assert.match(serverSource, /const API_KEY\s*=\s*String\(process\.env\.API_KEY\s*\|\|\s*['"]['"]\)\.trim\(\)/);
+  assert.match(botSource, /const API_KEY\s*=\s*String\(process\.env\.API_KEY\s*\|\|\s*['"]['"]\)\.trim\(\)/);
+  assert.match(botSource, /if \(!API_KEY\) return \{ error: ['"]Admin API is not configured['"] \}/);
+  assert.match(botSource, /const POWERBANK_PANEL_PASSWORD\s*=\s*String\(process\.env\.POWERBANK_PANEL_PASSWORD\s*\|\|\s*['"]['"]\)\.trim\(\)/);
+  assert.doesNotMatch(botSource, /ADMIN_IDS\.length\s*===\s*0/);
+  assert.match(botSource, /x-telegram-bot-api-secret-token/);
+  assert.match(botSource, /secret_token:\s*BOT_WEBHOOK_SECRET/);
+  assert.doesNotMatch(botSource, /Telegram webhook set:\s*\$\{webhookUrl\}/);
 });

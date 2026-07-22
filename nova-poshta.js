@@ -7,11 +7,13 @@ const NP_MIN_INTERVAL_MS = Math.max(0, Number(process.env.NP_MIN_INTERVAL_MS || 
 const NP_MAX_RETRIES = Math.max(0, Number(process.env.NP_MAX_RETRIES || 3));
 const NP_RETRY_BASE_MS = Math.max(250, Number(process.env.NP_RETRY_BASE_MS || 1200));
 const NP_CACHE_TTL_MS = Math.max(0, Number(process.env.NP_CACHE_TTL_MS || 6 * 60 * 60 * 1000));
+const NP_CACHE_MAX_ENTRIES = Math.max(50, Number(process.env.NP_CACHE_MAX_ENTRIES || 1000));
 const NP_SITE_TRACKING_URL = process.env.NP_SITE_TRACKING_URL || 'https://api.novapost.com/site/v.1.0/shipments/tracking';
 const NP_SITE_TRACKING_ENABLED = process.env.NP_SITE_TRACKING_ENABLED !== 'false';
 const NP_SITE_TRACKING_TIMEOUT_MS = Math.max(1000, Number(process.env.NP_SITE_TRACKING_TIMEOUT_MS || 8000));
 const NP_SITE_TRACKING_CACHE_TTL_MS = Math.max(0, Number(process.env.NP_SITE_TRACKING_CACHE_TTL_MS || 45 * 1000));
 const NP_SITE_TRACKING_MAX_BATCH = Math.max(0, Number(process.env.NP_SITE_TRACKING_MAX_BATCH || 20));
+const NP_SITE_TRACKING_CACHE_MAX_ENTRIES = Math.max(50, Number(process.env.NP_SITE_TRACKING_CACHE_MAX_ENTRIES || 500));
 let novaQueue = Promise.resolve();
 let lastNovaCallAt = 0;
 const cityCache = new Map();
@@ -48,23 +50,37 @@ function cacheGet(map, key) {
   return item.value;
 }
 
+function pruneCache(map, maxEntries, ttlMs) {
+  const now = Date.now();
+  if (ttlMs) {
+    for (const [key, item] of map) {
+      if (now - Number(item?.ts || 0) > ttlMs) map.delete(key);
+    }
+  }
+  while (map.size >= maxEntries) map.delete(map.keys().next().value);
+}
+
 function cacheSet(map, key, value) {
-  if (value) map.set(key, { value, ts: Date.now() });
+  if (value) {
+    pruneCache(map, NP_CACHE_MAX_ENTRIES, NP_CACHE_TTL_MS);
+    map.set(key, { value, ts: Date.now() });
+  }
   return value;
 }
 
 function siteCacheGet(key) {
   const item = siteTrackingCache.get(key);
-  if (!item) return null;
+  if (!item) return { hit: false, value: null };
   if (NP_SITE_TRACKING_CACHE_TTL_MS && Date.now() - item.ts > NP_SITE_TRACKING_CACHE_TTL_MS) {
     siteTrackingCache.delete(key);
-    return null;
+    return { hit: false, value: null };
   }
-  return item.value;
+  return { hit: true, value: item.value };
 }
 
 function siteCacheSet(key, value) {
-  if (value) siteTrackingCache.set(key, { value, ts: Date.now() });
+  pruneCache(siteTrackingCache, NP_SITE_TRACKING_CACHE_MAX_ENTRIES, NP_SITE_TRACKING_CACHE_TTL_MS);
+  siteTrackingCache.set(key, { value, ts: Date.now() });
   return value;
 }
 
@@ -943,7 +959,7 @@ async function getPublicTracking(documentNumber) {
   const ttn = String(documentNumber || '').replace(/\s+/g, '').trim();
   if (!ttn) return null;
   const cached = siteCacheGet(ttn);
-  if (cached) return cached;
+  if (cached.hit) return cached.value;
   const ctrl = new AbortController();
   const timeout = setTimeout(() => ctrl.abort(), NP_SITE_TRACKING_TIMEOUT_MS);
   try {

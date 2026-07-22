@@ -3,3 +3,19 @@ node_modules/
 .env
 .env.*
 !.env*.example
+
+# Runtime data lives on the persistent production disk and must never enter Git.
+/orders.json
+/reviews.json
+/support.json
+/data/analytics.json
+/data/arbitrator.json
+/data/crm-sync.json
+/data/crm-sync.json.bak
+/data/finance.json
+/data/np-afterpayments.json
+/data/order-notify.json
+/data/orders.json
+/data/reviews.json
+/data/support.json
+/data/*.tmp

@@ -14,6 +14,7 @@ PARTNER_CRM_API_KEY=<общий длинный секретный ключ>
 PARTNER_CRM_URL=https://www.to-pcrm.com/api/integrations/violet-motion/bridge
 PARTNER_CRM_AUTO_SYNC=true
 PARTNER_CRM_ALLOW_BACKFILL=false
+PARTNER_CRM_ALLOW_INBOUND_DELETE=false
 PARTNER_CRM_SYNC_INTERVAL_MINUTES=5
 PARTNER_CRM_TIMEOUT_MS=15000
 ```
@@ -22,14 +23,18 @@ PARTNER_CRM_TIMEOUT_MS=15000
 
 `PARTNER_CRM_ALLOW_BACKFILL` по умолчанию выключен. Startup/cron сверяет и обновляет только уже связанные заказы; отсутствующие исторические строки не импортируются, не экспортируются и не удаляются автоматически. Новые события продолжают идти через обычные bridge/batch/outbox маршруты. Включать backfill можно только отдельным осознанным решением после аудита данных.
 
+`PARTNER_CRM_ALLOW_INBOUND_DELETE` по умолчанию выключен. Universal CRM может обновлять связанные заказы, но не может удалять их в Violet Motion. Включать удаление разрешается только после отдельного согласования и production-теста tombstone-защиты.
+
 Для закрытых admin API сервера и Telegram-бота отдельно задаётся одинаковый `API_KEY`:
 
 ```env
 API_KEY=<другой длинный случайный ключ>
+BOT_WEBHOOK_SECRET=<отдельный длинный случайный ключ для Telegram webhook>
+POWERBANK_PANEL_PASSWORD=<отдельный пароль приватной панели>
 ```
 
 После смены `API_KEY` его нужно одновременно обновить у web service и процесса Telegram-бота.
-Новый ключ для этого деплоя сгенерирован локально в `.env.admin.local`; файл игнорируется Git и не должен загружаться в репозиторий.
+Секреты задаются только в Environment соответствующих сервисов Render и не должны загружаться в репозиторий или выводиться в логи.
 
 ## Что синхронизируется
 

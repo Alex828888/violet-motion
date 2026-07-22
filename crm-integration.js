@@ -100,15 +100,18 @@ function createCrmIntegration({
   logger = console,
   stateWriter = null,
 }) {
+  const asyncHandler = handler => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
   const apiKey = String(process.env.PARTNER_CRM_API_KEY || '').trim();
   const partnerUrl = String(process.env.PARTNER_CRM_URL || '').trim();
   const autoSync = process.env.PARTNER_CRM_AUTO_SYNC !== 'false';
   const allowBackfill = process.env.PARTNER_CRM_ALLOW_BACKFILL === 'true';
+  const allowInboundDelete = process.env.PARTNER_CRM_ALLOW_INBOUND_DELETE === 'true';
   const intervalMinutes = Math.max(1, Number(process.env.PARTNER_CRM_SYNC_INTERVAL_MINUTES || 5));
   const requestTimeoutMs = Math.max(3000, Number(process.env.PARTNER_CRM_TIMEOUT_MS || 15000));
   let flushTimer = null;
   let flushPromise = null;
   let fullSyncPromise = null;
+  let lastValidStateRaw = null;
 
   function emptyState() {
     return {
@@ -128,11 +131,14 @@ function createCrmIntegration({
     };
   }
 
-  function readState() {
-    try {
-      const parsed = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-      if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') return emptyState();
-      return {
+  function normalizeState(parsed) {
+    if (Array.isArray(parsed) && parsed.length === 0) return emptyState();
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+      const error = new Error('CRM sync state has an invalid shape');
+      error.code = 'CRM_STATE_INVALID';
+      throw error;
+    }
+    return {
         ...emptyState(),
         ...parsed,
         version: 3,
@@ -143,18 +149,51 @@ function createCrmIntegration({
         quarantine: Array.isArray(parsed.quarantine) ? parsed.quarantine : [],
         idempotency: Array.isArray(parsed.idempotency) ? parsed.idempotency : [],
         syncErrors: Array.isArray(parsed.syncErrors) ? parsed.syncErrors : [],
-      };
-    } catch {
-      return emptyState();
+    };
+  }
+
+  function readState() {
+    try {
+      const raw = fs.readFileSync(stateFile, 'utf8');
+      const state = normalizeState(JSON.parse(raw));
+      lastValidStateRaw = JSON.stringify(state);
+      return state;
+    } catch (error) {
+      if (error?.code === 'ENOENT') return emptyState();
+      if (lastValidStateRaw != null) return normalizeState(JSON.parse(lastValidStateRaw));
+      try {
+        const backupRaw = fs.readFileSync(`${stateFile}.bak`, 'utf8');
+        const backup = normalizeState(JSON.parse(backupRaw));
+        lastValidStateRaw = JSON.stringify(backup);
+        logger.error('[CRM state] primary state is unreadable; using validated backup');
+        return backup;
+      } catch {
+        const stateError = new Error('CRM sync state is unreadable and no valid backup is available');
+        stateError.code = 'CRM_STATE_UNREADABLE';
+        throw stateError;
+      }
     }
   }
 
   function writeState(state) {
-    if (typeof stateWriter === 'function') return stateWriter(state);
+    if (typeof stateWriter === 'function') {
+      const result = stateWriter(state);
+      lastValidStateRaw = JSON.stringify(state);
+      return result;
+    }
     const tmp = `${stateFile}.tmp`;
+    const backup = `${stateFile}.bak`;
     fs.mkdirSync(path.dirname(stateFile), { recursive: true });
-    fs.writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
+    if (fs.existsSync(stateFile)) {
+      try {
+        normalizeState(JSON.parse(fs.readFileSync(stateFile, 'utf8')));
+        fs.copyFileSync(stateFile, backup);
+      } catch {}
+    }
+    const raw = JSON.stringify(state, null, 2);
+    fs.writeFileSync(tmp, raw, 'utf8');
     fs.renameSync(tmp, stateFile);
+    lastValidStateRaw = JSON.stringify(state);
   }
 
   function safeError(error, fallbackCode = 'SYNC_ERROR') {
@@ -915,11 +954,15 @@ function createCrmIntegration({
     const results = Array.isArray(data?.results)
       ? data.results
       : (Array.isArray(data?.events) ? data.events : (Array.isArray(data?.outcomes) ? data.outcomes : null));
-    if (!results) return new Map(due.map(item => [item.eventId, { ok: true, error: null }]));
+    if (!results) return new Map(due.map(item => [item.eventId, {
+      ok: false,
+      error: 'Partner response did not include per-event acknowledgements',
+      code: 'EVENT_ACKS_MISSING',
+      partnerResponse: data,
+    }]));
     const byId = new Map();
-    results.forEach((result, index) => {
-      const fallback = results.length === due.length ? due[index]?.eventId : '';
-      const eventId = safeString(result?.eventId || result?.id || fallback, 100);
+    results.forEach(result => {
+      const eventId = safeString(result?.eventId || result?.id, 100);
       if (!eventId) return;
       const status = safeString(result?.status, 40).toLowerCase();
       const ok = result?.ok !== false
@@ -1210,8 +1253,8 @@ function createCrmIntegration({
       try {
         if (!remote || typeof remote !== 'object') throw validationError('Remote order must be an object', 'REMOTE_INVALID_PAYLOAD');
         if (remoteIsDelete(remote)) {
-          if (!allowDeletes) {
-            results.push({ ...identity, ok: true, action: 'delete_skipped_no_backfill' });
+          if (!allowDeletes || !allowInboundDelete) {
+            results.push({ ...identity, ok: true, action: 'delete_skipped_disabled' });
             continue;
           }
           const deletion = deleteRemoteOrder(remote, remote.externalId, 'partner_delete');
@@ -1416,6 +1459,7 @@ function createCrmIntegration({
       outboundConfigured: !!partnerUrl,
       autoSync,
       allowBackfill,
+      allowInboundDelete,
       pending: state.pending.length,
       failed: failed.length,
       deadLetter: state.deadLetter.length,
@@ -1497,6 +1541,10 @@ function createCrmIntegration({
     let quarantined = 0;
     for (const item of items) {
       const identity = remoteIdentity(item, item?.externalId);
+      if (remoteIsDelete(item) && !allowInboundDelete) {
+        results.push({ ...identity, ok: false, code: 'INBOUND_DELETE_DISABLED' });
+        continue;
+      }
       try {
         const result = remoteIsDelete(item)
           ? deleteRemoteOrder(item, item.externalId, 'partner_batch_delete')
@@ -1566,6 +1614,9 @@ function createCrmIntegration({
     }
   });
   app.delete('/api/integration/v1/orders/:externalId', authPartner, (req, res) => {
+    if (!allowInboundDelete) {
+      return res.status(403).json({ ok: false, deleted: false, error: 'inbound_delete_disabled' });
+    }
     try {
       const result = deleteRemoteOrder(req.body || {}, req.params.externalId, 'partner_api_delete');
       res.json({ ok: true, ...result });
@@ -1627,7 +1678,7 @@ function createCrmIntegration({
     if (retryable.length) scheduleFlush(100);
     res.json({ ok: true, retried: retryable.length, pending: state.pending.length, deadLetter: state.deadLetter.length });
   });
-  app.post('/api/admin/crm-sync/run', adminAuth, async (req, res) => {
+  app.post('/api/admin/crm-sync/run', adminAuth, asyncHandler(async (req, res) => {
     try {
       res.json(await runFullSync({ forcePending: req.body?.forcePending === true }));
     } catch (error) {
@@ -1636,7 +1687,7 @@ function createCrmIntegration({
       writeState(state);
       res.status(502).json({ error: safeErrorMessage(error.message), status: statusPayload() });
     }
-  });
+  }));
 
   if (autoSync && partnerUrl) {
     const startup = setTimeout(() => runFullSync().catch(error => logger.error('[CRM sync startup]', safeErrorMessage(error.message))), 20000);

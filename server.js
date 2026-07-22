@@ -20,6 +20,7 @@ const crypto  = require('crypto');
 const novaPoshta = require('./nova-poshta');
 const monobank = require('./monobank');
 const { createCrmIntegration } = require('./crm-integration');
+const { changedNpFields, mergeNovaPoshtaOrders } = require('./np-order-merge');
 
 const app        = express();
 const PORT       = process.env.PORT       || 3000;
@@ -29,7 +30,7 @@ const ZAPUSK_TG_TOKEN = process.env.ZAPUSK_TG_TOKEN || '';
 const ZAPUSK_TG_CHAT_ID = process.env.ZAPUSK_TG_CHAT_ID || '';
 const TG_EXTRA_ADMIN_IDS = '7996143460';
 const TG_ADMIN_IDS = [process.env.ADMIN_IDS, TG_EXTRA_ADMIN_IDS].filter(Boolean).join(',');
-const API_KEY    = process.env.API_KEY    || 'violet-secret';
+const API_KEY    = String(process.env.API_KEY || '').trim();
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const SUPPORT_AI_ENABLED = process.env.SUPPORT_AI_ENABLED !== 'false';
@@ -59,6 +60,7 @@ const PRODUCT_OLD_PRICE = process.env.PRODUCT_OLD_PRICE || '1899';
 const META_PIXEL_ID = process.env.META_PIXEL_ID || '2110562173060470';
 const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN || '';
 const META_TEST_EVENT_CODE = process.env.META_TEST_EVENT_CODE || '';
+const TG_REQUEST_TIMEOUT_MS = Math.max(1000, Number(process.env.TG_REQUEST_TIMEOUT_MS || 10000));
 const npCreateLocks = new Map();
 const npSyncState = {
   current: null,
@@ -102,12 +104,18 @@ for (const [name, file] of Object.entries(F)) {
 console.log(`💾 Data directory: ${DATA}`);
 
 function read(file) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
-  catch { return []; }
+  try {
+    const raw = fs.readFileSync(file, 'utf8');
+    return JSON.parse(raw);
+  } catch (error) {
+    console.error(`[data] failed to read ${path.basename(file)}: ${error.code || error.message}`);
+    throw error;
+  }
 }
 function write(file, data) {
   const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
+  const raw = JSON.stringify(data, null, 2);
+  fs.writeFileSync(tmp, raw, 'utf8');
   fs.renameSync(tmp, file);
 }
 let crmIntegration = null;
@@ -131,6 +139,35 @@ async function withOrderMutationLock(task) {
   await previous;
   try { return await task(); }
   finally { release(); }
+}
+
+async function persistNovaPoshtaOrderChanges(baseOrders = [], computedOrders = []) {
+  const baseById = new Map(baseOrders.map(order => [String(order.id), order]));
+  const changes = computedOrders.flatMap(computed => {
+    const base = baseById.get(String(computed?.id ?? ''));
+    return base && changedNpFields(base, computed).length ? [{ base, computed }] : [];
+  });
+  if (!changes.length) {
+    const latest = read(F.orders);
+    return {
+      changed: 0,
+      conflicts: [],
+      missingIds: [],
+      ordersById: new Map(latest.map(order => [String(order.id), order])),
+    };
+  }
+
+  return withOrderMutationLock(async () => {
+    const latest = read(F.orders);
+    const merged = mergeNovaPoshtaOrders(latest, changes);
+    if (merged.changedOrderIds.length) writeOrders(merged.orders);
+    return {
+      changed: merged.changedOrderIds.length,
+      conflicts: merged.conflicts,
+      missingIds: merged.missingIds,
+      ordersById: new Map(merged.orders.map(order => [String(order.id), order])),
+    };
+  });
 }
 
 function normalizeOrderPhone(value) {
@@ -262,9 +299,11 @@ function mergeLegacyFileIfDataEmpty(key) {
 
 /* ── Rate limiter ──────────────────────────────────────────── */
 const rateLimits = new Map();
+let nextRateLimitScope = 1;
 function rateLimit(windowMs, max) {
+  const scope = nextRateLimitScope++;
   return (req, res, next) => {
-    const key  = req.ip || 'unknown';
+    const key  = `${scope}:${req.ip || 'unknown'}`;
     const now  = Date.now();
     const data = rateLimits.get(key) || { count: 0, start: now };
     if (now - data.start > windowMs) { data.count = 0; data.start = now; }
@@ -278,7 +317,7 @@ setInterval(() => {
   const now = Date.now();
   for (const [k, v] of rateLimits.entries())
     if (now - v.start > 10 * 60 * 1000) rateLimits.delete(k);
-}, 10 * 60 * 1000);
+}, 10 * 60 * 1000).unref?.();
 
 /* ── Telegram ──────────────────────────────────────────────── */
 async function tg(text, extra = {}) {
@@ -293,48 +332,47 @@ async function tg(text, extra = {}) {
   return { ok: results.some(r => r?.ok), result: results };
 }
 
-async function tgTo(chatId, text, extra = {}) {
-  if (!TG_TOKEN || !chatId) return null;
+async function telegramPost(token, method, body, label) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TG_REQUEST_TIMEOUT_MS);
   try {
-    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+    const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', ...extra }),
+      body: JSON.stringify(body),
+      signal: controller.signal,
     });
-    return await r.json();
-  } catch (e) { console.error('[TG]', e.message); return null; }
+    const data = await response.json().catch(() => null);
+    if (!response.ok) console.error(`[${label}] HTTP ${response.status}`);
+    return data;
+  } catch (error) {
+    console.error(`[${label}]`, error.name === 'AbortError' ? 'timeout' : error.message);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function tgTo(chatId, text, extra = {}) {
+  if (!TG_TOKEN || !chatId) return null;
+  return telegramPost(TG_TOKEN, 'sendMessage', { chat_id: chatId, text, parse_mode: 'HTML', ...extra }, 'TG');
 }
 
 async function sendZapuskTelegram(text) {
   if (!ZAPUSK_TG_TOKEN || !ZAPUSK_TG_CHAT_ID) return { ok: false, missingConfig: true };
-  try {
-    const r = await fetch(`https://api.telegram.org/bot${ZAPUSK_TG_TOKEN}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: ZAPUSK_TG_CHAT_ID,
-        text,
-        parse_mode: 'HTML',
-        disable_web_page_preview: true,
-      }),
-    });
-    return await r.json();
-  } catch (e) {
-    console.error('[ZAPUSK TG]', e.message);
-    return { ok: false };
-  }
+  return (await telegramPost(ZAPUSK_TG_TOKEN, 'sendMessage', {
+    chat_id: ZAPUSK_TG_CHAT_ID,
+    text,
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+  }, 'ZAPUSK TG')) || { ok: false };
 }
 
 async function tgEdit(chatId, messageId, text, extra = {}) {
   if (!TG_TOKEN || !chatId || !messageId) return null;
-  try {
-    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/editMessageText`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, message_id: messageId, text, parse_mode: 'HTML', ...extra }),
-    });
-    return await r.json();
-  } catch (e) { console.error('[TG edit]', e.message); return null; }
+  return telegramPost(TG_TOKEN, 'editMessageText', {
+    chat_id: chatId, message_id: messageId, text, parse_mode: 'HTML', ...extra,
+  }, 'TG edit');
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -342,18 +380,24 @@ async function tgEdit(chatId, messageId, text, extra = {}) {
    Fix: When operator replies but client SSE is disconnected,
    messages are queued. On reconnect they're flushed immediately.
 ══════════════════════════════════════════════════════════════ */
-const sessions        = {};  // sessionId → { res, accepted, managerId }
-const pendingMessages = {};  // sessionId → [event objects]
+const sessions        = Object.create(null);  // sessionId → { res, accepted, managerId }
+const pendingMessages = Object.create(null);  // sessionId → [event objects]
 const MAX_QUEUE       = 50;
+const SUPPORT_SESSION_TTL_MS = Math.max(60 * 60 * 1000, Number(process.env.SUPPORT_SESSION_TTL_MS || 24 * 60 * 60 * 1000));
 
 function getSession(id) {
-  if (!sessions[id]) sessions[id] = { res: null, accepted: false, managerId: null };
-  return sessions[id];
+  const key = supportSessionKey(id);
+  if (!key) return null;
+  if (!sessions[key]) sessions[key] = { res: null, accepted: false, managerId: null, lastActivityAt: Date.now() };
+  sessions[key].lastActivityAt = Date.now();
+  return sessions[key];
 }
 
 /** Write to SSE stream. If disconnected, queue the message. */
 function sseWrite(sessionId, data) {
-  const s = sessions[sessionId];
+  const key = supportSessionKey(sessionId);
+  const s = getSession(key);
+  if (!s) return false;
   if (s?.res) {
     try {
       s.res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -361,36 +405,64 @@ function sseWrite(sessionId, data) {
     } catch {}
   }
   // Connection not available — queue
-  if (!pendingMessages[sessionId]) pendingMessages[sessionId] = [];
-  pendingMessages[sessionId].push(data);
-  if (pendingMessages[sessionId].length > MAX_QUEUE)
-    pendingMessages[sessionId].shift();
+  if (!pendingMessages[key]) pendingMessages[key] = [];
+  pendingMessages[key].push(data);
+  if (pendingMessages[key].length > MAX_QUEUE)
+    pendingMessages[key].shift();
+  return true;
 }
 
 /** Flush queued messages to a newly connected SSE client. */
 function flushQueue(sessionId) {
-  const msgs = pendingMessages[sessionId];
+  const key = supportSessionKey(sessionId);
+  if (!key) return;
+  const msgs = pendingMessages[key];
   if (!msgs || !msgs.length) return;
-  const s = sessions[sessionId];
+  const s = sessions[key];
   if (!s?.res) return;
   msgs.forEach(data => {
     try { s.res.write(`data: ${JSON.stringify(data)}\n\n`); } catch {}
   });
-  pendingMessages[sessionId] = [];
+  pendingMessages[key] = [];
 }
+
+setInterval(() => {
+  const cutoff = Date.now() - SUPPORT_SESSION_TTL_MS;
+  for (const id of new Set([...Object.keys(sessions), ...Object.keys(pendingMessages)])) {
+    const session = sessions[id];
+    if (session?.res || Number(session?.lastActivityAt || 0) > cutoff) continue;
+    delete sessions[id];
+    delete pendingMessages[id];
+    delete supportAiHistory[id];
+    delete supportAiUsage[id];
+  }
+}, 10 * 60 * 1000).unref?.();
 
 /* ── Middleware ────────────────────────────────────────────── */
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
+app.disable('x-powered-by');
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  next();
+});
+
+function asyncRoute(handler) {
+  return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+}
 
 /* ── Static files ──────────────────────────────────────────── */
 app.get('/style.css',  (_req, res) => { res.type('text/css'); res.sendFile(path.join(PUBLIC_ROOT, 'style.css')); });
 app.get('/script.js',  (_req, res) => { res.type('application/javascript'); res.sendFile(path.join(PUBLIC_ROOT, 'script.js')); });
 app.get('/favicon.ico', (_req, res) => res.status(204).end());
 
-app.use(express.static(PUBLIC_ROOT, {
-  extensions: false, fallthrough: true,
+const publicStaticOptions = {
+  dotfiles: 'deny',
+  extensions: false,
+  fallthrough: true,
   setHeaders: (res, filePath) => {
     const ext = path.extname(filePath).toLowerCase();
     if (ext === '.css')  res.setHeader('Content-Type', 'text/css; charset=utf-8');
@@ -398,12 +470,27 @@ app.use(express.static(PUBLIC_ROOT, {
     if (ext === '.json') res.setHeader('Content-Type', 'application/json; charset=utf-8');
     if (ext === '.html') res.setHeader('Content-Type', 'text/html; charset=utf-8');
   },
-}));
+};
+const rootPublicAssets = [
+  'main.jpg', 'side.jpg', 'back.jpg', 'top.jpg', 'shoes-poster.jpg', 'shoes-video-optimized.mp4',
+];
+app.get(rootPublicAssets.map(file => `/${file}`), (req, res) => {
+  res.sendFile(path.join(PUBLIC_ROOT, path.basename(req.path)));
+});
+app.use('/images', express.static(path.join(PUBLIC_ROOT, 'images'), publicStaticOptions));
+app.use('/media', express.static(path.join(PUBLIC_ROOT, 'media'), publicStaticOptions));
 
 /* ── Auth ──────────────────────────────────────────────────── */
 function authBot(req, res, next) {
-  if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  if (!API_KEY) return res.status(503).json({ error: 'Admin API is not configured' });
+  if (!secretEqual(req.headers['x-api-key'], API_KEY)) return res.status(401).json({ error: 'Unauthorized' });
   next();
+}
+
+function secretEqual(supplied, expected) {
+  const left = Buffer.from(String(supplied || ''));
+  const right = Buffer.from(String(expected || ''));
+  return left.length > 0 && left.length === right.length && crypto.timingSafeEqual(left, right);
 }
 
 crmIntegration = createCrmIntegration({
@@ -2142,6 +2229,7 @@ async function linkManualNovaPoshtaTtn(order, orders = read(F.orders)) {
 async function syncOpenNovaPoshtaOrders(limit = 100, options = {}) {
   const startedAt = Date.now();
   const orders = read(F.orders);
+  const baseOrders = orders.slice();
   let changed = 0;
   const errors = [];
   const safeLimit = parseSyncLimit(limit);
@@ -2246,7 +2334,16 @@ async function syncOpenNovaPoshtaOrders(limit = 100, options = {}) {
     : { checked: 0, changed: 0, errors: [], found: 0 };
   changed += returnSync.changed;
   errors.push(...returnSync.errors);
-  if (changed) writeOrders(orders);
+  if (changed) {
+    const persisted = await persistNovaPoshtaOrderChanges(baseOrders, orders);
+    changed = persisted.changed;
+    for (const conflict of persisted.conflicts) {
+      errors.push({ step: 'concurrent-merge', orderId: conflict.id, fields: conflict.fields });
+    }
+    for (const missingId of persisted.missingIds) {
+      errors.push({ step: 'concurrent-delete', orderId: missingId });
+    }
+  }
   return {
     checked: candidates.length,
     candidatePool: candidatePool.length,
@@ -2402,7 +2499,9 @@ function orderQueueNoticeText(latestOrder = null) {
   return text;
 }
 
-async function updateOrderQueueNotice(latestOrder = null) {
+let orderQueueNoticeTail = Promise.resolve();
+
+async function sendOrderQueueNotice(latestOrder = null) {
   if (!TG_TOKEN || !TG_CHAT_ID) return null;
   const state = read(F.orderNotify);
   const messageId = state && !Array.isArray(state) ? state.messageId : null;
@@ -2428,8 +2527,14 @@ async function updateOrderQueueNotice(latestOrder = null) {
   return sent;
 }
 
-const supportAiHistory = {};
-const supportAiUsage = {};
+function updateOrderQueueNotice(latestOrder = null) {
+  const task = orderQueueNoticeTail.then(() => sendOrderQueueNotice(latestOrder));
+  orderQueueNoticeTail = task.catch(() => {});
+  return task;
+}
+
+const supportAiHistory = Object.create(null);
+const supportAiUsage = Object.create(null);
 const supportSessionLocks = new Map();
 const SUPPORT_SIZE_CHART = {
   36: '23 см',
@@ -2469,7 +2574,9 @@ Return only compact JSON:
 `;
 
 function supportSessionKey(sessionId, fallbackId = null) {
-  return String(sessionId || fallbackId || '').trim();
+  const value = String(sessionId || fallbackId || '').trim();
+  if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(value)) return '';
+  return ['__proto__', 'prototype', 'constructor'].includes(value.toLowerCase()) ? '' : value;
 }
 
 async function withSupportSessionLock(sessionId, task) {
@@ -2484,6 +2591,18 @@ async function withSupportSessionLock(sessionId, task) {
     release();
     if (supportSessionLocks.get(key) === current) supportSessionLocks.delete(key);
   }
+}
+
+// Different support sessions still share one JSON file. Keep its read/modify/write
+// sections serialized, but never hold this lock while waiting for AI or Telegram.
+let supportMutationTail = Promise.resolve();
+async function withSupportMutationLock(task) {
+  const previous = supportMutationTail;
+  let release;
+  supportMutationTail = new Promise(resolve => { release = resolve; });
+  await previous;
+  try { return await task(); }
+  finally { release(); }
 }
 
 function supportRecordIsOpen(record) {
@@ -2868,7 +2987,7 @@ function getRequestBaseUrl(req) {
 }
 
 function buildZvonokWebhookUrl(req, order, button) {
-  const base = getRequestBaseUrl(req);
+  const base = APP_PUBLIC_URL || getRequestBaseUrl(req);
   if (!base) return '';
   const url = new URL('/api/zvonok/ivr', base);
   url.searchParams.set('orderId', order.id);
@@ -2878,8 +2997,8 @@ function buildZvonokWebhookUrl(req, order, button) {
 }
 
 async function startZvonokCall(order, req) {
-  if (!ZVONOK_API_KEY || !ZVONOK_CAMPAIGN_ID) {
-    console.warn('[Zvonok] skipped: ZVONOK_API_KEY or ZVONOK_CAMPAIGN_ID is not set');
+  if (!ZVONOK_API_KEY || !ZVONOK_CAMPAIGN_ID || !ZVONOK_WEBHOOK_SECRET) {
+    console.warn('[Zvonok] skipped: API, campaign, or webhook authentication is not configured');
     return null;
   }
 
@@ -2907,8 +3026,8 @@ async function startZvonokCall(order, req) {
     const text = await response.text();
     let data = text;
     try { data = JSON.parse(text); } catch {}
-    console.log(`[Zvonok] order #${order.id} call start: ${response.status}`, data);
-    return { ok: response.ok, status: response.status, data };
+    console.log(`[Zvonok] order #${order.id} call start: ${response.status}`);
+    return { ok: response.ok, status: response.status };
   } catch (e) {
     console.error(`[Zvonok] order #${order.id} call start failed:`, e.message);
     return null;
@@ -2971,12 +3090,16 @@ app.post('/api/analytics', rateLimit(60 * 1000, 30), (req, res) => {
   const ip       = req.ip || 'unknown';
   const now      = new Date().toISOString();
 
-  events.forEach(ev => {
+  events.slice(0, 100).forEach(ev => {
     if (!ev.event || !ev.sessionId) return;
+    const suppliedTime = new Date(ev.timestamp || now).getTime();
+    const eventTime = Number.isFinite(suppliedTime) && suppliedTime <= Date.now() + 5 * 60 * 1000
+      ? new Date(suppliedTime).toISOString()
+      : now;
     existing.push({
       event:     String(ev.event).slice(0, 50),
       sessionId: String(ev.sessionId).slice(0, 60),
-      timestamp: ev.timestamp || now,
+      timestamp: eventTime,
       data:      ev.data || {},
       referrer:  String(ev.referrer || '').slice(0, 200),
       ua:        String(ua || '').slice(0, 200),
@@ -2986,7 +3109,7 @@ app.post('/api/analytics', rateLimit(60 * 1000, 30), (req, res) => {
 
   // Prune entries older than 7 days
   const cutoff = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
-  const pruned = existing.filter(e => (e.timestamp || '') >= cutoff);
+  const pruned = existing.filter(e => (e.timestamp || '') >= cutoff).slice(-50000);
 
   write(F.analytics, pruned);
   res.json({ success: true });
@@ -3006,13 +3129,13 @@ app.get('/api/analytics/summary', authBot, (req, res) => {
   const filtered = all.filter(e => new Date(e.timestamp).getTime() >= cutoff);
 
   // Session stats — exclude likely-admin sessions (duration > 7200s)
-  const sessionMap = {};
+  const sessionMap = Object.create(null);
   filtered.forEach(ev => {
     if (!sessionMap[ev.sessionId]) sessionMap[ev.sessionId] = { events: [], ip: ev.ip };
     sessionMap[ev.sessionId].events.push(ev);
   });
 
-  const ipCounts = {};
+  const ipCounts = Object.create(null);
   filtered.forEach(ev => { ipCounts[ev.ip] = (ipCounts[ev.ip] || 0) + 1; });
   const hotIps = new Set(Object.entries(ipCounts).filter(([,c]) => c > 80).map(([ip]) => ip));
 
@@ -3039,7 +3162,7 @@ app.get('/api/analytics/summary', authBot, (req, res) => {
   });
 
   // Button clicks
-  const buttonClicks = {};
+  const buttonClicks = Object.create(null);
   filtered.filter(e => e.event === 'button_click').forEach(e => {
     const label = e.data?.label || 'unknown';
     buttonClicks[label] = (buttonClicks[label] || 0) + 1;
@@ -3090,7 +3213,7 @@ app.get('/api/analytics', authBot, (_req, res) => res.json(read(F.analytics)));
 /* ═══════════════════════════════════════════════════════════
    ADMIN API (BOT)
 ═══════════════════════════════════════════════════════════ */
-app.get('/api/admin/np/find-by-phone', authBot, async (req, res) => {
+app.get('/api/admin/np/find-by-phone', authBot, asyncRoute(async (req, res) => {
   const phone = sanitizeStr(req.query.phone || req.query.q, 40);
   const normalizedPhone = novaPoshta.normalizePhone(phone);
   if (!normalizedPhone || normalizedPhone.length < 7) return res.status(400).json({ error: 'Invalid phone' });
@@ -3143,7 +3266,7 @@ app.get('/api/admin/np/find-by-phone', authBot, async (req, res) => {
   } catch (error) {
     res.status(502).json(npErrorPayload(error));
   }
-});
+}));
 app.get('/api/admin/orders',       authBot, (_req, res) => res.json(read(F.orders)));
 app.get('/api/admin/orders/:id',   authBot, (req, res) => {
   const order = read(F.orders).find(x => x.id === Number(req.params.id));
@@ -3493,14 +3616,13 @@ app.post('/api/admin/np/settlements/resolve', authBot, async (req, res) => {
     res.status(502).json(npErrorPayload(error));
   }
 });
-app.post('/api/admin/orders/:id/np/create', authBot, async (req, res) => {
+app.post('/api/admin/orders/:id/np/create', authBot, asyncRoute(async (req, res) => {
   const id = Number(req.params.id);
   const orders = read(F.orders);
   const idx = orders.findIndex(x => x.id === id);
   if (idx < 0) return res.status(404).json({ error: 'Not found' });
   const bodyPatch = req.body && typeof req.body === 'object' ? { ...req.body } : {};
   delete bodyPatch.force;
-  const order = { ...orders[idx], ...bodyPatch };
   if (orders[idx].ttn && !req.body?.force) return res.json({ success: true, duplicate: true, order: orders[idx], ttn: orders[idx].ttn });
   const lockKey = String(id);
   if (npCreateLocks.has(lockKey)) {
@@ -3515,33 +3637,36 @@ app.post('/api/admin/orders/:id/np/create', authBot, async (req, res) => {
   try {
     const latestOrders = read(F.orders);
     const latestIdx = latestOrders.findIndex(x => x.id === id);
-    if (latestIdx >= 0 && latestOrders[latestIdx].ttn && !req.body?.force) {
-      return res.json({ success: true, duplicate: true, order: latestOrders[latestIdx], ttn: latestOrders[latestIdx].ttn });
+    if (latestIdx < 0) return res.status(404).json({ error: 'Not found' });
+    const baseOrder = latestOrders[latestIdx];
+    if (baseOrder.ttn && !req.body?.force) {
+      return res.json({ success: true, duplicate: true, order: baseOrder, ttn: baseOrder.ttn });
     }
+    const order = { ...baseOrder, ...bodyPatch };
     const created = await novaPoshta.createInternetDocument(order);
     const now = new Date().toISOString();
-    const previousTtn = String(orders[idx].ttn || '').trim();
-    const ttnHistory = Array.isArray(orders[idx].ttnHistory) ? [...orders[idx].ttnHistory] : [];
+    const previousTtn = String(baseOrder.ttn || '').trim();
+    const ttnHistory = Array.isArray(baseOrder.ttnHistory) ? [...baseOrder.ttnHistory] : [];
     if (previousTtn && previousTtn !== String(created.ttn || '').trim()) {
       ttnHistory.push({
         ttn: previousTtn,
-        npRef: orders[idx].npRef || null,
+        npRef: baseOrder.npRef || null,
         replacedAt: now,
         reason: req.body?.force ? 'recreated_before_dispatch' : 'replaced',
       });
     }
-    orders[idx] = {
-      ...orders[idx],
+    const computedOrder = {
+      ...baseOrder,
       ...order,
       ttn: created.ttn,
       npRef: created.ref,
       npEstimatedDeliveryDate: created.estimatedDeliveryDate,
-      npDeliveryCost: created.cost || orders[idx].npDeliveryCost || null,
+      npDeliveryCost: created.cost || baseOrder.npDeliveryCost || null,
       deliveryStatus: 'ttn_created',
-      status: ['paid', 'completed'].includes(orders[idx].status) ? orders[idx].status : 'confirmed',
+      status: ['paid', 'completed'].includes(baseOrder.status) ? baseOrder.status : 'confirmed',
       ttnHistory,
       novaPoshta: {
-        ...(orders[idx].novaPoshta && typeof orders[idx].novaPoshta === 'object' ? orders[idx].novaPoshta : {}),
+        ...(baseOrder.novaPoshta && typeof baseOrder.novaPoshta === 'object' ? baseOrder.novaPoshta : {}),
         ref: created.ref,
         ttn: created.ttn,
         city: created.city,
@@ -3558,46 +3683,72 @@ app.post('/api/admin/orders/:id/np/create', authBot, async (req, res) => {
       ttnCreatedAt: now,
       updatedAt: now,
     };
-    writeOrders(orders);
-    updateOrderQueueNotice(orders[idx]).catch(e => console.error('[order notice]', e.message));
+    const persisted = await persistNovaPoshtaOrderChanges([baseOrder], [computedOrder]);
+    const savedOrder = persisted.ordersById.get(String(id));
+    if (!savedOrder) {
+      return res.status(409).json({ error: 'Order was deleted while TTN was being created', createdTtn: created.ttn });
+    }
+    const mergeConflict = persisted.conflicts.find(item => item.id === String(id));
+    if (mergeConflict?.fields.includes('ttn')) {
+      return res.status(409).json({
+        error: 'Order TTN changed while a new TTN was being created',
+        createdTtn: created.ttn,
+        order: savedOrder,
+      });
+    }
+    updateOrderQueueNotice(savedOrder).catch(e => console.error('[order notice]', e.message));
     scheduleNovaPoshtaSync({
       source: 'ttn-create',
       limit: Number(process.env.NP_SYNC_AFTER_TTN_LIMIT || 30),
       includeManualLink: false,
     }, Math.max(0, Number(process.env.NP_SYNC_AFTER_TTN_DELAY_MS || 120000)));
-    res.json({ success: true, order: orders[idx], novaPoshta: created, ttn: created.ttn });
+    res.json({
+      success: true,
+      order: savedOrder,
+      novaPoshta: created,
+      ttn: savedOrder.ttn || created.ttn,
+      mergeConflicts: mergeConflict?.fields || [],
+    });
   } catch (error) {
     res.status(502).json(npErrorPayload(error));
   } finally {
     npCreateLocks.delete(lockKey);
   }
-});
-app.post('/api/admin/orders/:id/np/sync', authBot, async (req, res) => {
+}));
+app.post('/api/admin/orders/:id/np/sync', authBot, asyncRoute(async (req, res) => {
   const id = Number(req.params.id);
   const orders = read(F.orders);
   const idx = orders.findIndex(x => x.id === id);
   if (idx < 0) return res.status(404).json({ error: 'Not found' });
   if (!orders[idx].ttn) return res.status(400).json({ error: 'Order has no TTN' });
+  const baseOrder = orders[idx];
   try {
-    const { updated, track } = await syncOrderWithNovaPoshta(orders[idx]);
-    orders[idx] = updated;
-    writeOrders(orders);
-    updateOrderQueueNotice(orders[idx]).catch(e => console.error('[order notice]', e.message));
-    res.json({ success: true, order: orders[idx], track });
+    const { updated, track } = await syncOrderWithNovaPoshta(baseOrder);
+    const persisted = await persistNovaPoshtaOrderChanges([baseOrder], [updated]);
+    const savedOrder = persisted.ordersById.get(String(id));
+    if (!savedOrder) return res.status(409).json({ error: 'Order was deleted while Nova Poshta sync was running' });
+    updateOrderQueueNotice(savedOrder).catch(e => console.error('[order notice]', e.message));
+    res.json({
+      success: true,
+      order: savedOrder,
+      track,
+      mergeConflicts: persisted.conflicts.find(item => item.id === String(id))?.fields || [],
+    });
   } catch (error) {
     res.status(502).json(npErrorPayload(error));
   }
-});
-app.post('/api/admin/orders/:id/np/return', authBot, async (req, res) => {
+}));
+app.post('/api/admin/orders/:id/np/return', authBot, asyncRoute(async (req, res) => {
   const id = Number(req.params.id);
   const orders = read(F.orders);
   const idx = orders.findIndex(x => x.id === id);
   if (idx < 0) return res.status(404).json({ error: 'Not found' });
   if (!orders[idx].ttn) return res.status(400).json({ error: 'Order has no TTN', userMessage: 'У замовленні немає ТТН, тому повернення в Новій Пошті створити неможливо.' });
+  const baseOrder = orders[idx];
   try {
-    const result = await novaPoshta.createReturnOrder(orders[idx]);
+    const result = await novaPoshta.createReturnOrder(baseOrder);
     const now = new Date().toISOString();
-    let updated = applyNovaReturnOrderToOrder(orders[idx], result.returnOrder);
+    let updated = applyNovaReturnOrderToOrder(baseOrder, result.returnOrder);
     const returnTtn = updated.npReturnExpressWaybillNumber || updated.npReturnOrderNumber;
     if (returnTtn) {
       try {
@@ -3611,43 +3762,62 @@ app.post('/api/admin/orders/:id/np/return', authBot, async (req, res) => {
       ...updated,
       status: 'returned',
       paymentStatus: req.body?.paymentStatus || 'returned',
-      returnScope: req.body?.scope || orders[idx].returnScope || 'base',
-      returnedAt: orders[idx].returnedAt || now,
-      npReturnCreatedAt: orders[idx].npReturnCreatedAt || now,
+      returnScope: req.body?.scope || baseOrder.returnScope || 'base',
+      returnedAt: baseOrder.returnedAt || now,
+      npReturnCreatedAt: baseOrder.npReturnCreatedAt || now,
       npReturnDuplicate: !!result.duplicate,
       updatedAt: now,
     };
-    orders[idx] = updated;
-    writeOrders(orders);
-    updateOrderQueueNotice(orders[idx]).catch(e => console.error('[order notice]', e.message));
-    res.json({ success: true, order: orders[idx], returnOrder: result.returnOrder || null, duplicate: !!result.duplicate });
+    const persisted = await persistNovaPoshtaOrderChanges([baseOrder], [updated]);
+    const savedOrder = persisted.ordersById.get(String(id));
+    if (!savedOrder) return res.status(409).json({ error: 'Order was deleted while return creation was running' });
+    updateOrderQueueNotice(savedOrder).catch(e => console.error('[order notice]', e.message));
+    res.json({
+      success: true,
+      order: savedOrder,
+      returnOrder: result.returnOrder || null,
+      duplicate: !!result.duplicate,
+      mergeConflicts: persisted.conflicts.find(item => item.id === String(id))?.fields || [],
+    });
   } catch (error) {
     res.status(502).json(npErrorPayload(error));
   }
-});
-app.post('/api/admin/orders/:id/np/link-manual', authBot, async (req, res) => {
+}));
+app.post('/api/admin/orders/:id/np/link-manual', authBot, asyncRoute(async (req, res) => {
   const id = Number(req.params.id);
   const orders = read(F.orders);
   const idx = orders.findIndex(x => x.id === id);
   if (idx < 0) return res.status(404).json({ error: 'Not found' });
+  const baseOrder = orders[idx];
   try {
-    const linked = await linkManualNovaPoshtaTtn(orders[idx], orders);
+    const linked = await linkManualNovaPoshtaTtn(baseOrder, orders);
     if (!linked.linked) return res.status(404).json({ error: 'Manual TTN was not found by recipient phone', reason: linked.reason, checked: linked.checked || 0 });
-    orders[idx] = linked.order;
+    let updated = linked.order;
     try {
-      const synced = await syncOrderWithNovaPoshta(orders[idx]);
-      orders[idx] = synced.updated;
+      const synced = await syncOrderWithNovaPoshta(updated);
+      updated = synced.updated;
       linked.track = synced.track;
     } catch (error) {
       linked.syncError = error.message;
     }
-    writeOrders(orders);
-    updateOrderQueueNotice(orders[idx]).catch(e => console.error('[order notice]', e.message));
-    res.json({ success: true, order: orders[idx], ttn: linked.ttn, document: linked.document, track: linked.track || null, syncError: linked.syncError || null });
+    const persisted = await persistNovaPoshtaOrderChanges([baseOrder], [updated]);
+    const savedOrder = persisted.ordersById.get(String(id));
+    if (!savedOrder) return res.status(409).json({ error: 'Order was deleted while manual TTN linking was running' });
+    const mergeConflict = persisted.conflicts.find(item => item.id === String(id));
+    updateOrderQueueNotice(savedOrder).catch(e => console.error('[order notice]', e.message));
+    res.json({
+      success: true,
+      order: savedOrder,
+      ttn: savedOrder.ttn || linked.ttn,
+      document: linked.document,
+      track: linked.track || null,
+      syncError: linked.syncError || null,
+      mergeConflicts: mergeConflict?.fields || [],
+    });
   } catch (error) {
     res.status(502).json(npErrorPayload(error));
   }
-});
+}));
 app.post('/api/admin/np/sync', authBot, async (req, res) => {
   if (!novaPoshta.configStatus().apiConfigured) return res.status(400).json(novaPoshtaMissingConfigPayload());
   try {
@@ -3743,7 +3913,7 @@ app.post('/api/admin/backup/restore', authBot, (req, res) => {
 
 /* ── SSE endpoint ──────────────────────────────────────────── */
 app.get('/api/support/stream', (req, res) => {
-  const { sessionId } = req.query;
+  const sessionId = supportSessionKey(req.query.sessionId);
   if (!sessionId) return res.status(400).end();
 
   res.setHeader('Content-Type', 'text/event-stream');
@@ -3755,6 +3925,7 @@ app.get('/api/support/stream', (req, res) => {
   res.flushHeaders();
 
   const sess = getSession(sessionId);
+  if (sess.res && sess.res !== res) sess.res.end();
   sess.res   = res;
 
   // Immediately flush any messages that arrived while disconnected
@@ -3766,13 +3937,17 @@ app.get('/api/support/stream', (req, res) => {
 
   req.on('close', () => {
     clearInterval(ping);
-    if (sessions[sessionId]) sessions[sessionId].res = null;
+    if (sessions[sessionId]?.res === res) {
+      sessions[sessionId].res = null;
+      sessions[sessionId].lastActivityAt = Date.now();
+    }
   });
 });
 
 /* ── Bot relay ─────────────────────────────────────────────── */
 app.post('/api/support/relay', authBot, (req, res) => {
-  const { sessionId, text, managerName } = req.body;
+  const { text, managerName } = req.body;
+  const sessionId = supportSessionKey(req.body?.sessionId);
   if (!sessionId || !text) return res.status(400).json({ error: 'Missing fields' });
   sseWrite(sessionId, { type: 'message', text, managerName: managerName || 'Оператор' });
   const records = read(F.support);
@@ -3788,7 +3963,8 @@ app.post('/api/support/relay', authBot, (req, res) => {
 });
 
 app.post('/api/support/accept', authBot, (req, res) => {
-  const { sessionId, managerId } = req.body;
+  const { managerId } = req.body;
+  const sessionId = supportSessionKey(req.body?.sessionId);
   if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
   const support = updateSupportRecord(sessionId, {
     accepted: true,
@@ -3807,7 +3983,7 @@ app.post('/api/support/accept', authBot, (req, res) => {
 });
 
 app.post('/api/support/end', authBot, (req, res) => {
-  const { sessionId } = req.body;
+  const sessionId = supportSessionKey(req.body?.sessionId);
   if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
   const msgs = read(F.support);
   const idx  = findOpenSupportIndex(msgs, sessionId);
@@ -3836,7 +4012,7 @@ app.get('/api/support/sessions', authBot, (_req, res) => {
 /* ═══════════════════════════════════════════════════════════
    ZAPUSK LEADS (public)
 ═══════════════════════════════════════════════════════════ */
-app.post('/api/zapusk/lead', rateLimit(60 * 1000, 5), async (req, res) => {
+app.post('/api/zapusk/lead', rateLimit(60 * 1000, 5), asyncRoute(async (req, res) => {
   const clean = (value, max = 200) => sanitizeStr(value, max).replace(/[<>]/g, '');
   const escapeHtml = value => clean(value, 700)
     .replace(/&/g, '&amp;')
@@ -3873,7 +4049,7 @@ app.post('/api/zapusk/lead', rateLimit(60 * 1000, 5), async (req, res) => {
 
   if (!result?.ok) return res.status(502).json({ error: 'Telegram error' });
   return res.json({ success: true });
-});
+}));
 
 /* ═══════════════════════════════════════════════════════════
    ORDERS (public)
@@ -3989,7 +4165,7 @@ async function dispatchZvonokOnce(order, req) {
   return result;
 }
 
-app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
+app.post('/api/order', rateLimit(60 * 1000, 5), asyncRoute(async (req, res) => {
   const {
     name, phone, size, color, product, price, variant, productVariant, quantity, contactViaTelegram,
     orderMode, fullName, city, district, postOffice, delivery,
@@ -4111,7 +4287,7 @@ app.post('/api/order', rateLimit(60 * 1000, 5), async (req, res) => {
   }
 
   res.json({ success: true, id: o.id, upgraded: mutation.upgraded });
-});
+}));
 
 app.get('/api/orders',        authBot, (_req, res) => res.json(read(F.orders)));
 app.get('/api/orders/:id',    authBot, (req, res) => {
@@ -4134,18 +4310,17 @@ app.delete('/api/orders/:id', authBot, (req, res) => {
   res.json({ success: true });
 });
 
-app.all('/api/zvonok/ivr', async (req, res) => {
+app.all('/api/zvonok/ivr', asyncRoute(async (req, res) => {
   const payload = { ...req.query, ...req.body };
 
-  if (ZVONOK_WEBHOOK_SECRET) {
-    const secret = payload.secret || req.headers['x-zvonok-secret'];
-    if (secret !== ZVONOK_WEBHOOK_SECRET) return res.status(401).json({ error: 'Unauthorized' });
-  }
+  if (!ZVONOK_WEBHOOK_SECRET) return res.status(503).json({ error: 'Webhook is not configured' });
+  const secret = payload.secret || req.headers['x-zvonok-secret'];
+  if (!secretEqual(secret, ZVONOK_WEBHOOK_SECRET)) return res.status(401).json({ error: 'Unauthorized' });
 
   const orders = read(F.orders);
   const idx = findOrderIndexByZvonokPayload(orders, payload);
   if (idx < 0) {
-    console.warn('[Zvonok] webhook order not found:', payload);
+    console.warn('[Zvonok] webhook order not found');
     return res.status(404).json({ error: 'Order not found' });
   }
 
@@ -4175,8 +4350,16 @@ app.all('/api/zvonok/ivr', async (req, res) => {
   }
 
   if (!nextStatus) {
-    console.log(`[Zvonok] webhook received for order #${order.id}:`, payload);
+    console.log(`[Zvonok] webhook ignored for order #${order.id}`);
     return res.json({ success: true, ignored: true });
+  }
+
+  if (
+    order.status === nextStatus
+    && String(order.zvonokButton || '') === String(digit || '')
+    && String(order.zvonokStatus || '') === String(status || '')
+  ) {
+    return res.json({ success: true, replay: true, orderId: order.id, status: nextStatus });
   }
 
   orders[idx] = {
@@ -4191,14 +4374,14 @@ app.all('/api/zvonok/ivr', async (req, res) => {
   writeOrders(orders);
 
   await tg(message);
-  console.log(`[Zvonok] webhook order #${order.id}: ${nextStatus}`, payload);
+  console.log(`[Zvonok] webhook order #${order.id}: ${nextStatus}`);
   res.json({ success: true, orderId: order.id, status: nextStatus });
-});
+}));
 
 /* ═══════════════════════════════════════════════════════════
    REVIEWS (public)
 ═══════════════════════════════════════════════════════════ */
-app.post('/api/review', rateLimit(60 * 1000, 3), async (req, res) => {
+app.post('/api/review', rateLimit(60 * 1000, 3), asyncRoute(async (req, res) => {
   const { name, rating, text, date } = req.body;
   if (!name || !rating || !text) return res.status(400).json({ error: 'Missing fields' });
   const cleanName = sanitizeStr(name, 100);
@@ -4218,10 +4401,10 @@ app.post('/api/review', rateLimit(60 * 1000, 3), async (req, res) => {
     { reply_markup: { inline_keyboard: [[{ text: '🗑 Видалити', callback_data: `del_review_${rv.id}` }]] } }
   );
   res.json({ success: true, id: rv.id });
-});
+}));
 
 app.get('/api/reviews',        (_req, res) => res.json(read(F.reviews)));
-app.delete('/api/reviews/:id', (req, res) => {
+app.delete('/api/reviews/:id', authBot, (req, res) => {
   const id = Number(req.params.id); const arr = read(F.reviews);
   if (!arr.some(x => x.id === id)) return res.status(404).json({ error: 'Not found' });
   write(F.reviews, arr.filter(x => x.id !== id)); res.json({ success: true });
@@ -4230,48 +4413,56 @@ app.delete('/api/reviews/:id', (req, res) => {
 /* ═══════════════════════════════════════════════════════════
    SUPPORT (public)
 ═══════════════════════════════════════════════════════════ */
-app.post('/api/support', rateLimit(60 * 1000, 10), async (req, res) => {
+app.post('/api/support', rateLimit(60 * 1000, 10), asyncRoute(async (req, res) => {
   const { message, sessionId, timestamp, customer } = req.body;
   if (!message) return res.status(400).json({ error: 'Missing message' });
   const cleanMsg = sanitizeStr(message, 2000);
   if (!cleanMsg) return res.status(400).json({ error: 'Empty message' });
-  const key = supportSessionKey(sessionId, `anonymous_${req.ip}`);
+  const suppliedSessionId = supportSessionKey(sessionId);
+  if (sessionId && !suppliedSessionId) return res.status(400).json({ error: 'Invalid sessionId' });
+  const key = suppliedSessionId || supportSessionKey(null, `anonymous_${req.ip}`) || 'anonymous';
+  getSession(key);
   const result = await withSupportSessionLock(key, async () => {
     const now = new Date().toISOString();
     const messageAt = asIsoSupportDate(timestamp, now);
-    const msgs = read(F.support);
-    let idx = findOpenSupportIndex(msgs, sessionId);
-    const repeated = idx >= 0;
-    if (idx < 0) {
-      idx = msgs.length;
-      msgs.push({
-        id: nextId(msgs),
-        sessionId: sessionId || null,
-        category: 'ai_history',
-        status: 'active',
-        customer: resolveSupportCustomer(customer),
-        messages: [],
-        startedAt: now,
+    const prepared = await withSupportMutationLock(() => {
+      const msgs = read(F.support);
+      let idx = findOpenSupportIndex(msgs, key);
+      const repeated = idx >= 0;
+      if (idx < 0) {
+        idx = msgs.length;
+        msgs.push({
+          id: nextId(msgs),
+          sessionId: key,
+          category: 'ai_history',
+          status: 'active',
+          customer: resolveSupportCustomer(customer),
+          messages: [],
+          startedAt: now,
+          timestamp: messageAt,
+          answered: false,
+          accepted: false,
+        });
+      }
+
+      const previous = msgs[idx];
+      const priorTranscript = supportTranscript(previous);
+      const current = {
+        ...previous,
+        customer: previous.customer?.orderId ? previous.customer : resolveSupportCustomer(customer),
+        message: cleanMsg,
         timestamp: messageAt,
-        answered: false,
-        accepted: false,
-      });
-    }
-
-    let current = msgs[idx];
-    const priorTranscript = supportTranscript(current);
-    current = {
-      ...current,
-      customer: current.customer?.orderId ? current.customer : resolveSupportCustomer(customer),
-      message: cleanMsg,
-      timestamp: messageAt,
-      updatedAt: now,
-      messages: [...priorTranscript, supportMessage('user', cleanMsg, messageAt)],
-    };
-
-    if (current.accepted || current.status === 'accepted') {
+        updatedAt: now,
+        messages: [...priorTranscript, supportMessage('user', cleanMsg, messageAt)],
+      };
       msgs[idx] = current;
       write(F.support, msgs);
+      return { current, priorTranscript, repeated };
+    });
+    let { current } = prepared;
+    const { priorTranscript, repeated } = prepared;
+
+    if (current.accepted || current.status === 'accepted') {
       await notifySupportRequest(current, 'dialog');
       return { success: true, id: current.id, repeated, human: true };
     }
@@ -4280,41 +4471,73 @@ app.post('/api/support', rateLimit(60 * 1000, 10), async (req, res) => {
     const localReply = needsHuman ? null : localSupportReply(cleanMsg);
     const ai = localReply
       ? { action: 'answer', reply: localReply, reason: 'local_knowledge_base' }
-      : needsHuman ? null : await askSupportAi(sessionId, cleanMsg, priorTranscript);
+      : needsHuman ? null : await askSupportAi(key, cleanMsg, priorTranscript);
     if (ai?.action === 'answer') {
-      current = {
-        ...current,
-        category: 'ai_history',
-        status: 'active',
-        answered: true,
-        aiHandled: true,
-        aiError: false,
-        aiLastReply: ai.reply,
-        messages: [...current.messages, supportMessage('ai', ai.reply, new Date().toISOString())],
-        summaryDueAt: new Date(Date.now() + SUPPORT_AI_IDLE_MINUTES * 60 * 1000).toISOString(),
-      };
-      msgs[idx] = current;
-      write(F.support, msgs);
+      const persisted = await withSupportMutationLock(() => {
+        const msgs = read(F.support);
+        const idx = msgs.findIndex(item => item.id === current.id);
+        if (idx < 0) return { missing: true };
+        const latest = msgs[idx];
+        if (latest.accepted || latest.status === 'accepted') return { current: latest, human: true };
+        const completedAt = new Date().toISOString();
+        const merged = {
+          ...latest,
+          category: 'ai_history',
+          status: 'active',
+          answered: true,
+          aiHandled: true,
+          aiError: false,
+          aiLastReply: ai.reply,
+          updatedAt: completedAt,
+          messages: [...supportTranscript(latest), supportMessage('ai', ai.reply, completedAt)],
+          summaryDueAt: new Date(Date.now() + SUPPORT_AI_IDLE_MINUTES * 60 * 1000).toISOString(),
+        };
+        msgs[idx] = merged;
+        write(F.support, msgs);
+        return { current: merged };
+      });
+      if (persisted.missing) return { success: false, id: current.id, repeated, error: 'Support session no longer exists' };
+      current = persisted.current;
+      if (persisted.human) {
+        await notifySupportRequest(current, 'dialog');
+        return { success: true, id: current.id, repeated, human: true };
+      }
       return { success: true, id: current.id, repeated, aiReply: ai.reply, ai: true };
     }
 
     const handoffReason = needsHuman
       ? 'Клієнт попросив менеджера або потрібна дія з замовленням'
       : ai?.reason || 'AI не зміг надійно вирішити запит';
-    current = {
-      ...current,
-      category: 'manager_required',
-      status: 'waiting_manager',
-      accepted: false,
-      answered: false,
-      aiError: !needsHuman && !ai,
-      handoffReason,
-      summary: supportFallbackSummary({ ...current, handoffReason }, true),
-      summaryDueAt: null,
-    };
-    if (ai?.reply) current.messages = [...current.messages, supportMessage('ai', ai.reply, new Date().toISOString())];
-    msgs[idx] = current;
-    write(F.support, msgs);
+    const persisted = await withSupportMutationLock(() => {
+      const msgs = read(F.support);
+      const idx = msgs.findIndex(item => item.id === current.id);
+      if (idx < 0) return { missing: true };
+      const latest = msgs[idx];
+      if (latest.accepted || latest.status === 'accepted') return { current: latest, human: true };
+      const completedAt = new Date().toISOString();
+      const merged = {
+        ...latest,
+        category: 'manager_required',
+        status: 'waiting_manager',
+        accepted: false,
+        answered: false,
+        aiError: !needsHuman && !ai,
+        handoffReason,
+        summary: supportFallbackSummary({ ...latest, handoffReason }, true),
+        summaryDueAt: null,
+        updatedAt: completedAt,
+      };
+      if (ai?.reply) merged.messages = [...supportTranscript(latest), supportMessage('ai', ai.reply, completedAt)];
+      msgs[idx] = merged;
+      write(F.support, msgs);
+      return { current: merged };
+    });
+    if (persisted.missing) return { success: false, id: current.id, repeated, error: 'Support session no longer exists' };
+    current = persisted.current;
+    if (persisted.human) {
+      await notifySupportRequest(current, 'dialog');
+      return { success: true, id: current.id, repeated, human: true };
+    }
     await notifySupportRequest(current, 'handoff');
     return {
       success: true,
@@ -4326,7 +4549,7 @@ app.post('/api/support', rateLimit(60 * 1000, 10), async (req, res) => {
     };
   });
   res.json(result);
-});
+}));
 
 app.get('/api/support',        authBot, (_req, res) => res.json(read(F.support)));
 app.patch('/api/support/:id',  authBot, (req, res) => {
@@ -4340,11 +4563,16 @@ app.patch('/api/support/:id',  authBot, (req, res) => {
 app.get('/', (_req, res) => { res.type('text/html'); res.sendFile(path.join(PUBLIC_ROOT, 'index.html')); });
 app.get('*', (req, res, next) => {
   if (req.path.startsWith('/api/')) return next();
-  const possibleFile = path.join(PUBLIC_ROOT, req.path);
-  if (fs.existsSync(possibleFile) && fs.statSync(possibleFile).isFile())
-    return res.sendFile(possibleFile);
+  if (path.extname(req.path)) return res.status(404).end();
   res.type('text/html');
   res.sendFile(path.join(PUBLIC_ROOT, 'index.html'));
+});
+
+app.use((error, req, res, next) => {
+  if (res.headersSent) return next(error);
+  const code = sanitizeStr(error?.code || error?.name || 'INTERNAL_ERROR', 80);
+  console.error(`[http] ${req.method} ${req.path} failed (${code})`);
+  return res.status(500).json({ error: 'Internal server error' });
 });
 
 app.listen(PORT, () => {

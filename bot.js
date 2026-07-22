@@ -12,7 +12,9 @@
  */
 
 require('dotenv').config();
+const crypto = require('crypto');
 const { TelegramBot } = require('node-telegram-bot-api');
+const { createKeyedTaskQueue, updateChatId } = require('./telegram-update-queue');
 
 const TOKEN = process.env.BOT_TOKEN || process.env.TG_TOKEN || '';
 
@@ -21,21 +23,59 @@ const ADMIN_IDS = (process.env.ADMIN_IDS || '')
 const EXTRA_ADMIN_IDS = [7996143460];
 
 const SERVER_URL = process.env.SERVER_URL || 'http://localhost:3000';
-const API_KEY    = process.env.API_KEY    || 'violet-secret';
+const API_KEY    = String(process.env.API_KEY || '').trim();
 const BOT_USE_WEBHOOK = process.env.BOT_USE_WEBHOOK === 'true';
 const BOT_WEBHOOK_URL = String(process.env.BOT_WEBHOOK_URL || '').replace(/\/+$/, '');
-const BOT_WEBHOOK_SECRET = process.env.BOT_WEBHOOK_SECRET || API_KEY;
-const POWERBANK_PANEL_PASSWORD = process.env.POWERBANK_PANEL_PASSWORD || '12345loha54321';
+const BOT_WEBHOOK_SECRET = String(process.env.BOT_WEBHOOK_SECRET || '').trim();
+const POWERBANK_PANEL_PASSWORD = String(process.env.POWERBANK_PANEL_PASSWORD || '').trim();
 // Private mode intentionally stays active until the manager explicitly exits it.
 // The in-memory session is also cleared naturally on a bot restart/deploy.
 
 if (!TOKEN) { console.error('❌ BOT_TOKEN not set'); process.exit(1); }
+if (!API_KEY) console.error('❌ API_KEY not set; admin API commands are disabled.');
+if (BOT_USE_WEBHOOK && !/^[A-Za-z0-9_-]{16,256}$/.test(BOT_WEBHOOK_SECRET)) {
+  console.error('❌ BOT_WEBHOOK_SECRET must contain 16-256 safe characters in webhook mode.');
+  process.exit(1);
+}
 
 const bot = new TelegramBot(TOKEN, { polling: !BOT_USE_WEBHOOK });
+
+async function reportUpdateError(error, context = {}) {
+  const kind = context.kind || 'update';
+  console.error(`[telegram ${kind}]`, error?.message || error);
+
+  const chatId = updateChatId(context.update);
+  if (chatId == null) return;
+  await bot.sendMessage(chatId, '❌ Помилка бота. Спробуйте ще раз.', {
+    reply_markup: keyboardFor(chatId),
+  }).catch(() => {});
+}
+
+const updateQueue = createKeyedTaskQueue({ onError: reportUpdateError });
+
+function queuedUpdateHandler(kind, handler) {
+  return (...args) => {
+    const update = args[0];
+    void updateQueue.enqueue(
+      updateChatId(update),
+      () => handler(...args),
+      { kind, update },
+    );
+  };
+}
+
+function onText(pattern, handler) {
+  bot.onText(pattern, queuedUpdateHandler('text', handler));
+}
 console.log(`🤖 Admin bot started in ${BOT_USE_WEBHOOK ? 'webhook' : 'polling'} mode…`);
 
 /* ── Auth ─────────────────────────────────────────────────── */
-function isAdmin(id) { return ADMIN_IDS.length === 0 || ADMIN_IDS.includes(id) || EXTRA_ADMIN_IDS.includes(id); }
+function isAdmin(id) { return ADMIN_IDS.includes(id) || EXTRA_ADMIN_IDS.includes(id); }
+function secretEqual(supplied, expected) {
+  const left = Buffer.from(String(supplied || ''));
+  const right = Buffer.from(String(expected || ''));
+  return left.length > 0 && left.length === right.length && crypto.timingSafeEqual(left, right);
+}
 
 /* ── State ────────────────────────────────────────────────── */
 const managerDialogs = {};
@@ -53,6 +93,7 @@ const pendingCb      = new Set();
 const FETCH_TIMEOUT = Math.max(5000, Number(process.env.BOT_API_TIMEOUT_MS || 35000));
 
 async function apiFetch(method, pathname, body = null) {
+  if (!API_KEY) return { error: 'Admin API is not configured' };
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT);
   try {
@@ -61,7 +102,7 @@ async function apiFetch(method, pathname, body = null) {
     const r = await fetch(`${SERVER_URL}${pathname}`, opts);
     clearTimeout(t);
     const text = await r.text();
-    if (!r.ok) console.error(`[api] ${method} ${pathname}: ${r.status} ${text.slice(0, 500)}`);
+    if (!r.ok) console.error(`[api] ${method} ${pathname}: HTTP ${r.status}`);
     try { return JSON.parse(text); } catch { return null; }
   } catch (e) {
     clearTimeout(t);
@@ -281,7 +322,14 @@ async function reply(chatId, text, keyboard, msgId = null) {
   const opts = { parse_mode: 'HTML', reply_markup: keyboard };
   if (msgId) {
     try { await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, ...opts }); return; }
-    catch {}
+    catch (error) {
+      const message = String(error?.message || '');
+      if (/message is not modified/i.test(message)) return;
+      if (!/message to edit not found|message can(?:not|'t) be edited|message_id_invalid/i.test(message)) {
+        console.error('[reply edit]', message);
+        return;
+      }
+    }
   }
   await bot.sendMessage(chatId, text, opts);
 }
@@ -490,6 +538,10 @@ function leavePowerPanel(chatId) {
 }
 
 async function requestPowerPanelPassword(chatId) {
+  if (!POWERBANK_PANEL_PASSWORD) {
+    await bot.sendMessage(chatId, '🔒 Private недоступний: пароль не налаштований.', { reply_markup: MAIN_KB });
+    return;
+  }
   if (managerDialogs[chatId]) {
     await bot.sendMessage(chatId, 'ℹ️ Спочатку завершіть активний діалог із клієнтом, а потім відкрийте Private.', { reply_markup: DIALOG_KB });
     return;
@@ -2305,7 +2357,7 @@ async function showAnalyticsReport(chatId, period, view = 'overview', msgId = nu
 /* ═══════════════════════════════════════════════════════════
    COMMANDS
 ═══════════════════════════════════════════════════════════ */
-bot.onText(/\/start/, async msg => {
+onText(/\/start/, async msg => {
   if (!isAdmin(msg.from.id)) return;
   if (managerDialogs[msg.chat.id]) {
     return bot.sendMessage(msg.chat.id, 'ℹ️ Спочатку завершіть активний діалог із клієнтом.', { reply_markup: DIALOG_KB });
@@ -2325,22 +2377,22 @@ function regularCommand(msg, action) {
   return action();
 }
 
-bot.onText(/\/analytics/, msg => regularCommand(msg, () => showAnalyticsMenu(msg.chat.id)));
-bot.onText(/\/search (.+)/, (msg, match) => regularCommand(msg, () => showOrders(msg.chat.id, 1, match[1].trim().toLowerCase())));
-bot.onText(/\/orders/,  msg => regularCommand(msg, () => showOrders(msg.chat.id)));
-bot.onText(/\/track(?:ing)?/, msg => regularCommand(msg, () => showTrackingMenu(msg.chat.id)));
-bot.onText(/\/reviews/, msg => regularCommand(msg, () => showReviews(msg.chat.id)));
-bot.onText(/\/support/, msg => regularCommand(msg, () => showSupport(msg.chat.id)));
-bot.onText(/\/crm/,     msg => regularCommand(msg, () => showCrmPicker(msg.chat.id)));
-bot.onText(/\/arb(itrator)?/, msg => regularCommand(msg, () => showArbitratorPanel(msg.chat.id)));
-bot.onText(/\/stats/,   msg => regularCommand(msg, () => showStats(msg.chat.id)));
-bot.onText(/\/power/,   msg => { if (!isAdmin(msg.from.id)) return; isPowerPanelAuthorized(msg.chat.id) ? showPowerPanel(msg.chat.id) : requestPowerPanelPassword(msg.chat.id); });
-bot.onText(/\/private/, msg => { if (!isAdmin(msg.from.id)) return; isPowerPanelAuthorized(msg.chat.id) ? showPowerPanel(msg.chat.id) : requestPowerPanelPassword(msg.chat.id); });
+onText(/\/analytics/, msg => regularCommand(msg, () => showAnalyticsMenu(msg.chat.id)));
+onText(/\/search (.+)/, (msg, match) => regularCommand(msg, () => showOrders(msg.chat.id, 1, match[1].trim().toLowerCase())));
+onText(/\/orders/,  msg => regularCommand(msg, () => showOrders(msg.chat.id)));
+onText(/\/track(?:ing)?/, msg => regularCommand(msg, () => showTrackingMenu(msg.chat.id)));
+onText(/\/reviews/, msg => regularCommand(msg, () => showReviews(msg.chat.id)));
+onText(/\/support/, msg => regularCommand(msg, () => showSupport(msg.chat.id)));
+onText(/\/crm/,     msg => regularCommand(msg, () => showCrmPicker(msg.chat.id)));
+onText(/\/arb(itrator)?/, msg => regularCommand(msg, () => showArbitratorPanel(msg.chat.id)));
+onText(/\/stats/,   msg => regularCommand(msg, () => showStats(msg.chat.id)));
+onText(/\/power/,   msg => { if (!isAdmin(msg.from.id)) return; return isPowerPanelAuthorized(msg.chat.id) ? showPowerPanel(msg.chat.id) : requestPowerPanelPassword(msg.chat.id); });
+onText(/\/private/, msg => { if (!isAdmin(msg.from.id)) return; return isPowerPanelAuthorized(msg.chat.id) ? showPowerPanel(msg.chat.id) : requestPowerPanelPassword(msg.chat.id); });
 
 /* ═══════════════════════════════════════════════════════════
    TEXT MESSAGES
 ═══════════════════════════════════════════════════════════ */
-bot.on('message', async msg => {
+bot.on('message', queuedUpdateHandler('message', async msg => {
   if (!msg.text || msg.text.startsWith('/')) return;
   if (!isAdmin(msg.from.id)) return;
 
@@ -2382,7 +2434,7 @@ bot.on('message', async msg => {
       await requestPowerPanelPassword(chatId);
       return;
     }
-    if (text === POWERBANK_PANEL_PASSWORD) {
+    if (POWERBANK_PANEL_PASSWORD && text === POWERBANK_PANEL_PASSWORD) {
       delete pendingPowerAuth[chatId];
       enterPowerPanel(chatId);
       await bot.sendMessage(chatId, '✅ Доступ до Private відкрито. Нижнє меню перемкнено на VoltGo.', { reply_markup: PRIVATE_KB });
@@ -2529,16 +2581,16 @@ bot.on('message', async msg => {
   }
 
   switch (text) {
-    case '📦 Замовлення':  showOrders(chatId);       break;
-    case '🚚 Відстеження': showTrackingMenu(chatId); break;
+    case '📦 Замовлення':  await showOrders(chatId);       break;
+    case '🚚 Відстеження': await showTrackingMenu(chatId); break;
     case '💰 Провести гроші': await startReconciliationInput(chatId, 'money', 'manager'); break;
     case '↩️ Провести повернення': await startReconciliationInput(chatId, 'return', 'manager'); break;
     case '📋 Звірка ТТН': await showManagerReconciliationPanel(chatId); break;
-    case '💬 Відгуки':     showReviews(chatId);      break;
-    case '🎧 Підтримка':   showSupport(chatId);      break;
-    case '💼 CRM':         showCrmPicker(chatId);    break;
-    case '📊 Статистика':  showStats(chatId);         break;
-    case '📈 Аналітика':   showAnalyticsMenu(chatId); break;
+    case '💬 Відгуки':     await showReviews(chatId);      break;
+    case '🎧 Підтримка':   await showSupport(chatId);      break;
+    case '💼 CRM':         await showCrmPicker(chatId);    break;
+    case '📊 Статистика':  await showStats(chatId);         break;
+    case '📈 Аналітика':   await showAnalyticsMenu(chatId); break;
     case '🤝 Арбітраж':    await showArbitratorPanel(chatId); break;
     case '🔒 Private':
       if (isPowerPanelAuthorized(chatId)) await showPowerPanel(chatId);
@@ -2566,10 +2618,10 @@ bot.on('message', async msg => {
     default:
       if (pendingSearch[chatId]) {
         delete pendingSearch[chatId];
-        showOrders(chatId, 1, text.toLowerCase());
+        await showOrders(chatId, 1, text.toLowerCase());
       }
   }
-});
+}));
 
 /* ═══════════════════════════════════════════════════════════
    CALLBACK QUERIES
@@ -2596,7 +2648,7 @@ async function privateCallbackAllowed(chatId, data) {
   return !!(order && !order.error && orderModelKey(order) === 'power');
 }
 
-bot.on('callback_query', async q => {
+bot.on('callback_query', queuedUpdateHandler('callback', async q => {
   const chatId = q.message.chat.id;
   const msgId  = q.message.message_id;
   const data   = q.data;
@@ -2852,7 +2904,7 @@ bot.on('callback_query', async q => {
     }
 
     /* ─ Analytics callbacks ─────────────────────────────── */
-    if (data === 'an_menu') { showAnalyticsMenu(chatId, msgId); return; }
+    if (data === 'an_menu') { await showAnalyticsMenu(chatId, msgId); return; }
 
     if (data.startsWith('an_')) {
       const parts = data.slice(3).split('_'); // e.g. "hour" | "scroll_today" | "clicks_today"
@@ -2870,12 +2922,12 @@ bot.on('callback_query', async q => {
         period = parts[1] || 'today';
       }
 
-      showAnalyticsReport(chatId, period, view, msgId);
+      await showAnalyticsReport(chatId, period, view, msgId);
       return;
     }
 
     /* ─ Orders ──────────────────────────────────────────── */
-    if (data === 'orders') { showOrders(chatId, 1, null, msgId); return; }
+    if (data === 'orders') { await showOrders(chatId, 1, null, msgId); return; }
 
     if (data.startsWith('of_')) {
       const [, pageStr, model, status] = data.split('_');
@@ -2883,13 +2935,13 @@ bot.on('callback_query', async q => {
         await requestPowerPanelPassword(chatId);
         return;
       }
-      showOrders(chatId, Number(pageStr), null, msgId, { model, status });
+      await showOrders(chatId, Number(pageStr), null, msgId, { model, status });
       return;
     }
 
     if (data.startsWith('op_')) {
       const [pageStr, filterStr] = data.replace('op_', '').split('_f_');
-      showOrders(chatId, Number(pageStr), filterStr || null, msgId);
+      await showOrders(chatId, Number(pageStr), filterStr || null, msgId);
       return;
     }
 
@@ -2901,7 +2953,7 @@ bot.on('callback_query', async q => {
         await requestPowerPanelPassword(chatId);
         return;
       }
-      showOrderDetail(chatId, orderId, msgId);
+      await showOrderDetail(chatId, orderId, msgId);
       return;
     }
 
@@ -3070,7 +3122,7 @@ bot.on('callback_query', async q => {
     }
 
     /* ─ Reviews ─────────────────────────────────────────── */
-    if (data.startsWith('rv_'))         { showReviews(chatId, Number(data.slice(3)), msgId); return; }
+    if (data.startsWith('rv_'))         { await showReviews(chatId, Number(data.slice(3)), msgId); return; }
 
     if (data.startsWith('del_review_')) {
       const id = Number(data.slice(11));
@@ -3108,13 +3160,10 @@ bot.on('callback_query', async q => {
       await bot.sendMessage(chatId, `✅ Запит #${id} — відповіли.`, { reply_markup: MAIN_KB });
     }
 
-  } catch (error) {
-    console.error('[callback]', data, error.message);
-    await bot.sendMessage(chatId, `❌ Помилка бота: ${esc(error.message || 'невідома помилка')}`, { parse_mode: 'HTML', reply_markup: keyboardFor(chatId) }).catch(() => {});
   } finally {
     setTimeout(() => pendingCb.delete(cbKey), 2000);
   }
-});
+}));
 
 bot.on('polling_error', e => {
   console.error('[poll]', e.message);
@@ -3137,22 +3186,64 @@ if (BOT_USE_WEBHOOK) {
     console.error('❌ BOT_USE_WEBHOOK=true, but BOT_WEBHOOK_URL is not set.');
     process.exit(1);
   }
-  const webhookPath = `/telegram/webhook/${encodeURIComponent(BOT_WEBHOOK_SECRET)}`;
+  const webhookPath = '/telegram/webhook';
   webApp.post(webhookPath, (req, res) => {
-    bot.processUpdate(req.body);
-    res.sendStatus(200);
+    if (!secretEqual(req.headers['x-telegram-bot-api-secret-token'], BOT_WEBHOOK_SECRET)) {
+      return res.sendStatus(401);
+    }
+    try {
+      bot.processUpdate(req.body);
+      res.sendStatus(200);
+    } catch (error) {
+      console.error('[webhook update]', error.message);
+      res.sendStatus(500);
+    }
   });
 }
 const BOT_PORT = process.env.PORT || 10000;
-webApp.listen(BOT_PORT, async () => {
+const webServer = webApp.listen(BOT_PORT, async () => {
   console.log(`🌐 Health check → port ${BOT_PORT}`);
   if (!BOT_USE_WEBHOOK) return;
   try {
-    const webhookPath = `/telegram/webhook/${encodeURIComponent(BOT_WEBHOOK_SECRET)}`;
+    const webhookPath = '/telegram/webhook';
     const webhookUrl = `${BOT_WEBHOOK_URL}${webhookPath}`;
-    await bot.setWebHook(webhookUrl);
-    console.log(`🔗 Telegram webhook set: ${webhookUrl}`);
+    await bot.setWebhook(webhookUrl, { secret_token: BOT_WEBHOOK_SECRET });
+    console.log('🔗 Telegram webhook configured');
   } catch (error) {
     console.error('[webhook]', error.message);
   }
 });
+
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[shutdown] ${signal}`);
+
+  const timeoutMs = Math.max(5000, Number(process.env.BOT_SHUTDOWN_TIMEOUT_MS || 20000));
+  const forceExit = setTimeout(() => {
+    console.error('[shutdown] timed out');
+    process.exit(1);
+  }, timeoutMs);
+  forceExit.unref();
+
+  try {
+    const stopTasks = [new Promise(resolve => webServer.close(() => resolve()))];
+    if (!BOT_USE_WEBHOOK) {
+      stopTasks.push(bot.stopPolling().catch(error => {
+        console.error('[poll stop]', error.message);
+      }));
+    }
+    await Promise.all(stopTasks);
+    await updateQueue.onIdle();
+    clearTimeout(forceExit);
+    process.exit(0);
+  } catch (error) {
+    clearTimeout(forceExit);
+    console.error('[shutdown]', error.message);
+    process.exit(1);
+  }
+}
+
+process.once('SIGTERM', () => { void shutdown('SIGTERM'); });
+process.once('SIGINT', () => { void shutdown('SIGINT'); });

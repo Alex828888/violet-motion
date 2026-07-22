@@ -8,7 +8,9 @@
     "bot": "node bot.js",
     "dev": "nodemon server.js",
     "dev:bot": "nodemon bot.js",
-    "test": "node --test"
+    "check": "node --check server.js && node --check bot.js && node --check crm-integration.js && node --check nova-poshta.js && node --check monobank.js && node --check np-order-merge.js && node --check telegram-update-queue.js",
+    "test": "node --test",
+    "verify": "npm run check && npm test"
   },
   "dependencies": {
     "cors": "^2.8.5",

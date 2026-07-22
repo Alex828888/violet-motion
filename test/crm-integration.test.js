@@ -22,6 +22,8 @@ async function createHarness(t, initialOrders, partnerUrl = '', options = {}) {
   else delete process.env.PARTNER_CRM_URL;
   process.env.PARTNER_CRM_AUTO_SYNC = 'false';
   delete process.env.PARTNER_CRM_ALLOW_BACKFILL;
+  if (options.allowInboundDelete === false) delete process.env.PARTNER_CRM_ALLOW_INBOUND_DELETE;
+  else process.env.PARTNER_CRM_ALLOW_INBOUND_DELETE = 'true';
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'violet-crm-hardening-test-'));
   const stateFile = path.join(tempDir, 'crm-sync.json');
   const app = express();
@@ -584,6 +586,32 @@ test('identity audit reports existing conflicts without historical backfill', as
   assert.equal(response.status, 200);
   assert.deepEqual(body.identityConflicts, { localId: 1, externalId: 1 });
   assert.deepEqual(harness.orders, before);
+});
+
+test('inbound delete is disabled by default for direct and batch requests', async t => {
+  const initial = [validOrder(1, { integration: { partnerOrderId: 'protected-delete-1' } })];
+  const harness = await createHarness(t, initial, '', { allowInboundDelete: false });
+
+  let response = await fetch(`${harness.base}/api/integration/v1/orders/protected-delete-1`, {
+    method: 'DELETE',
+    headers: harness.partnerHeaders,
+    body: JSON.stringify({ localId: '1' }),
+  });
+  let body = await response.json();
+  assert.equal(response.status, 403);
+  assert.equal(body.error, 'inbound_delete_disabled');
+  assert.equal(harness.orders.length, 1);
+
+  response = await fetch(`${harness.base}/api/integration/v1/orders/batch`, {
+    method: 'POST',
+    headers: harness.partnerHeaders,
+    body: JSON.stringify({ orders: [{ type: 'order.delete', localId: '1', externalId: 'protected-delete-1' }] }),
+  });
+  body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.results[0].ok, false);
+  assert.equal(body.results[0].code, 'INBOUND_DELETE_DISABLED');
+  assert.equal(harness.orders.length, 1);
 });
 
 test('DELETE refuses conflicting localId and externalId instead of deleting either order', async t => {
